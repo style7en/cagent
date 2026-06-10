@@ -115,31 +115,52 @@ static void do_append(const char *utf8) {
 /* ===== JSON / HTTP / 工具 ===== */
 
 /* JSON 字符串转义: 必须覆盖所有 0x00-0x1F 控制字符, 否则服务端解析失败.
- * \r 直接丢弃 (Windows 换行多余的部分, 显示和 LLM 都不需要). */
-static void json_escape(const char *src, char *dst) {
+ * \r 直接丢弃 (Windows 换行多余的部分, 显示和 LLM 都不需要).
+ * 有界写入: 至多写 dst_cap-1 字节 + '\0'. 返回 1 成功, 0 容量不足.
+ * 最坏膨胀比 6x (每控制字符 -> \u00XX). */
+static int json_escape(const char *src, char *dst, size_t dst_cap) {
+    if (dst_cap == 0) return 0;
+    size_t j = 0;
     while (*src) {
         unsigned char c = (unsigned char)*src++;
+        /* 预估本字符最多写入 6 字节 (\u00XX), 再留 1 字节给 '\0' */
+        if (j + 6 >= dst_cap) { dst[dst_cap - 1] = '\0'; return 0; }
         switch (c) {
-        case '"':  *dst++ = '\\'; *dst++ = '"';  break;
-        case '\\': *dst++ = '\\'; *dst++ = '\\'; break;
-        case '\n': *dst++ = '\\'; *dst++ = 'n';  break;
-        case '\t': *dst++ = '\\'; *dst++ = 't';  break;
-        case '\b': *dst++ = '\\'; *dst++ = 'b';  break;
-        case '\f': *dst++ = '\\'; *dst++ = 'f';  break;
+        case '"':  dst[j++] = '\\'; dst[j++] = '"';  break;
+        case '\\': dst[j++] = '\\'; dst[j++] = '\\'; break;
+        case '\n': dst[j++] = '\\'; dst[j++] = 'n';  break;
+        case '\t': dst[j++] = '\\'; dst[j++] = 't';  break;
+        case '\b': dst[j++] = '\\'; dst[j++] = 'b';  break;
+        case '\f': dst[j++] = '\\'; dst[j++] = 'f';  break;
         case '\r': break;   /* 丢弃 */
         default:
             if (c < 0x20) {
-                /* 其他控制字符按 \u00XX 转义 */
-                dst += sprintf(dst, "\\u%04X", c);
+                j += sprintf(dst + j, "\\u%04X", c);
             } else {
-                *dst++ = (char)c;
+                dst[j++] = (char)c;
             }
         }
     }
-    *dst = '\0';
+    dst[j] = '\0';
+    return 1;
 }
 
-static int extract_string(const char *s, const char *key, char *out) {
+/* 分配一块刚好够 src 转义后存放的 heap 缓冲并执行 escape.
+ * 返回 NULL 表示分配失败. 调用者负责 free. */
+static char *json_escape_alloc(const char *src) {
+    size_t cap = strlen(src) * 6 + 1;
+    char *buf = (char*)malloc(cap);
+    if (!buf) return NULL;
+    json_escape(src, buf, cap);   /* cap 足够, 不会失败 */
+    return buf;
+}
+
+/* 从 JSON 文本里抽出 "key":"value" 的 value, 解码常见转义.
+ * out 至多写 out_cap-1 字节 + '\0'. 返回 1 表示找到并完整写入, 0 表示未找到.
+ * 若 value 超长被截断, 仍返回 1 但 out 是截断结果. */
+static int extract_string(const char *s, const char *key, char *out, size_t out_cap) {
+    if (!s || out_cap == 0) { if (out_cap) out[0] = '\0'; return 0; }
+    out[0] = '\0';
     char pattern[128];
     snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     const char *p = strstr(s, pattern);
@@ -151,26 +172,28 @@ static int extract_string(const char *s, const char *key, char *out) {
     while (*p == ' ' || *p == '\t') p++;
     if (*p != '"') return 0;
     p++;
-    while (*p && *p != '"') {
+    size_t j = 0;
+    /* 每次循环最多写 2 字节 (\u 解码出 UTF-8 时), 留 1 字节给 '\0' */
+    while (*p && *p != '"' && j + 2 < out_cap) {
         if (*p == '\\' && *(p+1)) {
             char c = *(p+1);
-            if (c == 'n') { *out++ = '\n'; p += 2; }
-            else if (c == 't') { *out++ = '\t'; p += 2; }
+            if (c == 'n') { out[j++] = '\n'; p += 2; }
+            else if (c == 't') { out[j++] = '\t'; p += 2; }
             else if (c == 'r') { p += 2; }
             else if (c == 'u' && p[2] && p[3] && p[4] && p[5]) {
                 char hex[5] = { p[2], p[3], p[4], p[5], 0 };
                 unsigned int v = (unsigned int)strtol(hex, NULL, 16);
-                if (v < 0x80) *out++ = (char)v;
-                else { *out++ = (char)(0xC0 | (v >> 6));
-                       *out++ = (char)(0x80 | (v & 0x3F)); }
+                if (v < 0x80) out[j++] = (char)v;
+                else { out[j++] = (char)(0xC0 | (v >> 6));
+                       out[j++] = (char)(0x80 | (v & 0x3F)); }
                 p += 6;
             }
-            else { *out++ = c; p += 2; }
+            else { out[j++] = c; p += 2; }
         } else {
-            *out++ = *p++;
+            out[j++] = *p++;
         }
     }
-    *out = '\0';
+    out[j] = '\0';
     return 1;
 }
 
@@ -415,10 +438,14 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
     int rolled_back = 0;   /* 在 done 之前标记是否需要回滚 */
 
     /* 4. 追加本轮 user message */
-    char escaped[BUFSZ];
-    json_escape(task->user_msg, escaped);
+    char *escaped = json_escape_alloc(task->user_msg);
+    if (!escaped) {
+        append_text("(内存不足, 已忽略本轮)\r\n");
+        goto done;
+    }
     int n = snprintf(messages + savepoint, BUFSZ - savepoint,
                      ",{\"role\":\"user\",\"content\":\"%s\"}", escaped);
+    free(escaped);
     if (n <= 0 || (size_t)n >= BUFSZ - savepoint) {
         append_text("(输入过长, 已忽略本轮)\r\n");
         messages[savepoint] = '\0';
@@ -443,16 +470,23 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
 
         if (!strstr(resp, "\"tool_calls\"")) {
             char content[BUFSZ];
-            if (extract_string(resp, "content", content)) {
+            if (extract_string(resp, "content", content, sizeof(content))) {
                 append_text(content);
                 append_text("\r\n");
 
-                /* 成功: 把 assistant 最终回复也追加进历史 */
-                char esc_content[BUFSZ];
-                json_escape(content, esc_content);
-                size_t len = strlen(messages);
-                snprintf(messages + len, BUFSZ - len,
-                    ",{\"role\":\"assistant\",\"content\":\"%s\"}", esc_content);
+                /* 成功: 把 assistant 最终回复也追加进历史
+                 * (若拼接溢出会得到截断的非法 JSON, 必须回滚) */
+                char *esc_content = json_escape_alloc(content);
+                if (esc_content) {
+                    size_t len = strlen(messages);
+                    int an = snprintf(messages + len, BUFSZ - len,
+                        ",{\"role\":\"assistant\",\"content\":\"%s\"}", esc_content);
+                    free(esc_content);
+                    if (an <= 0 || (size_t)an >= BUFSZ - len) {
+                        append_text("(历史空间不足, 本轮回滚)\r\n");
+                        rolled_back = 1;
+                    }
+                }
             } else {
                 /* 响应不含 content 也不含 tool_calls: 视为解析失败, 回滚 */
                 append_text("(响应解析失败)\r\n");
@@ -463,40 +497,117 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             goto done;
         }
 
-        /* === 工具调用分支 === */
-        char id[256] = "", name[64] = "", args[4096] = "";
-        const char *tc = strstr(resp, "\"tool_calls\"");
-        extract_string(tc, "id", id);
-        extract_string(tc, "name", name);
-        extract_string(tc, "arguments", args);
+        /* === 工具调用分支 ===
+         * 解析所有 tool_calls (OpenAI 协议支持并行调用), 全部执行, 然后:
+         *   1) 写一条 assistant 消息, 其 tool_calls 数组包含全部调用
+         *   2) 为每个调用写一条 tool 消息
+         * 必须 1:1 配对, 否则下一轮服务端会以 invalid_arguments 报错. */
+        const char *tc_section = strstr(resp, "\"tool_calls\"");
 
-        {
-            char line[8192];
-            snprintf(line, sizeof(line), "[Tool] %s(%s)\r\n", name, args);
-            append_text(line);
+        /* 第一遍: 解析 + 执行, 收集结果 */
+        typedef struct {
+            char id[256];
+            char name[64];
+            char args[4096];
+            char *output;   /* heap, 末尾 free */
+        } ToolCall;
+        ToolCall calls[8];   /* 单轮最多 8 个并行调用, 足够使用 */
+        int n_calls = 0;
+
+        /* 收集所有 tool_calls. 每个 tool_call 以 "id": 起头, 顺序扫描.
+         * extract_string 取第一次匹配, 在 tool_call 子串起点上抽 id/name/arguments
+         * 自然能命中本调用的字段. */
+        const char *cursor = tc_section;
+        while (n_calls < (int)(sizeof(calls)/sizeof(calls[0]))) {
+            const char *p = strstr(cursor, "\"id\":");
+            if (!p) break;
+            ToolCall *c = &calls[n_calls++];
+            c->id[0] = c->name[0] = c->args[0] = '\0';
+            c->output = NULL;
+            extract_string(p, "id", c->id, sizeof(c->id));
+            extract_string(p, "name", c->name, sizeof(c->name));
+            extract_string(p, "arguments", c->args, sizeof(c->args));
+            cursor = p + 5;   /* 跳过本次 "id": 防止死循环 */
         }
 
-        char command[4096] = "";
-        extract_string(args, "command", command);
-        execute_bash(command);
-
-        {
-            char line[BUFSZ + 32];
-            snprintf(line, sizeof(line), "[Output]\r\n%s\r\n", tool_out);
-            append_text(line);
+        if (n_calls == 0) {
+            append_text("(tool_calls 解析失败)\r\n");
+            append_text(resp);
+            append_text(ROLLBACK_HINT);
+            rolled_back = 1;
+            goto done;
         }
 
-        char esc_args[8192], esc_out[BUFSZ];
-        json_escape(args, esc_args);
-        json_escape(tool_out, esc_out);
+        /* 执行所有工具 */
+        for (int i = 0; i < n_calls; i++) {
+            ToolCall *c = &calls[i];
+            {
+                char line[8192];
+                snprintf(line, sizeof(line), "[Tool] %s(%s)\r\n", c->name, c->args);
+                append_text(line);
+            }
+            char command[4096] = "";
+            extract_string(c->args, "command", command, sizeof(command));
+            execute_bash(command);
+            c->output = strdup(tool_out);
+            {
+                char line[BUFSZ + 32];
+                snprintf(line, sizeof(line), "[Output]\r\n%s\r\n", tool_out);
+                append_text(line);
+            }
+        }
 
-        size_t len = strlen(messages);
-        snprintf(messages + len, BUFSZ - len,
-            ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
-            "{\"id\":\"%s\",\"type\":\"function\","
-            "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},"
-            "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"%s\"}",
-            id, name, esc_args, id, esc_out);
+        /* 第二遍: 写 assistant 消息 (含所有 tool_calls 数组) */
+        size_t mstart = strlen(messages);
+        int an = snprintf(messages + mstart, BUFSZ - mstart,
+            ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[");
+        int ok = (an > 0 && (size_t)an < BUFSZ - mstart);
+
+        for (int i = 0; i < n_calls && ok; i++) {
+            ToolCall *c = &calls[i];
+            char *esc_id   = json_escape_alloc(c->id);
+            char *esc_name = json_escape_alloc(c->name);
+            char *esc_args = json_escape_alloc(c->args);
+            if (!esc_id || !esc_name || !esc_args) { ok = 0; free(esc_id); free(esc_name); free(esc_args); break; }
+            size_t len = strlen(messages);
+            int n2 = snprintf(messages + len, BUFSZ - len,
+                "%s{\"id\":\"%s\",\"type\":\"function\","
+                "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}",
+                (i == 0 ? "" : ","), esc_id, esc_name, esc_args);
+            free(esc_id); free(esc_name); free(esc_args);
+            if (n2 <= 0 || (size_t)n2 >= BUFSZ - len) { ok = 0; }
+        }
+
+        if (ok) {
+            size_t len = strlen(messages);
+            int n2 = snprintf(messages + len, BUFSZ - len, "]}");
+            if (n2 <= 0 || (size_t)n2 >= BUFSZ - len) ok = 0;
+        }
+
+        /* 第三遍: 为每个 tool_call 写 tool 消息 */
+        for (int i = 0; i < n_calls && ok; i++) {
+            ToolCall *c = &calls[i];
+            char *esc_id  = json_escape_alloc(c->id);
+            char *esc_out = json_escape_alloc(c->output ? c->output : "");
+            if (!esc_id || !esc_out) { ok = 0; free(esc_id); free(esc_out); break; }
+            size_t len = strlen(messages);
+            int n2 = snprintf(messages + len, BUFSZ - len,
+                ",{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"%s\"}",
+                esc_id, esc_out);
+            free(esc_id); free(esc_out);
+            if (n2 <= 0 || (size_t)n2 >= BUFSZ - len) ok = 0;
+        }
+
+        /* 释放工具输出 */
+        for (int i = 0; i < n_calls; i++) free(calls[i].output);
+
+        if (!ok) {
+            /* 任一步失败: 把本次拼接的 assistant+tool 段全部截掉, 回滚整轮 */
+            messages[mstart] = '\0';
+            append_text("(历史空间或内存不足, 本轮回滚)\r\n");
+            rolled_back = 1;
+            goto done;
+        }
     }
     append_text("(max iterations reached)\r\n");
     /* 达到上限不算失败: 此前已多次成功调用, 保留历史. */
