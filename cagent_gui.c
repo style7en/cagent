@@ -114,12 +114,27 @@ static void do_append(const char *utf8) {
 
 /* ===== JSON / HTTP / 工具 ===== */
 
+/* JSON 字符串转义: 必须覆盖所有 0x00-0x1F 控制字符, 否则服务端解析失败.
+ * \r 直接丢弃 (Windows 换行多余的部分, 显示和 LLM 都不需要). */
 static void json_escape(const char *src, char *dst) {
     while (*src) {
-        if (*src == '"' || *src == '\\') *dst++ = '\\';
-        if (*src == '\n') { *dst++ = '\\'; *dst++ = 'n'; src++; continue; }
-        if (*src == '\r') { src++; continue; }
-        *dst++ = *src++;
+        unsigned char c = (unsigned char)*src++;
+        switch (c) {
+        case '"':  *dst++ = '\\'; *dst++ = '"';  break;
+        case '\\': *dst++ = '\\'; *dst++ = '\\'; break;
+        case '\n': *dst++ = '\\'; *dst++ = 'n';  break;
+        case '\t': *dst++ = '\\'; *dst++ = 't';  break;
+        case '\b': *dst++ = '\\'; *dst++ = 'b';  break;
+        case '\f': *dst++ = '\\'; *dst++ = 'f';  break;
+        case '\r': break;   /* 丢弃 */
+        default:
+            if (c < 0x20) {
+                /* 其他控制字符按 \u00XX 转义 */
+                dst += sprintf(dst, "\\u%04X", c);
+            } else {
+                *dst++ = (char)c;
+            }
+        }
     }
     *dst = '\0';
 }
@@ -627,7 +642,7 @@ static void layout(HWND hwnd) {
     int top_h = row_h * 3 + gap * 4;  /* 3 行 + 4 个间隙 */
     int btn_w = 80;
     int clear_w = 80;
-    int input_h = 28;
+    int input_h = 72;           /* 多行输入框, 约 3 行高 (Enter 发送, Shift+Enter 换行) */
     int input_y = H - input_h - gap;
     int input_w = W - btn_w - clear_w - gap * 4;
 
@@ -646,14 +661,21 @@ static void layout(HWND hwnd) {
     MoveWindow(g_hSend,  gap * 3 + input_w + clear_w, input_y, btn_w, input_h, TRUE);
 }
 
-/* 输入框子类化:Enter 触发发送 */
+/* 输入框子类化: Enter 发送, Shift+Enter 插入换行 */
 static WNDPROC g_oldInputProc;
 static LRESULT CALLBACK InputProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN && wp == VK_RETURN) {
+        if (GetKeyState(VK_SHIFT) & 0x8000) {
+            /* Shift+Enter: 走默认处理插入换行 */
+            return CallWindowProc(g_oldInputProc, h, msg, wp, lp);
+        }
         SendMessage(GetParent(h), WM_COMMAND, MAKEWPARAM(ID_SEND, BN_CLICKED), 0);
         return 0;
     }
-    if (msg == WM_CHAR && wp == VK_RETURN) return 0;  /* 抑制 beep */
+    if (msg == WM_CHAR && wp == VK_RETURN) {
+        /* 仅在没按 Shift 时抑制 (否则 Shift+Enter 会被吞,听不到 beep 也没换行) */
+        if (!(GetKeyState(VK_SHIFT) & 0x8000)) return 0;
+    }
     return CallWindowProc(g_oldInputProc, h, msg, wp, lp);
 }
 
@@ -697,7 +719,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessage(g_hHistory, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
         g_hInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_INPUT, NULL, NULL);
         SendMessage(g_hInput, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
