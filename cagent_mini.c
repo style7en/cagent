@@ -140,7 +140,7 @@ int main(int argc, char *argv[]) {
         "{\"role\":\"system\",\"content\":\"你是 cagent-mini,一个由 C 语言实现的极简教学版 AI Agent。请始终使用中文回答。需要时调用工具。回答简洁。\"},"
         "{\"role\":\"user\",\"content\":\"%s\"}", escaped);
 
-    for (int iter = 0; iter < 5; iter++) {
+    for (int iter = 0; iter < 20; iter++) {
         /* 1. 组装 body */
         snprintf(body, BUFSZ,
             "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s}",

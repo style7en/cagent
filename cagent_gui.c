@@ -31,13 +31,14 @@
 #include <stdlib.h>
 
 #define BUFSZ           (256 * 1024)
-#define MAX_ITERATIONS  5
+#define MAX_ITERATIONS  20
 
 #define ID_HISTORY  1001
 #define ID_INPUT    1002
 #define ID_SEND     1003
-#define ID_CFG_BASE 1004   /* +0 url, +1 key, +2 model */
-#define ID_LBL_BASE 1007   /* +0 url, +1 key, +2 model */
+#define ID_CLEAR    1004
+#define ID_CFG_BASE 1005   /* +0 url, +1 key, +2 model */
+#define ID_LBL_BASE 1008   /* +0 url, +1 key, +2 model */
 
 #define WM_APP_APPEND  (WM_APP + 1)   /* lParam = UTF-8 char* (须 free) */
 #define WM_APP_DONE    (WM_APP + 2)   /* Agent 任务完成,启用 UI */
@@ -47,7 +48,7 @@
 #define CFG_MDL 2
 
 /* ===== 全局状态 ===== */
-static HWND g_hHistory, g_hInput, g_hSend;
+static HWND g_hHistory, g_hInput, g_hSend, g_hClear;
 static HWND g_hCfg[3];                 /* [url, key, model] */
 static HFONT g_hFont;
 static HANDLE g_hThread = NULL;
@@ -72,9 +73,6 @@ static const char *TOOLS_JSON =
     "\"required\":[\"command\"]}}}]";
 
 /* ===== 工具函数: UTF-8 <-> UTF-16 ===== */
-static void wide_to_utf8(const WCHAR *src, char *dst, int dst_bytes) {
-    WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, dst_bytes, NULL, NULL);
-}
 
 /* 向历史框追加一段文本(UTF-8)。线程安全:通过 PostMessage 投递 */
 static void append_text(const char *utf8) {
@@ -114,7 +112,7 @@ static void do_append(const char *utf8) {
     free(wbuf);
 }
 
-/* ===== JSON / HTTP / 工具 (从 cagent_mini.c 移植) ===== */
+/* ===== JSON / HTTP / 工具 ===== */
 
 static void json_escape(const char *src, char *dst) {
     while (*src) {
@@ -162,20 +160,13 @@ static int extract_string(const char *s, const char *key, char *out) {
 }
 
 /* 用 CreateProcess + 匿名管道静默运行命令(仅本地工具用),纯内存收发数据。
- *   input/input_len: 通过 stdin 喂给子进程的数据(可为 NULL)
- *   output/out_cap : 接收子进程 stdout+stderr 的合并输出
+ * 子进程的 stdout+stderr 合并写入 output (含 \0)。
  * 返回实际读到的字节数,失败返回 -1。 */
-static int run_pipe(const char *cmdline,
-                    const char *input, size_t input_len,
-                    char *output, size_t out_cap) {
-    HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL;
+static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
+    HANDLE outR = NULL, outW = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
 
-    if (!CreatePipe(&inR, &inW, &sa, 0)) return -1;
-    if (!CreatePipe(&outR, &outW, &sa, 0)) {
-        CloseHandle(inR); CloseHandle(inW); return -1;
-    }
-    SetHandleInformation(inW,  HANDLE_FLAG_INHERIT, 0);
+    if (!CreatePipe(&outR, &outW, &sa, 0)) return -1;
     SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOA si;
@@ -183,7 +174,7 @@ static int run_pipe(const char *cmdline,
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    si.hStdInput  = inR;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
     si.hStdOutput = outW;
     si.hStdError  = outW;
 
@@ -193,18 +184,10 @@ static int run_pipe(const char *cmdline,
     PROCESS_INFORMATION pi = {0};
     if (!CreateProcessA(NULL, buf, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        CloseHandle(inR); CloseHandle(inW);
         CloseHandle(outR); CloseHandle(outW);
         return -1;
     }
-    CloseHandle(inR);
     CloseHandle(outW);
-
-    if (input && input_len > 0) {
-        DWORD written;
-        WriteFile(inW, input, (DWORD)input_len, &written, NULL);
-    }
-    CloseHandle(inW);
 
     size_t pos = 0;
     DWORD nread;
@@ -322,7 +305,9 @@ static int http_post(const char *url, const char *api_key,
     return status;
 }
 
-static void call_llm(void) {
+/* 发起一次 chat/completions 请求, 把响应写入全局 resp.
+ * 返回值: HTTP 状态码; <0 表示网络层失败; 非 200 表示业务/认证错误. */
+static int call_llm(void) {
     /* 用户填的是 base url (例: https://x.com/v1),程序自动追加 /chat/completions */
     char full_url[1280];
     size_t n = strlen(g_api_url);
@@ -343,17 +328,53 @@ static void call_llm(void) {
             memcpy(resp, prefix, plen);
         }
     }
+    return status;
+}
+
+/* 把 cmd.exe 的 OEM/ANSI 输出转成 UTF-8.
+ * cmd.exe 的 stdout 用当前控制台的 OEM 代码页 (中文系统 = CP936/GBK),
+ * 直接当 UTF-8 处理会得到 ????. 用 GetACP() 拿到系统代码页, GBK→UTF-16→UTF-8.
+ * 转换失败则原样保留(降级而非崩溃). */
+static void oem_to_utf8(char *buf, size_t cap) {
+    UINT cp = GetACP();
+    if (cp == CP_UTF8 || buf[0] == '\0') return;
+
+    int wlen = MultiByteToWideChar(cp, 0, buf, -1, NULL, 0);
+    if (wlen <= 0) return;
+    WCHAR *w = (WCHAR*)malloc(wlen * sizeof(WCHAR));
+    if (!w) return;
+    MultiByteToWideChar(cp, 0, buf, -1, w, wlen);
+
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (u8len > 0 && (size_t)u8len <= cap) {
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, (int)cap, NULL, NULL);
+    }
+    free(w);
 }
 
 static void execute_bash(const char *command) {
-    /* 本地命令仍走子进程 + 管道(无 HTTP) */
-    int n = run_pipe(command, NULL, 0, tool_out, BUFSZ);
-    if (n <= 0) strcpy(tool_out, "(no output)");
+    int n = run_pipe(command, tool_out, BUFSZ);
+    if (n <= 0) { strcpy(tool_out, "(no output)"); return; }
+    oem_to_utf8(tool_out, BUFSZ);
 }
 
 /* ===== Agent 工作线程 ===== */
 
 typedef struct { char user_msg[BUFSZ]; } AgentTask;
+
+#define SYSTEM_PROMPT \
+    "{\"role\":\"system\",\"content\":\"你是 cagent,一个由 C 语言实现的极简 AI Agent。" \
+    "请始终使用中文回答。需要时调用工具。回答简洁。\"}"
+
+/* messages 缓冲水位线: 接近上限时整轮对话重置, 防止越界. */
+#define MESSAGES_WATERMARK  ((BUFSZ * 3) / 4)
+
+static const char *ROLLBACK_HINT = "\r\n(本轮已回滚, 不影响后续对话)\r\n";
+
+/* 初始化 messages 为只含 system prompt 的状态. 在程序启动和 "清空对话" 时调用. */
+static void reset_conversation(void) {
+    snprintf(messages, BUFSZ, "%s", SYSTEM_PROMPT);
+}
 
 static DWORD WINAPI agent_thread(LPVOID arg) {
     AgentTask *task = (AgentTask*)arg;
@@ -365,12 +386,29 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
         append_text(line);
     }
 
-    /* 初始化 messages */
+    /* 1. 若历史接近溢出, 整体重置(并提示用户) */
+    if (strlen(messages) > MESSAGES_WATERMARK) {
+        append_text("(对话历史过长, 已自动清空上下文)\r\n");
+        reset_conversation();
+    }
+
+    /* 2. 若首次发言, messages 还是空(没经过 config_load 之外的初始化) */
+    if (messages[0] == '\0') reset_conversation();
+
+    /* 3. 记录快照点: 出错时回滚到这里, 丢弃本轮 user message */
+    size_t savepoint = strlen(messages);
+    int rolled_back = 0;   /* 在 done 之前标记是否需要回滚 */
+
+    /* 4. 追加本轮 user message */
     char escaped[BUFSZ];
     json_escape(task->user_msg, escaped);
-    snprintf(messages, BUFSZ,
-        "{\"role\":\"system\",\"content\":\"你是 cagent,一个由 C 语言实现的极简 AI Agent。请始终使用中文回答。需要时调用工具。回答简洁。\"},"
-        "{\"role\":\"user\",\"content\":\"%s\"}", escaped);
+    int n = snprintf(messages + savepoint, BUFSZ - savepoint,
+                     ",{\"role\":\"user\",\"content\":\"%s\"}", escaped);
+    if (n <= 0 || (size_t)n >= BUFSZ - savepoint) {
+        append_text("(输入过长, 已忽略本轮)\r\n");
+        messages[savepoint] = '\0';
+        goto done;
+    }
 
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
         snprintf(body, BUFSZ,
@@ -378,21 +416,39 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             g_model, messages, TOOLS_JSON);
 
         append_text("(thinking...)\r\n");
-        call_llm();
+        int status = call_llm();
+
+        /* === 失败判定: HTTP 非 200 (含网络层失败的 -1), 回滚 === */
+        if (status != 200) {
+            append_text(resp);
+            append_text(ROLLBACK_HINT);
+            rolled_back = 1;
+            goto done;
+        }
 
         if (!strstr(resp, "\"tool_calls\"")) {
             char content[BUFSZ];
             if (extract_string(resp, "content", content)) {
                 append_text(content);
                 append_text("\r\n");
+
+                /* 成功: 把 assistant 最终回复也追加进历史 */
+                char esc_content[BUFSZ];
+                json_escape(content, esc_content);
+                size_t len = strlen(messages);
+                snprintf(messages + len, BUFSZ - len,
+                    ",{\"role\":\"assistant\",\"content\":\"%s\"}", esc_content);
             } else {
-                append_text("(no content)\r\n");
+                /* 响应不含 content 也不含 tool_calls: 视为解析失败, 回滚 */
+                append_text("(响应解析失败)\r\n");
                 append_text(resp);
-                append_text("\r\n");
+                append_text(ROLLBACK_HINT);
+                rolled_back = 1;
             }
             goto done;
         }
 
+        /* === 工具调用分支 === */
         char id[256] = "", name[64] = "", args[4096] = "";
         const char *tc = strstr(resp, "\"tool_calls\"");
         extract_string(tc, "id", id);
@@ -428,8 +484,12 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             id, name, esc_args, id, esc_out);
     }
     append_text("(max iterations reached)\r\n");
+    /* 达到上限不算失败: 此前已多次成功调用, 保留历史. */
 
 done:
+    if (rolled_back) {
+        messages[savepoint] = '\0';
+    }
     free(task);
     PostMessage(g_hHistory, WM_APP_DONE, 0, 0);
     return 0;
@@ -547,12 +607,13 @@ static void start_task(HWND hwnd) {
     GetWindowTextW(g_hInput, wbuf, wlen + 1);
 
     AgentTask *task = (AgentTask*)calloc(1, sizeof(AgentTask));
-    wide_to_utf8(wbuf, task->user_msg, BUFSZ);
+    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, task->user_msg, BUFSZ, NULL, NULL);
     free(wbuf);
 
     SetWindowTextW(g_hInput, L"");
     EnableWindow(g_hInput, FALSE);
     EnableWindow(g_hSend, FALSE);
+    EnableWindow(g_hClear, FALSE);
 
     g_hThread = CreateThread(NULL, 0, agent_thread, task, 0, NULL);
 }
@@ -565,9 +626,10 @@ static void layout(HWND hwnd) {
     int lbl_w = 80;             /* 标签宽 (容纳 "Url-Base:") */
     int top_h = row_h * 3 + gap * 4;  /* 3 行 + 4 个间隙 */
     int btn_w = 80;
+    int clear_w = 80;
     int input_h = 28;
     int input_y = H - input_h - gap;
-    int input_w = W - btn_w - gap * 3;
+    int input_w = W - btn_w - clear_w - gap * 4;
 
     /* 三行配置 */
     for (int i = 0; i < 3; i++) {
@@ -580,7 +642,8 @@ static void layout(HWND hwnd) {
     MoveWindow(g_hHistory, gap, top_h, W - gap * 2,
                H - top_h - input_h - gap * 2, TRUE);
     MoveWindow(g_hInput, gap, input_y, input_w, input_h, TRUE);
-    MoveWindow(g_hSend, gap * 2 + input_w, input_y, btn_w, input_h, TRUE);
+    MoveWindow(g_hClear, gap * 2 + input_w, input_y, clear_w, input_h, TRUE);
+    MoveWindow(g_hSend,  gap * 3 + input_w + clear_w, input_y, btn_w, input_h, TRUE);
 }
 
 /* 输入框子类化:Enter 触发发送 */
@@ -646,6 +709,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_SEND, NULL, NULL);
         SendMessage(g_hSend, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
+        g_hClear = CreateWindowW(L"BUTTON", L"清空对话",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_CLEAR, NULL, NULL);
+        SendMessage(g_hClear, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+
+        /* 初始化对话历史(只有 system prompt) */
+        reset_conversation();
+
         SetFocus(g_hInput);
         return 0;
     }
@@ -657,6 +728,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == ID_SEND && HIWORD(wp) == BN_CLICKED) {
             if (IsWindowEnabled(g_hSend)) start_task(hwnd);
+            return 0;
+        }
+        if (LOWORD(wp) == ID_CLEAR && HIWORD(wp) == BN_CLICKED) {
+            if (IsWindowEnabled(g_hSend)) {  /* Send enabled 才表示无后台任务在跑 */
+                reset_conversation();
+                SetWindowTextW(g_hHistory, L"");
+                SetFocus(g_hInput);
+            }
             return 0;
         }
         break;
@@ -686,8 +765,20 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_APP_DONE) {
         EnableWindow(g_hInput, TRUE);
         EnableWindow(g_hSend, TRUE);
+        EnableWindow(g_hClear, TRUE);
         SetFocus(g_hInput);
         return 0;
+    }
+    /* 修复多行 EDIT 滚动后字形重叠 / 残留:
+     * Win32 EDIT 滚动时仅重绘新出现的行, 用自定义字体 + 中文 / 高 DPI 时
+     * 行高轻微错位会让旧字形未被擦除. 拦截所有可能引发滚动的消息,
+     * 在默认处理之后强制整个控件区域重绘. */
+    if (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL ||
+        msg == WM_KEYDOWN || msg == WM_KEYUP) {
+        LRESULT r = CallWindowProc(g_oldHistoryProc, h, msg, wp, lp);
+        InvalidateRect(h, NULL, TRUE);
+        UpdateWindow(h);
+        return r;
     }
     return CallWindowProc(g_oldHistoryProc, h, msg, wp, lp);
 }
