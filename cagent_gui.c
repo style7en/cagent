@@ -457,6 +457,7 @@ static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
 static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
 static char g_api_key[512]  = "";
 static char g_model[128]    = "";
+static int g_key_decrypt_failed = 0;   /* DPAPI 解密失败标志, 启动后提示 */
 
 /* Agent 工作缓冲(只在工作线程使用,主线程不碰) */
 static char messages[BUFSZ];
@@ -1107,8 +1108,17 @@ static void config_load(void) {
 
         if (strcmp(key, "url_base") == 0)
             snprintf(g_api_url, sizeof(g_api_url), "%s", val);
-        else if (strcmp(key, "api_key") == 0)
-            snprintf(g_api_key, sizeof(g_api_key), "%s", val);
+        else if (strcmp(key, "api_key") == 0) {
+            char *dec = dpapi_unprotect(val);
+            if (dec) {
+                snprintf(g_api_key, sizeof(g_api_key), "%s", dec);
+                free(dec);
+            } else {
+                /* 解密失败: 置空并标记, 启动后提示用户重填 */
+                g_api_key[0] = '\0';
+                g_key_decrypt_failed = 1;
+            }
+        }
         else if (strcmp(key, "model") == 0)
             snprintf(g_model, sizeof(g_model), "%s", val);
     }
@@ -1130,7 +1140,11 @@ static void config_save(void) {
     if (!f) return;
     fprintf(f, "# cagent GUI 配置 (UTF-8, 退出时自动保存)\r\n");
     fprintf(f, "url_base=%s\r\n", g_api_url);
-    fprintf(f, "api_key=%s\r\n",  g_api_key);
+    {
+        char *enc = dpapi_protect(g_api_key);
+        if (enc) { fprintf(f, "api_key=%s\r\n", enc); free(enc); }
+        else fprintf(f, "api_key=%s\r\n", g_api_key);   /* 加密失败降级明文 */
+    }
     fprintf(f, "model=%s\r\n",    g_model);
     fclose(f);
 }
@@ -1281,6 +1295,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         /* 初始化对话历史(只有 system prompt) */
         reset_conversation();
+
+        /* DPAPI 解密失败提示 (config_load 在历史框创建前执行, 延迟到此处显示) */
+        if (g_key_decrypt_failed) {
+            append_text("API Key 解密失败 (可能换了用户/机器), 请重新填写 Key。\r\n");
+            g_key_decrypt_failed = 0;
+        }
 
         SetFocus(g_hInput);
         return 0;
