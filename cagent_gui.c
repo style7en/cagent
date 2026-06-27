@@ -382,6 +382,8 @@ static HWND g_hHistory, g_hInput, g_hSend, g_hClear;
 static HWND g_hCfg[3];                 /* [url, key, model] */
 static HFONT g_hFont;
 static HANDLE g_hThread = NULL;
+static volatile LONG g_running = 0;   /* 1 = Agent 工作线程运行中 */
+static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
 
 /* 运行时配置(在 start_task 时从 Edit 控件同步) */
 static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
@@ -741,6 +743,12 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
     }
 
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+        /* 取消检查点 1: 每轮迭代顶部 (LLM 调用前) */
+        if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
+            append_text("(已取消)\r\n");
+            rolled_back = 1;
+            goto done;
+        }
         snprintf(body, BUFSZ,
             "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s}",
             g_model, messages, TOOLS_JSON);
@@ -852,6 +860,13 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
 
         /* 执行所有工具: arguments 是字符串化 JSON, 二次解析取 command */
         for (int i = 0; i < n_calls; i++) {
+            /* 取消检查点 2: 每个工具执行前 */
+            if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
+                append_text("(已取消)\r\n");
+                rolled_back = 1;
+                for (int j = 0; j < n_calls; j++) free(calls[j].output);
+                goto done;
+            }
             ToolCall *c = &calls[i];
             {
                 char line[8192];
@@ -1027,7 +1042,9 @@ static void config_save(void) {
 }
 
 static void start_task(HWND hwnd) {
+    /* 防御性: 若仍有旧线程未回收, 等待其结束再关闭 (正常路径不会走到, 因按钮状态已挡) */
     if (g_hThread) {
+        WaitForSingleObject(g_hThread, INFINITE);
         CloseHandle(g_hThread);
         g_hThread = NULL;
     }
@@ -1054,10 +1071,13 @@ static void start_task(HWND hwnd) {
     free(wbuf);
 
     SetWindowTextW(g_hInput, L"");
-    EnableWindow(g_hInput, FALSE);
-    EnableWindow(g_hSend, FALSE);
-    EnableWindow(g_hClear, FALSE);
 
+    InterlockedExchange(&g_cancel, 0);          /* 清除取消标志 */
+    EnableWindow(g_hInput, FALSE);              /* 输入框禁用 */
+    EnableWindow(g_hClear, FALSE);              /* 清空按钮禁用 */
+    SetWindowTextW(g_hSend, L"停止");           /* 发送按钮变停止, 保持启用 (点击即取消) */
+
+    InterlockedExchange(&g_running, 1);
     g_hThread = CreateThread(NULL, 0, agent_thread, task, 0, NULL);
 }
 
@@ -1178,11 +1198,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_COMMAND:
         if (LOWORD(wp) == ID_SEND && HIWORD(wp) == BN_CLICKED) {
-            if (IsWindowEnabled(g_hSend)) start_task(hwnd);
+            if (g_running) {
+                /* 任务运行中: 点击=请求取消 */
+                InterlockedExchange(&g_cancel, 1);
+                EnableWindow(g_hSend, FALSE);   /* 防重复点, 等 DONE 恢复 */
+                append_text("(正在停止...)\r\n");
+            } else {
+                start_task(hwnd);
+            }
             return 0;
         }
         if (LOWORD(wp) == ID_CLEAR && HIWORD(wp) == BN_CLICKED) {
-            if (IsWindowEnabled(g_hSend)) {  /* Send enabled 才表示无后台任务在跑 */
+            if (!g_running) {  /* 任务运行中不允许清空 */
                 reset_conversation();
                 SetWindowTextW(g_hHistory, L"");
                 SetFocus(g_hInput);
@@ -1214,8 +1241,11 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_APP_DONE) {
-        EnableWindow(g_hInput, TRUE);
+        InterlockedExchange(&g_running, 0);
+        InterlockedExchange(&g_cancel, 0);
+        SetWindowTextW(g_hSend, L"发送");       /* 恢复按钮文本 */
         EnableWindow(g_hSend, TRUE);
+        EnableWindow(g_hInput, TRUE);
         EnableWindow(g_hClear, TRUE);
         SetFocus(g_hInput);
         return 0;
