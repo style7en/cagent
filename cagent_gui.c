@@ -472,7 +472,31 @@ static const char *TOOLS_JSON =
     "\"description\":\"Execute a shell command via cmd /c\","
     "\"parameters\":{\"type\":\"object\","
     "\"properties\":{\"command\":{\"type\":\"string\"}},"
-    "\"required\":[\"command\"]}}}]";
+    "\"required\":[\"command\"]}}},"
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"read_file\","
+    "\"description\":\"Read text content of a file\","
+    "\"parameters\":{\"type\":\"object\","
+    "\"properties\":{\"path\":{\"type\":\"string\"}},"
+    "\"required\":[\"path\"]}}},"
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"write_file\","
+    "\"description\":\"Write content to a file (overwrite)\","
+    "\"parameters\":{\"type\":\"object\","
+    "\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},"
+    "\"required\":[\"path\",\"content\"]}}},"
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"list_dir\","
+    "\"description\":\"List directory entries (name, size, type)\","
+    "\"parameters\":{\"type\":\"object\","
+    "\"properties\":{\"path\":{\"type\":\"string\"}},"
+    "\"required\":[\"path\"]}}},"
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"search\","
+    "\"description\":\"Search pattern in files under a directory (non-recursive)\","
+    "\"parameters\":{\"type\":\"object\","
+    "\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}},"
+    "\"required\":[\"pattern\",\"path\"]}}}]";
 
 /* ===== 工具函数: UTF-8 <-> UTF-16 ===== */
 
@@ -822,6 +846,114 @@ static void execute_bash(const char *command) {
     oem_to_utf8(tool_out, BUFSZ);
 }
 
+/* ===== 结构化工具 (写入全局 tool_out) ===== */
+
+static void tool_read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { snprintf(tool_out, BUFSZ, "(读取失败: 无法打开 %s)", path); return; }
+    size_t n = fread(tool_out, 1, BUFSZ - 64, f);
+    fclose(f);
+    tool_out[n] = '\0';
+    if (n >= BUFSZ - 64) {
+        strcat(tool_out, "\n(已截断, 文件过大)");
+    }
+    oem_to_utf8(tool_out, BUFSZ);
+}
+
+static void tool_write_file(const char *path, const char *content) {
+    /* 覆盖确认: 文件已存在则弹窗 (工作线程, 同命令沙箱) */
+    FILE *test = fopen(path, "rb");
+    if (test) {
+        fclose(test);
+        int rc = MessageBoxW(NULL, L"文件已存在, 确认覆盖?", L"write_file 确认",
+                             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (rc != IDYES) { strcpy(tool_out, "(用户拒绝覆盖)"); return; }
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { strcpy(tool_out, "(写入失败)"); return; }
+    size_t len = strlen(content);
+    fwrite(content, 1, len, f);
+    fclose(f);
+    snprintf(tool_out, BUFSZ, "(已写入 %zu 字节)", len);
+}
+
+static void tool_list_dir(const char *path) {
+    char pattern[MAX_PATH];
+    snprintf(pattern, sizeof(pattern), "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) { snprintf(tool_out, BUFSZ, "(列目录失败: %s)", path); return; }
+    size_t pos = 0;
+    int count = 0;
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        const char *type = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "<DIR>" : "file";
+        char line[512];
+        snprintf(line, sizeof(line), "%s\t%llu\t%s\n", fd.cFileName,
+                 (unsigned long long)fd.nFileSizeLow, type);
+        size_t ln = strlen(line);
+        if (pos + ln + 32 >= BUFSZ) { strcat(tool_out, "(更多条目已截断)"); break; }
+        memcpy(tool_out + pos, line, ln);
+        pos += ln;
+        if (++count >= 200) { strcat(tool_out, "(更多条目已截断)"); break; }
+    } while (FindNextFileA(h, &fd));
+    tool_out[pos] = '\0';
+    FindClose(h);
+}
+
+static void tool_search(const char *pattern, const char *path) {
+    char glob[MAX_PATH];
+    snprintf(glob, sizeof(glob), "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(glob, &fd);
+    if (h == INVALID_HANDLE_VALUE) { snprintf(tool_out, BUFSZ, "(搜索失败: %s)", path); return; }
+    size_t pos = 0;
+    int matches = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;  /* 非递归: 跳过子目录 */
+        char fpath[MAX_PATH];
+        snprintf(fpath, sizeof(fpath), "%s\\%s", path, fd.cFileName);
+        FILE *f = fopen(fpath, "rb");
+        if (!f) continue;
+        char *buf = (char*)malloc(256 * 1024);
+        if (!buf) { fclose(f); continue; }
+        size_t n = fread(buf, 1, 256 * 1024 - 1, f);
+        fclose(f);
+        if (n == 0) { free(buf); continue; }
+        buf[n] = '\0';
+        char *line = buf;
+        while (line < buf + n && matches < 50) {
+            char *eol = strchr(line, '\n');
+            int linelen = eol ? (int)(eol - line) : (int)(buf + n - line);
+            char save = line[linelen];
+            line[linelen] = '\0';
+            if (strstr(line, pattern)) {
+                char ml[1024];
+                snprintf(ml, sizeof(ml), "%s: %s\n", fd.cFileName, line);
+                size_t mlen = strlen(ml);
+                if (pos + mlen + 32 >= BUFSZ) {
+                    pos += snprintf(tool_out + pos, BUFSZ - pos, "(更多匹配已截断)");
+                    line[linelen] = save;
+                    free(buf);
+                    goto done;
+                }
+                memcpy(tool_out + pos, ml, mlen);
+                pos += mlen;
+                matches++;
+            }
+            line[linelen] = save;
+            if (!eol) break;
+            line = eol + 1;
+        }
+        free(buf);
+        if (matches >= 50) { pos += snprintf(tool_out + pos, BUFSZ - pos, "(更多匹配已截断)"); break; }
+    } while (FindNextFileA(h, &fd));
+done:
+    tool_out[pos] = '\0';
+    FindClose(h);
+    if (matches == 0 && pos == 0) strcpy(tool_out, "(无匹配)");
+}
+
 /* ===== Agent 工作线程 ===== */
 
 typedef struct { char user_msg[BUFSZ]; } AgentTask;
@@ -1017,14 +1149,28 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
                 snprintf(line, sizeof(line), "[Tool] %s(%s)\r\n", c->name, c->args);
                 append_text(line);
             }
-            char command[4096] = "";
             JValue *argsj = json_parse(c->args);
-            if (argsj) {
+            if (strcmp(c->name, "execute_bash") == 0) {
                 const char *cmd = json_as_str(json_obj_get(argsj, "command"));
-                if (cmd) snprintf(command, sizeof(command), "%s", cmd);
-                json_free(argsj);
+                execute_bash(cmd ? cmd : "");
+            } else if (strcmp(c->name, "read_file") == 0) {
+                const char *p = json_as_str(json_obj_get(argsj, "path"));
+                tool_read_file(p ? p : "");
+            } else if (strcmp(c->name, "write_file") == 0) {
+                const char *p = json_as_str(json_obj_get(argsj, "path"));
+                const char *ct = json_as_str(json_obj_get(argsj, "content"));
+                tool_write_file(p ? p : "", ct ? ct : "");
+            } else if (strcmp(c->name, "list_dir") == 0) {
+                const char *p = json_as_str(json_obj_get(argsj, "path"));
+                tool_list_dir(p ? p : "");
+            } else if (strcmp(c->name, "search") == 0) {
+                const char *pat = json_as_str(json_obj_get(argsj, "pattern"));
+                const char *p = json_as_str(json_obj_get(argsj, "path"));
+                tool_search(pat ? pat : "", p ? p : "");
+            } else {
+                strcpy(tool_out, "(未知工具)");
             }
-            execute_bash(command);
+            json_free(argsj);
             c->output = strdup(tool_out);
             {
                 char line[BUFSZ + 32];
