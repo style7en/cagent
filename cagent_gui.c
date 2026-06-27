@@ -26,6 +26,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <winhttp.h>
+#include <wincrypt.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -56,6 +57,60 @@ const JValue *json_arr_at(const JValue *arr, size_t i);
 const char   *json_as_str(const JValue *v);
 
 /* 解析器自测: 返回 0 通过, 非 0 失败。由 WinMain --selftest 触发。 */
+/* ===== DPAPI Key 加密 =====
+ * 加密: 明文 -> "dpapi:<base64>"。解密: "dpapi:<base64>" 或明文 -> 明文。
+ * 失败返回 NULL。返回值 malloc, 调用者 free。 */
+static char *dpapi_protect(const char *plain);
+static char *dpapi_unprotect(const char *stored);
+
+static char *dpapi_protect(const char *plain) {
+    if (!plain) return NULL;
+    DATA_BLOB in = { (DWORD)strlen(plain), (BYTE*)plain };
+    DATA_BLOB out = {0};
+    if (!CryptProtectData(&in, NULL, NULL, NULL, NULL, 0, &out)) return NULL;
+    DWORD b64len = 0;
+    CryptBinaryToStringA(out.pbData, out.cbData,
+        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &b64len);
+    char *b64 = (char*)malloc(b64len);
+    if (!b64) { LocalFree(out.pbData); return NULL; }
+    CryptBinaryToStringA(out.pbData, out.cbData,
+        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64, &b64len);
+    LocalFree(out.pbData);
+    char *res = (char*)malloc(6 + b64len);
+    if (!res) { free(b64); return NULL; }
+    memcpy(res, "dpapi:", 6);
+    memcpy(res + 6, b64, b64len);   /* b64len 含 '\0' */
+    free(b64);
+    return res;
+}
+
+static char *dpapi_unprotect(const char *stored) {
+    if (!stored) return NULL;
+    if (strncmp(stored, "dpapi:", 6) != 0) {
+        return strdup(stored);   /* 明文兼容 */
+    }
+    const char *b64 = stored + 6;
+    DWORD binlen = 0;
+    if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, NULL, &binlen, NULL, NULL))
+        return NULL;
+    BYTE *bin = (BYTE*)malloc(binlen);
+    if (!bin) return NULL;
+    if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, bin, &binlen, NULL, NULL)) {
+        free(bin); return NULL;
+    }
+    DATA_BLOB in = { binlen, bin };
+    DATA_BLOB out = {0};
+    BOOL ok = CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &out);
+    free(bin);
+    if (!ok) return NULL;
+    char *res = (char*)malloc(out.cbData + 1);
+    if (!res) { LocalFree(out.pbData); return NULL; }
+    memcpy(res, out.pbData, out.cbData);
+    res[out.cbData] = '\0';
+    LocalFree(out.pbData);
+    return res;
+}
+
 static int json_selftest(void) {
     int fails = 0;
     #define CHK(cond) do { if(!(cond)) { printf("FAIL: %s\n", #cond); fails++; } } while(0)
@@ -115,6 +170,19 @@ static int json_selftest(void) {
         JValue *r = json_parse("\xEF\xBB\xBF  {\"k\":\"v\"}  ");
         CHK(r != NULL && strcmp(json_as_str(json_obj_get(r,"k")),"v")==0);
         json_free(r);
+    }
+
+    /* DPAPI round-trip + 明文兼容 */
+    {
+        const char *plain = "sk-test-key-123";
+        char *enc = dpapi_protect(plain);
+        CHK(enc != NULL && strncmp(enc, "dpapi:", 6) == 0);
+        char *dec = dpapi_unprotect(enc);
+        CHK(dec != NULL && strcmp(dec, plain) == 0);
+        free(enc); free(dec);
+        char *dec2 = dpapi_unprotect("sk-plain-key");
+        CHK(dec2 != NULL && strcmp(dec2, "sk-plain-key") == 0);
+        free(dec2);
     }
 
     if (fails == 0) printf("json_selftest: OK\n");
