@@ -118,12 +118,17 @@ make cagent_gui.exe
 | 网络错误诊断 | WinHTTP 错误码翻译为中文(DNS/连接/超时/SSL 证书),便于排错 |
 | API Key 加密 | DPAPI (`CryptProtectData`) 加密存储 `cagent.ini` 中的 Key,明文不入盘 |
 | 命令沙箱 | 危险命令(rm/del/format 等)执行前弹窗确认,拒绝则把结果交回模型 |
+| 对话历史持久化 | 每轮 done 后保存 `cagent_history.json`,启动加载恢复 LLM 上下文 |
 
 ### 工具
 
-目前只内置:
+目前内置:
 
-- `execute_bash(command)` — 通过 `cmd /c` 执行命令并捕获输出
+- `execute_bash(command)` — 通过 `cmd /c` 执行命令并捕获输出(危险命令弹窗确认)
+- `read_file(path)` — 读取文件文本内容(超大截断)
+- `write_file(path, content)` — 写入文件(已存在时弹窗确认覆盖)
+- `list_dir(path)` — 列出目录条目(名/大小/类型,超 200 截断)
+- `search(pattern, path)` — 在目录下文件内容中搜索(非递归,超 50 匹配截断)
 
 ---
 
@@ -172,6 +177,9 @@ A: Key 用 DPAPI 加密,绑定当前 Windows 用户。换机/换用户无法解�
 
 **Q: 模型要删文件时弹了确认框?**
 A: 命令沙箱拦截了危险命令(rm/del/format 等)。选"否"会把"(用户拒绝执行)"返回模型,模型可改用其他方案。
+
+**Q: 重启后历史框没有显示之前的对话?**
+A: 历史持久化只恢复 LLM 上下文(`messages`),不重建历史框显示。历史框会提示"已恢复历史对话",继续对话时模型仍记得之前内容。点"清空对话"会删除历史文件。
 
 ---
 
