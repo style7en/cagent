@@ -1,6 +1,6 @@
 # cagent
 
-用 C 语言实现的极简 AI Agent,**单文件 + 零第三方依赖**,运行在 Windows 平台。包含一个教学版 CLI 和一个 Win32 GUI 版,核心思想都是同一段 Agent 循环。
+用 C 语言实现的极简 AI Agent,**单文件 + 零第三方依赖**,运行在 Windows 平台。Win32 GUI 版,核心是同一段 Agent 循环。
 
 ---
 
@@ -9,10 +9,8 @@
 ```
 cagent/
 ├── Makefile            # 构建脚本
-├── cagent.ini          # GUI 版配置文件 (首次启动后自动生成)
-├── cagent_mini.c       # 教学版 CLI (~200 行)
-├── cagent_mini.exe     # 编译产物
-├── cagent_gui.c        # Win32 GUI 版 (~750 行)
+├── cagent.ini          # 配置文件 (首次启动后自动生成)
+├── cagent_gui.c        # Win32 GUI 版 (~1300 行)
 └── cagent_gui.exe      # 编译产物
 ```
 
@@ -29,47 +27,15 @@ cagent/
 ### 一键编译
 
 ```bash
-make            # 同时构建 mini + gui
-make clean      # 删除可执行文件和临时文件
+make            # 构建 cagent_gui
+make clean      # 删除可执行文件
 ```
 
 或单独构建:
 
 ```bash
-make cagent_mini.exe
 make cagent_gui.exe
 ```
-
----
-
-## 教学版 CLI: `cagent_mini.exe`
-
-最精简的 Agent 实现,**适合阅读源码学习 Agent 工作原理**:`call LLM → 检测 tool_calls → 执行工具 → 把结果追加进 messages → 继续 → 直到没有 tool_call 输出最终回复`。
-
-### 使用方式
-
-API/Key/Model 在源码顶部宏定义中写死。修改后重新编译:
-
-```c
-#define API_URL "https://your-endpoint/v1/chat/completions"
-#define API_KEY "sk-xxxxxxxx"
-#define MODEL   "your-model-id"
-```
-
-运行(任务作为命令行参数传入):
-
-```bash
-./cagent_mini.exe "请用 execute_bash 列出当前目录"
-```
-
-### 依赖
-
-- 系统中需有 `curl` 命令(Win10+ 内置)
-- 工具调用通过 `cmd /c` 执行
-
-### 工具
-
-- `execute_bash(command)` — 执行任意 shell 命令,捕获 stdout+stderr 返回给模型
 
 ---
 
@@ -148,7 +114,7 @@ API/Key/Model 在源码顶部宏定义中写死。修改后重新编译:
 
 ### 工具
 
-同 mini 版,目前只内置:
+目前只内置:
 
 - `execute_bash(command)` — 通过 `cmd /c` 执行命令并捕获输出
 
@@ -170,7 +136,7 @@ API/Key/Model 在源码顶部宏定义中写死。修改后重新编译:
 └─────────────────────────────────────────┘
 ```
 
-GUI 版 `cagent_gui.c` 的 `agent_thread` 和 mini 版 `cagent_mini.c` 的 `main` 都是这个循环的实现。
+`cagent_gui.c` 的 `agent_thread` 就是这个循环的实现。
 
 ---
 
@@ -183,7 +149,7 @@ A: 首次启动 `cagent.ini` 不存在,请在三个 Edit 中填入配置;关闭�
 A: API Key 错误或未授权,检查 Key 字段。
 
 **Q: 工具调用反复执行不停止?**
-A: 达到 `MAX_ITERATIONS=5` 后会显示 "(max iterations reached)",这是模型未能终止的兜底。可在源码中调大。
+A: 达到 `MAX_ITERATIONS=20` 后会显示 "(max iterations reached)",这是模型未能终止的兜底。可在源码中调大。
 
 **Q: 长输出被截断?**
 A: 缓冲区上限 `BUFSZ=256KB`(单次工具输出/单次 LLM 响应),按需调整。
