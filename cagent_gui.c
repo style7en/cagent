@@ -657,16 +657,49 @@ static void http_set_err(char *out, size_t cap) {
 /* ===== WinHTTP POST =====
  * 解析 url 得到 host/port/path/是否 https,然后 WinHTTP 发起请求。
  * 响应正文写入 out (含 \0),返回 HTTP 状态码,失败返回 -1。 */
-static int http_post(const char *url, const char *api_key,
-                     const char *body, size_t body_len,
-                     char *out, size_t out_cap) {
-    if (out_cap > 0) out[0] = '\0';
+/* ===== SSE 流式 ===== */
+
+/* 流式累积的 tool_call (按 index 累积 delta 片段) */
+typedef struct {
+    char id[256];
+    char name[64];
+    char args[8192];   /* arguments 片段累积 */
+} StreamToolCall;
+
+/* 流式上下文: 跨 http_post_stream 传递 */
+typedef struct {
+    char content_buf[BUFSZ];   /* 累积完整 content 供 md_render */
+    size_t content_len;
+    LONG content_start;        /* 流式开始时历史框长度 (供 Markdown 替换定位) */
+    StreamToolCall calls[8];
+    int n_calls;
+} StreamCtx;
+
+/* content delta 回调: 增量显示 + 累积到 content_buf */
+static void on_content_delta(void *ud, const char *delta) {
+    StreamCtx *ctx = (StreamCtx*)ud;
+    append_text(delta);
+    size_t dl = strlen(delta);
+    if (ctx->content_len + dl < sizeof(ctx->content_buf) - 1) {
+        memcpy(ctx->content_buf + ctx->content_len, delta, dl);
+        ctx->content_len += dl;
+        ctx->content_buf[ctx->content_len] = '\0';
+    }
+}
+
+/* SSE 流式 POST: 增量读取, content delta 回调, tool_calls delta 累积到 ctx。
+ * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断). */
+static int http_post_stream(const char *url, const char *api_key,
+                            const char *body, size_t body_len,
+                            char *err_out, size_t err_cap,
+                            StreamCtx *ctx) {
+    if (err_cap > 0) err_out[0] = '\0';
 
     const char *p = url;
     int https = 0;
     if (strncmp(p, "https://", 8) == 0) { https = 1; p += 8; }
     else if (strncmp(p, "http://", 7) == 0) { p += 7; }
-    else return -1;
+    else { snprintf(err_out, err_cap, "[网络错误] URL 非法"); return -1; }
 
     const char *host_start = p;
     const char *path_start = strchr(p, '/');
@@ -681,12 +714,10 @@ static int http_post(const char *url, const char *api_key,
     } else {
         host_end = host_start + strlen(host_start);
     }
-
     char host[256] = {0};
     size_t host_len = (size_t)(host_end - host_start);
-    if (host_len >= sizeof(host)) return -1;
+    if (host_len >= sizeof(host)) { snprintf(err_out, err_cap, "[网络错误] 主机名过长"); return -1; }
     memcpy(host, host_start, host_len);
-
     const char *path = path_start ? path_start : "/";
 
     WCHAR whost[256], wpath[1024];
@@ -694,98 +725,112 @@ static int http_post(const char *url, const char *api_key,
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024);
 
     HINTERNET hSession = WinHttpOpen(L"cagent-gui/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) { http_set_err(out, out_cap); return -1; }
-
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) { http_set_err(err_out, err_cap); return -1; }
     HINTERNET hConnect = WinHttpConnect(hSession, whost, port, 0);
-    if (!hConnect) { http_set_err(out, out_cap); WinHttpCloseHandle(hSession); return -1; }
-
+    if (!hConnect) { http_set_err(err_out, err_cap); WinHttpCloseHandle(hSession); return -1; }
     DWORD flags = https ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hReq = WinHttpOpenRequest(hConnect, L"POST", wpath, NULL,
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hReq) {
-        http_set_err(out, out_cap);
-        WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        return -1;
-    }
-
-    /* 可选: 跳过 SSL 证书校验 (自签端点, 默认仍严格校验) */
+    if (!hReq) { http_set_err(err_out, err_cap); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return -1; }
     if (g_skip_cert_verify && https) {
-        DWORD sec = SECURITY_FLAG_IGNORE_UNKNOWN_CA
-                  | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
-                  | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
-                  | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        DWORD sec = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+                  | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
         WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &sec, sizeof(sec));
     }
 
-    /* 头部: Content-Type + Authorization */
     char hdrs_a[1024];
     snprintf(hdrs_a, sizeof(hdrs_a),
-        "Content-Type: application/json\r\nAuthorization: Bearer %s\r\n",
-        api_key);
+        "Content-Type: application/json\r\nAuthorization: Bearer %s\r\n", api_key);
     WCHAR hdrs[1024];
     MultiByteToWideChar(CP_UTF8, 0, hdrs_a, -1, hdrs, 1024);
-    WinHttpAddRequestHeaders(hReq, hdrs, (DWORD)wcslen(hdrs),
-        WINHTTP_ADDREQ_FLAG_ADD);
+    WinHttpAddRequestHeaders(hReq, hdrs, (DWORD)wcslen(hdrs), WINHTTP_ADDREQ_FLAG_ADD);
 
     DWORD blen = (DWORD)body_len;
-    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-        (LPVOID)body, blen, blen, 0);
+    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID)body, blen, blen, 0);
     if (ok) ok = WinHttpReceiveResponse(hReq, NULL);
-    if (!ok) http_set_err(out, out_cap);
+    if (!ok) { http_set_err(err_out, err_cap); WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return -1; }
 
-    int status = -1;
-    if (ok) {
-        DWORD st = 0, ss = sizeof(st);
-        WinHttpQueryHeaders(hReq,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &st, &ss, WINHTTP_NO_HEADER_INDEX);
-        status = (int)st;
+    DWORD st = 0, ss = sizeof(st);
+    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &st, &ss, WINHTTP_NO_HEADER_INDEX);
+    int status = (int)st;
 
+    if (status != 200) {
         size_t pos = 0;
         char tmp[8192];
         DWORD nread;
-        while (pos + 1 < out_cap &&
-               WinHttpReadData(hReq, tmp, sizeof(tmp), &nread) && nread > 0) {
-            size_t copy = nread;
-            if (pos + copy >= out_cap) copy = out_cap - 1 - pos;
-            memcpy(out + pos, tmp, copy);
-            pos += copy;
-        }
-        out[pos] = '\0';
-    }
-
-    WinHttpCloseHandle(hReq);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    return status;
-}
-
-/* 发起一次 chat/completions 请求, 把响应写入全局 resp.
- * 返回值: HTTP 状态码; <0 表示网络层失败; 非 200 表示业务/认证错误. */
-static int call_llm(void) {
-    /* 用户填的是 base url (例: https://x.com/v1),程序自动追加 /chat/completions */
-    char full_url[1280];
-    size_t n = strlen(g_api_url);
-    int has_slash = (n > 0 && g_api_url[n-1] == '/');
-    snprintf(full_url, sizeof(full_url), "%s%schat/completions",
-             g_api_url, has_slash ? "" : "/");
-
-    int status = http_post(full_url, g_api_key, body, strlen(body), resp, BUFSZ);
-    if (status < 0) {
-        /* resp 已由 http_post 写入诊断文本; 兜底防空 */
-        if (!resp[0]) snprintf(resp, BUFSZ, "[网络错误] 未知失败");
-    } else if (status != 200) {
-        /* 保留响应体方便调试,但前面加状态码 */
         char prefix[64];
         int plen = snprintf(prefix, sizeof(prefix), "[HTTP %d] ", status);
-        size_t blen = strlen(resp);
-        if (plen + blen + 1 < BUFSZ) {
-            memmove(resp + plen, resp, blen + 1);
-            memcpy(resp, prefix, plen);
+        if (plen < (int)err_cap) { memcpy(err_out, prefix, plen); pos = plen; }
+        while (pos + 1 < err_cap && WinHttpReadData(hReq, tmp, sizeof(tmp), &nread) && nread > 0) {
+            size_t copy = nread;
+            if (pos + copy >= err_cap) copy = err_cap - 1 - pos;
+            memcpy(err_out + pos, tmp, copy);
+            pos += copy;
+        }
+        err_out[pos] = '\0';
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return status;
+    }
+
+    /* 流式读取 + SSE 解析 */
+    char linebuf[8192];
+    size_t lpos = 0;
+    char tmp[8192];
+    DWORD nread;
+    int cancelled = 0;
+    while (WinHttpReadData(hReq, tmp, sizeof(tmp), &nread) && nread > 0) {
+        if (InterlockedCompareExchange(&g_cancel, 0, 0)) { cancelled = 1; break; }
+        for (DWORD i = 0; i < nread; i++) {
+            char c = tmp[i];
+            if (c == '\n' || lpos >= sizeof(linebuf) - 1) {
+                linebuf[lpos] = '\0';
+                size_t lbLen = strlen(linebuf);
+                while (lbLen > 0 && linebuf[lbLen-1] == '\r') linebuf[--lbLen] = '\0';
+                if (strncmp(linebuf, "data: ", 6) == 0) {
+                    const char *json = linebuf + 6;
+                    if (strcmp(json, "[DONE]") == 0) { lpos = 0; goto stream_done; }
+                    JValue *root = json_parse(json);
+                    if (root) {
+                        const JValue *choices = json_obj_get(root, "choices");
+                        const JValue *delta = json_obj_get(json_arr_at(choices, 0), "delta");
+                        const char *content = json_as_str(json_obj_get(delta, "content"));
+                        if (content) on_content_delta(ctx, content);
+                        const JValue *tcs = json_obj_get(delta, "tool_calls");
+                        if (tcs && tcs->type == J_ARR) {
+                            for (size_t j = 0; j < tcs->arr.n; j++) {
+                                const JValue *tc = tcs->arr.items[j];
+                                int idx = 0;
+                                const JValue *idxv = json_obj_get(tc, "index");
+                                if (idxv && idxv->type == J_NUM) idx = (int)idxv->num;
+                                if (idx < 0 || idx >= 8) continue;
+                                if (idx >= ctx->n_calls) ctx->n_calls = idx + 1;
+                                StreamToolCall *sc = &ctx->calls[idx];
+                                const char *id = json_as_str(json_obj_get(tc, "id"));
+                                if (id) snprintf(sc->id, sizeof(sc->id), "%s", id);
+                                const JValue *fn = json_obj_get(tc, "function");
+                                const char *name = json_as_str(json_obj_get(fn, "name"));
+                                if (name) snprintf(sc->name, sizeof(sc->name), "%s", name);
+                                const char *args = json_as_str(json_obj_get(fn, "arguments"));
+                                if (args) {
+                                    size_t al = strlen(sc->args);
+                                    snprintf(sc->args + al, sizeof(sc->args) - al, "%s", args);
+                                }
+                            }
+                        }
+                        json_free(root);
+                    }
+                }
+                lpos = 0;
+            } else {
+                linebuf[lpos++] = c;
+            }
         }
     }
+stream_done:
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    if (cancelled) return -2;
     return status;
 }
 
@@ -1027,13 +1072,32 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             goto done;
         }
         snprintf(body, BUFSZ,
-            "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s}",
+            "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true}",
             g_model, messages, TOOLS_JSON);
 
         append_text("(thinking...)\r\n");
-        int status = call_llm();
 
-        /* === 失败判定: HTTP 非 200 (含网络层失败的 -1), 回滚 === */
+        /* 流式 SSE 请求 */
+        StreamCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.content_start = GetWindowTextLength(g_hHistory);
+
+        char full_url[1280];
+        size_t nurl = strlen(g_api_url);
+        int has_slash = (nurl > 0 && g_api_url[nurl-1] == '/');
+        snprintf(full_url, sizeof(full_url), "%s%schat/completions",
+                 g_api_url, has_slash ? "" : "/");
+
+        int status = http_post_stream(full_url, g_api_key, body, strlen(body),
+                                      resp, BUFSZ, &ctx);
+
+        /* 取消 */
+        if (status == -2) {
+            append_text("(已取消)\r\n");
+            rolled_back = 1;
+            goto done;
+        }
+        /* 失败 (网络错误或非 200) */
         if (status != 200) {
             append_text(resp);
             append_text(ROLLBACK_HINT);
@@ -1041,99 +1105,28 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             goto done;
         }
 
-        /* 无工具调用: 用解析器取 choices[0].message.content */
-        {
-            JValue *root = json_parse(resp);
-            const char *content = NULL;
-            if (root) {
-                const JValue *choices = json_obj_get(root, "choices");
-                const JValue *msg = json_obj_get(json_arr_at(choices, 0), "message");
-                content = json_as_str(json_obj_get(msg, "content"));
+        if (ctx.n_calls > 0) {
+            /* 有 tool_calls: 从 ctx.calls 转 ToolCall 并执行 */
+            typedef struct {
+                char id[256]; char name[64]; char args[4096]; char *output;
+            } ToolCall;
+            ToolCall calls[8];
+            int n_calls = 0;
+            for (int i = 0; i < ctx.n_calls && n_calls < 8; i++) {
+                if (!ctx.calls[i].name[0]) continue;
+                ToolCall *c = &calls[n_calls++];
+                c->id[0] = c->name[0] = c->args[0] = '\0';
+                c->output = NULL;
+                snprintf(c->id, sizeof(c->id), "%s", ctx.calls[i].id);
+                snprintf(c->name, sizeof(c->name), "%s", ctx.calls[i].name);
+                snprintf(c->args, sizeof(c->args), "%s", ctx.calls[i].args);
             }
-            if (content) {
-                append_text(content);
-                append_text("\r\n");
-
-                /* 成功: 把 assistant 最终回复追加进历史 (溢出则回滚) */
-                char *esc_content = json_escape_alloc(content);
-                if (esc_content) {
-                    size_t len = strlen(messages);
-                    int an = snprintf(messages + len, BUFSZ - len,
-                        ",{\"role\":\"assistant\",\"content\":\"%s\"}", esc_content);
-                    free(esc_content);
-                    if (an <= 0 || (size_t)an >= BUFSZ - len) {
-                        append_text("(历史空间不足, 本轮回滚)\r\n");
-                        rolled_back = 1;
-                    }
-                }
-                json_free(root);
-            } else {
-                /* 响应解析失败 (root==NULL 或 content 缺失/为 null): 回滚 */
-                append_text("(响应解析失败)\r\n");
-                append_text(resp);
+            if (n_calls == 0) {
+                append_text("(tool_calls 解析失败)\r\n");
                 append_text(ROLLBACK_HINT);
                 rolled_back = 1;
-                json_free(root);
                 goto done;
             }
-            goto done;
-        }
-
-        /* === 工具调用分支 ===
-         * 用解析器取 choices[0].message.tool_calls[] (支持并行调用), 全部执行,
-         * 然后: 1) 写一条 assistant 消息含全部 tool_calls; 2) 每个调用写一条 tool 消息.
-         * 必须 1:1 配对, 否则服务端报 invalid_arguments. */
-        JValue *root = json_parse(resp);
-        if (!root) {
-            append_text("(响应解析失败)\r\n");
-            append_text(resp);
-            append_text(ROLLBACK_HINT);
-            rolled_back = 1;
-            goto done;
-        }
-        const JValue *choices = json_obj_get(root, "choices");
-        const JValue *msg = json_obj_get(json_arr_at(choices, 0), "message");
-        const JValue *tcs = json_obj_get(msg, "tool_calls");
-        if (!tcs || tcs->type != J_ARR || tcs->arr.n == 0) {
-            append_text("(tool_calls 解析失败)\r\n");
-            append_text(resp);
-            append_text(ROLLBACK_HINT);
-            rolled_back = 1;
-            json_free(root);
-            goto done;
-        }
-
-        typedef struct {
-            char id[256];
-            char name[64];
-            char args[4096];
-            char *output;   /* heap, 末尾 free */
-        } ToolCall;
-        ToolCall calls[8];   /* 单轮最多 8 个并行调用 */
-        int n_calls = 0;
-        for (size_t i = 0; i < tcs->arr.n && n_calls < (int)(sizeof(calls)/sizeof(calls[0])); i++) {
-            const JValue *tc = tcs->arr.items[i];
-            const char *id = json_as_str(json_obj_get(tc, "id"));
-            const JValue *fn = json_obj_get(tc, "function");
-            const char *name = json_as_str(json_obj_get(fn, "name"));
-            const char *args = json_as_str(json_obj_get(fn, "arguments"));
-            ToolCall *c = &calls[n_calls++];
-            c->id[0] = c->name[0] = c->args[0] = '\0';
-            c->output = NULL;
-            if (id)   snprintf(c->id,   sizeof(c->id),   "%s", id);
-            if (name) snprintf(c->name, sizeof(c->name), "%s", name);
-            if (args) snprintf(c->args, sizeof(c->args), "%s", args);
-        }
-        /* 解析结果已拷贝进 calls, root 可释放 */
-        json_free(root);
-
-        if (n_calls == 0) {
-            append_text("(tool_calls 解析失败)\r\n");
-            append_text(resp);
-            append_text(ROLLBACK_HINT);
-            rolled_back = 1;
-            goto done;
-        }
 
         /* 执行所有工具: arguments 是字符串化 JSON, 二次解析取 command */
         for (int i = 0; i < n_calls; i++) {
@@ -1229,6 +1222,27 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             messages[mstart] = '\0';
             append_text("(历史空间或内存不足, 本轮回滚)\r\n");
             rolled_back = 1;
+            goto done;
+        }
+        } else {
+            /* 无 tool_calls: content 收尾 (Task 3 在此插入 md_render 替换) */
+            if (ctx.content_len > 0) {
+                char *esc = json_escape_alloc(ctx.content_buf);
+                if (esc) {
+                    size_t len = strlen(messages);
+                    int an = snprintf(messages + len, BUFSZ - len,
+                        ",{\"role\":\"assistant\",\"content\":\"%s\"}", esc);
+                    free(esc);
+                    if (an <= 0 || (size_t)an >= BUFSZ - len) {
+                        append_text("(历史空间不足, 本轮回滚)\r\n");
+                        rolled_back = 1;
+                    }
+                }
+            } else {
+                append_text("(响应解析失败)\r\n");
+                append_text(ROLLBACK_HINT);
+                rolled_back = 1;
+            }
             goto done;
         }
     }
