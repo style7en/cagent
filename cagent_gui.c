@@ -775,7 +775,38 @@ static void oem_to_utf8(char *buf, size_t cap) {
     free(w);
 }
 
+/* 危险命令模式表 (子串匹配, 宁可误报不漏报) */
+static const char *DANGEROUS[] = {
+    "rm", "del", "erase", "rmdir", "rd", "format", "shutdown",
+    "taskkill", "reg delete", "diskpart", "mklink", "takeown", "icacls"
+};
+
 static void execute_bash(const char *command) {
+    /* 危险命令确认: 命中模式表则弹 MessageBox 让用户决定 */
+    for (size_t i = 0; i < sizeof(DANGEROUS)/sizeof(DANGEROUS[0]); i++) {
+        if (strstr(command, DANGEROUS[i])) {
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, command, -1, NULL, 0);
+            WCHAR *wcmd = (WCHAR*)malloc(wlen * sizeof(WCHAR));
+            WCHAR msg[8192];
+            if (wcmd) {
+                MultiByteToWideChar(CP_UTF8, 0, command, -1, wcmd, wlen);
+                swprintf(msg, sizeof(msg)/sizeof(msg[0]),
+                         L"模型请求执行以下命令:\n\n%s\n\n确认执行?", wcmd);
+                free(wcmd);
+            } else {
+                swprintf(msg, sizeof(msg)/sizeof(msg[0]),
+                         L"模型请求执行一条危险命令, 确认执行?");
+            }
+            int rc = MessageBoxW(NULL, msg, L"危险命令确认",
+                                 MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+            if (rc != IDYES) {
+                strcpy(tool_out, "(用户拒绝执行)");
+                return;
+            }
+            break;
+        }
+    }
+
     int n = run_pipe(command, tool_out, BUFSZ);
     if (n <= 0) { strcpy(tool_out, "(no output)"); return; }
     oem_to_utf8(tool_out, BUFSZ);
