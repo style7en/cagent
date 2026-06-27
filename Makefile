@@ -6,7 +6,7 @@ LDFLAGS = -s
 
 GUI_TARGET = cagent_gui.exe
 GUI_SRC = cagent_gui.c
-GUI_LDFLAGS = -mwindows -lcomctl32 -lwinhttp -lcrypt32
+GUI_LDFLAGS = -mwindows -lcomctl32 -lwinhttp -lcrypt32 -lriched20
 
 .PHONY: all clean
 

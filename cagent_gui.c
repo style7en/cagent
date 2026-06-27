@@ -27,6 +27,7 @@
 #include <commctrl.h>
 #include <winhttp.h>
 #include <wincrypt.h>
+#include <richedit.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1501,11 +1502,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         set_edit_utf8(g_hCfg[CFG_KEY], g_api_key);
         set_edit_utf8(g_hCfg[CFG_MDL], g_model);
 
-        g_hHistory = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        g_hHistory = CreateWindowExW(WS_EX_CLIENTEDGE, RICHEDIT_CLASSW, L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL |
             ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_HISTORY, NULL, NULL);
-        SendMessage(g_hHistory, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+        /* RichEdit 默认字符格式 (16pt Microsoft YaHei UI) */
+        {
+            CHARFORMAT2W cf;
+            memset(&cf, 0, sizeof(cf));
+            cf.cbSize = sizeof(cf);
+            cf.dwMask = CFM_FACE | CFM_SIZE | CFM_CHARSET;
+            cf.yHeight = 320;   /* 16pt × 20 */
+            cf.bCharSet = DEFAULT_CHARSET;
+            wcscpy(cf.szFaceName, L"Microsoft YaHei UI");
+            SendMessage(g_hHistory, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
+        }
 
         g_hInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL |
@@ -1651,6 +1662,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
         freopen("selftest.txt", "w", stdout);
         return json_selftest();
     }
+    LoadLibraryW(L"riched20.dll");   /* 注册 RichEdit 控件类 */
     enable_dpi_awareness();   /* 必须在创建任何窗口之前调用 */
     InitCommonControls();
 
