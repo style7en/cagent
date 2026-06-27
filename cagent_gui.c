@@ -485,48 +485,6 @@ static char *json_escape_alloc(const char *src) {
     return buf;
 }
 
-/* 从 JSON 文本里抽出 "key":"value" 的 value, 解码常见转义.
- * out 至多写 out_cap-1 字节 + '\0'. 返回 1 表示找到并完整写入, 0 表示未找到.
- * 若 value 超长被截断, 仍返回 1 但 out 是截断结果. */
-static int extract_string(const char *s, const char *key, char *out, size_t out_cap) {
-    if (!s || out_cap == 0) { if (out_cap) out[0] = '\0'; return 0; }
-    out[0] = '\0';
-    char pattern[128];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(s, pattern);
-    if (!p) return 0;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != ':') return 0;
-    p++;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != '"') return 0;
-    p++;
-    size_t j = 0;
-    /* 每次循环最多写 2 字节 (\u 解码出 UTF-8 时), 留 1 字节给 '\0' */
-    while (*p && *p != '"' && j + 2 < out_cap) {
-        if (*p == '\\' && *(p+1)) {
-            char c = *(p+1);
-            if (c == 'n') { out[j++] = '\n'; p += 2; }
-            else if (c == 't') { out[j++] = '\t'; p += 2; }
-            else if (c == 'r') { p += 2; }
-            else if (c == 'u' && p[2] && p[3] && p[4] && p[5]) {
-                char hex[5] = { p[2], p[3], p[4], p[5], 0 };
-                unsigned int v = (unsigned int)strtol(hex, NULL, 16);
-                if (v < 0x80) out[j++] = (char)v;
-                else { out[j++] = (char)(0xC0 | (v >> 6));
-                       out[j++] = (char)(0x80 | (v & 0x3F)); }
-                p += 6;
-            }
-            else { out[j++] = c; p += 2; }
-        } else {
-            out[j++] = *p++;
-        }
-    }
-    out[j] = '\0';
-    return 1;
-}
-
 /* 用 CreateProcess + 匿名管道静默运行命令(仅本地工具用),纯内存收发数据。
  * 子进程的 stdout+stderr 合并写入 output (含 \0)。
  * 返回实际读到的字节数,失败返回 -1。 */
@@ -798,14 +756,20 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             goto done;
         }
 
-        if (!strstr(resp, "\"tool_calls\"")) {
-            char content[BUFSZ];
-            if (extract_string(resp, "content", content, sizeof(content))) {
+        /* 无工具调用: 用解析器取 choices[0].message.content */
+        {
+            JValue *root = json_parse(resp);
+            const char *content = NULL;
+            if (root) {
+                const JValue *choices = json_obj_get(root, "choices");
+                const JValue *msg = json_obj_get(json_arr_at(choices, 0), "message");
+                content = json_as_str(json_obj_get(msg, "content"));
+            }
+            if (content) {
                 append_text(content);
                 append_text("\r\n");
 
-                /* 成功: 把 assistant 最终回复也追加进历史
-                 * (若拼接溢出会得到截断的非法 JSON, 必须回滚) */
+                /* 成功: 把 assistant 最终回复追加进历史 (溢出则回滚) */
                 char *esc_content = json_escape_alloc(content);
                 if (esc_content) {
                     size_t len = strlen(messages);
@@ -817,48 +781,66 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
                         rolled_back = 1;
                     }
                 }
+                json_free(root);
             } else {
-                /* 响应不含 content 也不含 tool_calls: 视为解析失败, 回滚 */
+                /* 响应解析失败 (root==NULL 或 content 缺失/为 null): 回滚 */
                 append_text("(响应解析失败)\r\n");
                 append_text(resp);
                 append_text(ROLLBACK_HINT);
                 rolled_back = 1;
+                json_free(root);
+                goto done;
             }
             goto done;
         }
 
         /* === 工具调用分支 ===
-         * 解析所有 tool_calls (OpenAI 协议支持并行调用), 全部执行, 然后:
-         *   1) 写一条 assistant 消息, 其 tool_calls 数组包含全部调用
-         *   2) 为每个调用写一条 tool 消息
-         * 必须 1:1 配对, 否则下一轮服务端会以 invalid_arguments 报错. */
-        const char *tc_section = strstr(resp, "\"tool_calls\"");
+         * 用解析器取 choices[0].message.tool_calls[] (支持并行调用), 全部执行,
+         * 然后: 1) 写一条 assistant 消息含全部 tool_calls; 2) 每个调用写一条 tool 消息.
+         * 必须 1:1 配对, 否则服务端报 invalid_arguments. */
+        JValue *root = json_parse(resp);
+        if (!root) {
+            append_text("(响应解析失败)\r\n");
+            append_text(resp);
+            append_text(ROLLBACK_HINT);
+            rolled_back = 1;
+            goto done;
+        }
+        const JValue *choices = json_obj_get(root, "choices");
+        const JValue *msg = json_obj_get(json_arr_at(choices, 0), "message");
+        const JValue *tcs = json_obj_get(msg, "tool_calls");
+        if (!tcs || tcs->type != J_ARR || tcs->arr.n == 0) {
+            append_text("(tool_calls 解析失败)\r\n");
+            append_text(resp);
+            append_text(ROLLBACK_HINT);
+            rolled_back = 1;
+            json_free(root);
+            goto done;
+        }
 
-        /* 第一遍: 解析 + 执行, 收集结果 */
         typedef struct {
             char id[256];
             char name[64];
             char args[4096];
             char *output;   /* heap, 末尾 free */
         } ToolCall;
-        ToolCall calls[8];   /* 单轮最多 8 个并行调用, 足够使用 */
+        ToolCall calls[8];   /* 单轮最多 8 个并行调用 */
         int n_calls = 0;
-
-        /* 收集所有 tool_calls. 每个 tool_call 以 "id": 起头, 顺序扫描.
-         * extract_string 取第一次匹配, 在 tool_call 子串起点上抽 id/name/arguments
-         * 自然能命中本调用的字段. */
-        const char *cursor = tc_section;
-        while (n_calls < (int)(sizeof(calls)/sizeof(calls[0]))) {
-            const char *p = strstr(cursor, "\"id\":");
-            if (!p) break;
+        for (size_t i = 0; i < tcs->arr.n && n_calls < (int)(sizeof(calls)/sizeof(calls[0])); i++) {
+            const JValue *tc = tcs->arr.items[i];
+            const char *id = json_as_str(json_obj_get(tc, "id"));
+            const JValue *fn = json_obj_get(tc, "function");
+            const char *name = json_as_str(json_obj_get(fn, "name"));
+            const char *args = json_as_str(json_obj_get(fn, "arguments"));
             ToolCall *c = &calls[n_calls++];
             c->id[0] = c->name[0] = c->args[0] = '\0';
             c->output = NULL;
-            extract_string(p, "id", c->id, sizeof(c->id));
-            extract_string(p, "name", c->name, sizeof(c->name));
-            extract_string(p, "arguments", c->args, sizeof(c->args));
-            cursor = p + 5;   /* 跳过本次 "id": 防止死循环 */
+            if (id)   snprintf(c->id,   sizeof(c->id),   "%s", id);
+            if (name) snprintf(c->name, sizeof(c->name), "%s", name);
+            if (args) snprintf(c->args, sizeof(c->args), "%s", args);
         }
+        /* 解析结果已拷贝进 calls, root 可释放 */
+        json_free(root);
 
         if (n_calls == 0) {
             append_text("(tool_calls 解析失败)\r\n");
@@ -868,7 +850,7 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             goto done;
         }
 
-        /* 执行所有工具 */
+        /* 执行所有工具: arguments 是字符串化 JSON, 二次解析取 command */
         for (int i = 0; i < n_calls; i++) {
             ToolCall *c = &calls[i];
             {
@@ -877,7 +859,12 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
                 append_text(line);
             }
             char command[4096] = "";
-            extract_string(c->args, "command", command, sizeof(command));
+            JValue *argsj = json_parse(c->args);
+            if (argsj) {
+                const char *cmd = json_as_str(json_obj_get(argsj, "command"));
+                if (cmd) snprintf(command, sizeof(command), "%s", cmd);
+                json_free(argsj);
+            }
             execute_bash(command);
             c->output = strdup(tool_out);
             {
