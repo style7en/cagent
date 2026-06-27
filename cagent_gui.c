@@ -840,6 +840,11 @@ static void reset_conversation(void) {
     snprintf(messages, BUFSZ, "%s", SYSTEM_PROMPT);
 }
 
+/* 前向声明: agent_thread 调用历史函数, 其定义在 config 区之后 */
+static void get_history_path(char *out, size_t cap);
+static void history_save(void);
+static int  history_load(void);
+
 static DWORD WINAPI agent_thread(LPVOID arg) {
     AgentTask *task = (AgentTask*)arg;
 
@@ -854,6 +859,9 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
     if (strlen(messages) > MESSAGES_WATERMARK) {
         append_text("(对话历史过长, 已自动清空上下文)\r\n");
         reset_conversation();
+        char hpath[MAX_PATH];
+        get_history_path(hpath, sizeof(hpath));
+        DeleteFileA(hpath);
     }
 
     /* 2. 若首次发言, messages 还是空(没经过 config_load 之外的初始化) */
@@ -1084,6 +1092,7 @@ done:
     if (rolled_back) {
         messages[savepoint] = '\0';
     }
+    history_save();   /* 每轮 done 后保存 (含回滚后状态) */
     free(task);
     PostMessage(g_hHistory, WM_APP_DONE, 0, 0);
     return 0;
@@ -1123,6 +1132,40 @@ static void get_ini_path(char *out, size_t cap) {
     if (slash) *(slash + 1) = '\0';
     else exe[0] = '\0';
     snprintf(out, cap, "%scagent.ini", exe);
+}
+
+/* 取 exe 同目录下的 cagent_history.json 绝对路径 */
+static void get_history_path(char *out, size_t cap) {
+    char exe[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) { snprintf(out, cap, "cagent_history.json"); return; }
+    char *slash = strrchr(exe, '\\');
+    if (slash) *(slash + 1) = '\0';
+    else exe[0] = '\0';
+    snprintf(out, cap, "%scagent_history.json", exe);
+}
+
+/* 把 messages 写入历史文件 (失败静默) */
+static void history_save(void) {
+    char path[MAX_PATH];
+    get_history_path(path, sizeof(path));
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fputs(messages, f);
+    fclose(f);
+}
+
+/* 读历史文件到 messages, 成功返回 1, 失败/不存在返回 0 */
+static int history_load(void) {
+    char path[MAX_PATH];
+    get_history_path(path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t n = fread(messages, 1, BUFSZ - 1, f);
+    fclose(f);
+    if (n == 0) return 0;
+    messages[n] = '\0';
+    return 1;
 }
 
 /* 简单 key=value 解析器:遇到目标 key 把 value 拷入 out (去掉行尾 \r\n) */
@@ -1337,8 +1380,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_CLEAR, NULL, NULL);
         SendMessage(g_hClear, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
-        /* 初始化对话历史(只有 system prompt) */
-        reset_conversation();
+        /* 加载历史对话; 失败则初始化为只含 system prompt */
+        if (!history_load()) reset_conversation();
+        else append_text("(已恢复历史对话, 可继续)\r\n");
 
         /* DPAPI 解密失败提示 (config_load 在历史框创建前执行, 延迟到此处显示) */
         if (g_key_decrypt_failed) {
@@ -1369,6 +1413,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == ID_CLEAR && HIWORD(wp) == BN_CLICKED) {
             if (!g_running) {  /* 任务运行中不允许清空 */
                 reset_conversation();
+                char hpath[MAX_PATH];
+                get_history_path(hpath, sizeof(hpath));
+                DeleteFileA(hpath);   /* 同步删除历史文件 */
                 SetWindowTextW(g_hHistory, L"");
                 SetFocus(g_hInput);
             }
