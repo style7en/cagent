@@ -1002,6 +1002,121 @@ done:
 
 /* ===== Agent 工作线程 ===== */
 
+/* ===== Markdown 渲染 (RichEdit) ===== */
+
+/* 选中 [start, end), 设置字符格式 */
+static void rich_set_fmt(HWND h, LONG start, LONG end,
+                         DWORD mask, DWORD effects, int yHeight,
+                         COLORREF back, const WCHAR *face) {
+    SendMessage(h, EM_SETSEL, start, end);
+    CHARFORMAT2W cf;
+    memset(&cf, 0, sizeof(cf));
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = mask;
+    cf.dwEffects = effects;
+    if (yHeight > 0) cf.yHeight = yHeight;
+    if (back != 0) cf.crBackColor = back;
+    if (face) wcscpy(cf.szFaceName, face);
+    SendMessage(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+}
+
+/* 追加 UTF-16 文本到 RichEdit 末尾, 返回追加起始位置 */
+static LONG rich_append(HWND h, const WCHAR *wtext) {
+    LONG start = GetWindowTextLength(h);
+    SendMessage(h, EM_SETSEL, start, start);
+    SendMessage(h, EM_REPLACESEL, FALSE, (LPARAM)wtext);
+    return start;
+}
+
+/* 把 Markdown 基础集 (标题/粗体/代码块/行内代码) 渲染追加到 RichEdit。 */
+static void md_render(HWND h, const char *utf8) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wlen <= 0) return;
+    WCHAR *wbuf = (WCHAR*)malloc(wlen * sizeof(WCHAR));
+    if (!wbuf) return;
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wbuf, wlen);
+
+    const COLORREF code_bg = RGB(245, 245, 245);
+    int in_codeblock = 0;
+    WCHAR *line = wbuf;
+    while (line < wbuf + wlen) {
+        WCHAR *eol = wcschr(line, L'\n');
+        int linelen = eol ? (int)(eol - line) : (int)(wbuf + wlen - 1 - line);
+        WCHAR save = line[linelen];
+        line[linelen] = L'\0';
+
+        /* 代码块围栏 ``` */
+        if (wcsncmp(line, L"```", 3) == 0) {
+            in_codeblock = !in_codeblock;
+            LONG s = rich_append(h, line);
+            rich_set_fmt(h, s, s + linelen, CFM_FACE | CFM_BACKCOLOR, 0, 0, code_bg, L"Consolas");
+            rich_append(h, L"\r\n");
+            line[linelen] = save;
+            if (!eol) break;
+            line = eol + 1;
+            continue;
+        }
+
+        if (in_codeblock) {
+            LONG s = rich_append(h, line);
+            rich_set_fmt(h, s, s + linelen, CFM_FACE | CFM_BACKCOLOR, 0, 0, code_bg, L"Consolas");
+            rich_append(h, L"\r\n");
+            line[linelen] = save;
+            if (!eol) break;
+            line = eol + 1;
+            continue;
+        }
+
+        /* 标题 # / ## / ### */
+        int hlvl = 0, hoff = 0;
+        if (wcsncmp(line, L"### ", 4) == 0) { hlvl = 3; hoff = 4; }
+        else if (wcsncmp(line, L"## ", 3) == 0) { hlvl = 2; hoff = 3; }
+        else if (wcsncmp(line, L"# ", 2) == 0) { hlvl = 1; hoff = 2; }
+        if (hlvl > 0) {
+            int yh = (hlvl == 1) ? 480 : (hlvl == 2) ? 400 : 360;
+            LONG s = rich_append(h, line + hoff);
+            rich_set_fmt(h, s, s + (linelen - hoff), CFM_SIZE | CFM_BOLD, CFE_BOLD, yh, 0, NULL);
+            rich_append(h, L"\r\n");
+            line[linelen] = save;
+            if (!eol) break;
+            line = eol + 1;
+            continue;
+        }
+
+        /* 普通行: 先追加, 再处理行内 ` 和 ** */
+        LONG s = rich_append(h, line);
+        /* 行内代码 `...` */
+        {
+            WCHAR *p = line;
+            while ((p = wcsstr(p, L"`")) != NULL) {
+                WCHAR *q = wcsstr(p + 1, L"`");
+                if (!q) break;
+                LONG cs = s + (LONG)(p + 1 - line);
+                LONG ce = s + (LONG)(q - line);
+                rich_set_fmt(h, cs, ce, CFM_FACE | CFM_BACKCOLOR, 0, 0, code_bg, L"Consolas");
+                p = q + 1;
+            }
+        }
+        /* 粗体 **...** */
+        {
+            WCHAR *p = line;
+            while ((p = wcsstr(p, L"**")) != NULL) {
+                WCHAR *q = wcsstr(p + 2, L"**");
+                if (!q) break;
+                LONG cs = s + (LONG)(p + 2 - line);
+                LONG ce = s + (LONG)(q - line);
+                rich_set_fmt(h, cs, ce, CFM_BOLD, CFE_BOLD, 0, 0, NULL);
+                p = q + 2;
+            }
+        }
+        rich_append(h, L"\r\n");
+        line[linelen] = save;
+        if (!eol) break;
+        line = eol + 1;
+    }
+    free(wbuf);
+}
+
 typedef struct { char user_msg[BUFSZ]; } AgentTask;
 
 #define SYSTEM_PROMPT \
@@ -1225,8 +1340,15 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             goto done;
         }
         } else {
-            /* 无 tool_calls: content 收尾 (Task 3 在此插入 md_render 替换) */
+            /* 无 tool_calls: content 收尾。把流式显示的纯文本段替换为 Markdown 渲染。 */
             if (ctx.content_len > 0) {
+                /* 选中并删除流式期间追加的纯文本 [content_start, 末尾) */
+                LONG content_end = GetWindowTextLength(g_hHistory);
+                SendMessage(g_hHistory, EM_SETSEL, ctx.content_start, content_end);
+                SendMessage(g_hHistory, EM_REPLACESEL, FALSE, (LPARAM)L"");
+                /* 渲染 Markdown 追加 */
+                md_render(g_hHistory, ctx.content_buf);
+                /* 追加 assistant content 到 messages */
                 char *esc = json_escape_alloc(ctx.content_buf);
                 if (esc) {
                     size_t len = strlen(messages);
