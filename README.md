@@ -78,6 +78,7 @@ make cagent_gui.exe
 | **Url-Base** | 填到 `/v1` 即可,程序自动追加 `/chat/completions`<br>例: `https://token.sensenova.cn/v1` |
 | **Key** | OpenAI 兼容的 API Key,显示为 `*` |
 | **Model** | 模型 ID,例: `deepseek-v4-flash` |
+| **skip_cert_verify** | 写在 `cagent.ini` 中,`1`=跳过 SSL 证书校验(自签端点用,默认 `0` 严格) |
 
 ### 配置文件 `cagent.ini`
 
@@ -90,8 +91,9 @@ make cagent_gui.exe
   ```ini
   # cagent GUI 配置 (UTF-8, 退出时自动保存)
   url_base=https://token.sensenova.cn/v1
-  api_key=sk-xxxxxxxx
+  api_key=dpapi:<DPAPI 加密的 base64>
   model=deepseek-v4-flash
+  skip_cert_verify=0
   ```
 
 ### 操作
@@ -114,6 +116,8 @@ make cagent_gui.exe
 | 配置持久化 | 启动加载/退出保存 `cagent.ini` |
 | 协作式取消 | Agent 运行时"发送"按钮变"停止",点击后在迭代间隙优雅退出并回滚本轮历史 |
 | 网络错误诊断 | WinHTTP 错误码翻译为中文(DNS/连接/超时/SSL 证书),便于排错 |
+| API Key 加密 | DPAPI (`CryptProtectData`) 加密存储 `cagent.ini` 中的 Key,明文不入盘 |
+| 命令沙箱 | 危险命令(rm/del/format 等)执行前弹窗确认,拒绝则把结果交回模型 |
 
 ### 工具
 
@@ -162,6 +166,12 @@ A: LLM 请求通常 1-5 秒,期间界面显示 `(thinking...)` 但仍可拖动�
 
 **Q: 点了"停止"但还在转?**
 A: 取消是协作式的:已发出的 HTTP 请求无法中途打断,会在下一个迭代间隙生效。若长时间无响应(如服务端不返回),等待超时后才会退出。
+
+**Q: 换了电脑/用户后 API Key 解密失败?**
+A: Key 用 DPAPI 加密,绑定当前 Windows 用户。换机/换用户无法解密,程序会提示并清空 Key,重新填写即可。
+
+**Q: 模型要删文件时弹了确认框?**
+A: 命令沙箱拦截了危险命令(rm/del/format 等)。选"否"会把"(用户拒绝执行)"返回模型,模型可改用其他方案。
 
 ---
 
