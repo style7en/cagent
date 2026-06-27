@@ -458,6 +458,7 @@ static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
 static char g_api_key[512]  = "";
 static char g_model[128]    = "";
 static int g_key_decrypt_failed = 0;   /* DPAPI 解密失败标志, 启动后提示 */
+static int g_skip_cert_verify = 0;     /* 1=跳过 SSL 证书校验 (自签端点用) */
 
 /* Agent 工作缓冲(只在工作线程使用,主线程不碰) */
 static char messages[BUFSZ];
@@ -682,6 +683,15 @@ static int http_post(const char *url, const char *api_key,
         http_set_err(out, out_cap);
         WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
         return -1;
+    }
+
+    /* 可选: 跳过 SSL 证书校验 (自签端点, 默认仍严格校验) */
+    if (g_skip_cert_verify && https) {
+        DWORD sec = SECURITY_FLAG_IGNORE_UNKNOWN_CA
+                  | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+                  | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+                  | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &sec, sizeof(sec));
     }
 
     /* 头部: Content-Type + Authorization */
@@ -1152,6 +1162,8 @@ static void config_load(void) {
         }
         else if (strcmp(key, "model") == 0)
             snprintf(g_model, sizeof(g_model), "%s", val);
+        else if (strcmp(key, "skip_cert_verify") == 0)
+            g_skip_cert_verify = (atoi(val) != 0);
     }
     fclose(f);
 }
@@ -1177,6 +1189,7 @@ static void config_save(void) {
         else fprintf(f, "api_key=%s\r\n", g_api_key);   /* 加密失败降级明文 */
     }
     fprintf(f, "model=%s\r\n",    g_model);
+    fprintf(f, "skip_cert_verify=%d\r\n", g_skip_cert_verify);
     fclose(f);
 }
 
