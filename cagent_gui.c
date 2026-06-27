@@ -536,6 +536,29 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     return (int)pos;
 }
 
+/* 把 WinHTTP/系统错误码翻译为中文可读文本 (静态字符串, 勿 free)。 */
+static const char *winhttp_err_msg(DWORD code) {
+    switch (code) {
+    case ERROR_WINHTTP_NAME_NOT_RESOLVED:        return "DNS 解析失败, 请检查 Url-Base";
+    case ERROR_WINHTTP_CANNOT_CONNECT:           return "无法连接服务器";
+    case ERROR_WINHTTP_CONNECTION_ERROR:         return "连接被重置";
+    case ERROR_WINHTTP_TIMEOUT:                  return "请求超时";
+    case ERROR_WINHTTP_SECURE_INVALID_CERT:      return "SSL 证书无效";
+    case ERROR_WINHTTP_SECURE_CERT_CN_INVALID:   return "证书主机名不匹配";
+    case ERROR_WINHTTP_SECURE_CERT_DATE_INVALID: return "证书已过期或未生效 (请检查系统时间)";
+    case ERROR_WINHTTP_SECURE_CHANNEL_ERROR:     return "SSL/TLS 通道建立失败";
+    default: return NULL;
+    }
+}
+
+/* 把当前 GetLastError() 翻译后写入 out。 */
+static void http_set_err(char *out, size_t cap) {
+    DWORD e = GetLastError();
+    const char *m = winhttp_err_msg(e);
+    if (m) snprintf(out, cap, "[网络错误] %s", m);
+    else snprintf(out, cap, "[网络错误] WinHTTP 错误 %lu", e);
+}
+
 /* ===== WinHTTP POST =====
  * 解析 url 得到 host/port/path/是否 https,然后 WinHTTP 发起请求。
  * 响应正文写入 out (含 \0),返回 HTTP 状态码,失败返回 -1。 */
@@ -578,15 +601,16 @@ static int http_post(const char *url, const char *api_key,
     HINTERNET hSession = WinHttpOpen(L"cagent-gui/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return -1;
+    if (!hSession) { http_set_err(out, out_cap); return -1; }
 
     HINTERNET hConnect = WinHttpConnect(hSession, whost, port, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return -1; }
+    if (!hConnect) { http_set_err(out, out_cap); WinHttpCloseHandle(hSession); return -1; }
 
     DWORD flags = https ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hReq = WinHttpOpenRequest(hConnect, L"POST", wpath, NULL,
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hReq) {
+        http_set_err(out, out_cap);
         WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
         return -1;
     }
@@ -605,6 +629,7 @@ static int http_post(const char *url, const char *api_key,
     BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
         (LPVOID)body, blen, blen, 0);
     if (ok) ok = WinHttpReceiveResponse(hReq, NULL);
+    if (!ok) http_set_err(out, out_cap);
 
     int status = -1;
     if (ok) {
@@ -645,7 +670,8 @@ static int call_llm(void) {
 
     int status = http_post(full_url, g_api_key, body, strlen(body), resp, BUFSZ);
     if (status < 0) {
-        snprintf(resp, BUFSZ, "{\"error\":\"WinHTTP request failed\"}");
+        /* resp 已由 http_post 写入诊断文本; 兜底防空 */
+        if (!resp[0]) snprintf(resp, BUFSZ, "[网络错误] 未知失败");
     } else if (status != 200) {
         /* 保留响应体方便调试,但前面加状态码 */
         char prefix[64];
