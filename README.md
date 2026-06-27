@@ -100,6 +100,7 @@ make cagent_gui.exe
 
 - **回车**发送(等同点击"发送"按钮)
 - **运行中取消**:Agent 调用期间"发送"按钮变为"停止",点击即请求取消;取消在下一个安全点(下一轮迭代前或工具执行前)生效,正在进行的 HTTP 请求无法立即打断
+- **流式显示**:LLM 回复逐字流式显示(纯文本),结束后自动渲染 Markdown 格式(标题/粗体/代码块)
 - 模型调用期间输入框自动禁用,完成后自动恢复
 - 长内容自动换行,自动滚动到底部
 
@@ -119,6 +120,9 @@ make cagent_gui.exe
 | API Key 加密 | DPAPI (`CryptProtectData`) 加密存储 `cagent.ini` 中的 Key,明文不入盘 |
 | 命令沙箱 | 危险命令(rm/del/format 等)执行前弹窗确认,拒绝则把结果交回模型 |
 | 对话历史持久化 | 每轮 done 后保存 `cagent_history.json`,启动加载恢复 LLM 上下文 |
+| RichEdit 显示 | 历史框用 RichEdit 2.0,支持格式化文本 |
+| 流式 SSE | LLM 响应逐字流式显示(`stream:true`),工具调用 delta 累积 |
+| Markdown 渲染 | 标题/粗体/代码块/行内代码基础集渲染(content 结束后替换) |
 
 ### 工具
 
