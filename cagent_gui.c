@@ -901,7 +901,7 @@ static void tool_read_file(const char *path) {
     if (n >= BUFSZ - 64) {
         strcat(tool_out, "\n(已截断, 文件过大)");
     }
-    oem_to_utf8(tool_out, BUFSZ);
+    /* 文件内容直接用 (假设 UTF-8); 不调 oem_to_utf8 (那是给 cmd 的 GBK 输出用的) */
 }
 
 static void tool_write_file(const char *path, const char *content) {
