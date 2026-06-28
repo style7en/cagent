@@ -459,6 +459,7 @@ static char g_api_key[512]  = "";
 static char g_model[128]    = "";
 static int g_key_decrypt_failed = 0;   /* DPAPI 解密失败标志, 启动后提示 */
 static int g_skip_cert_verify = 0;     /* 1=跳过 SSL 证书校验 (自签端点用) */
+static char g_workspace[MAX_PATH] = "";/* 工作目录 (文件工具限制在此目录内, 默认 exe 目录) */
 
 /* Agent 工作缓冲(只在工作线程使用,主线程不碰) */
 static char messages[BUFSZ];
@@ -834,10 +835,10 @@ stream_done:
 
 /* 把 cmd.exe 的 OEM/ANSI 输出转成 UTF-8.
  * cmd.exe 的 stdout 用当前控制台的 OEM 代码页 (中文系统 = CP936/GBK),
- * 直接当 UTF-8 处理会得到 ????. 用 GetACP() 拿到系统代码页, GBK→UTF-16→UTF-8.
+ * 直接当 UTF-8 处理会得到 ????. 用 GetOEMCP() 拿到 cmd 输出代码页 (OEM/GBK), GBK→UTF-16→UTF-8.
  * 转换失败则原样保留(降级而非崩溃). */
 static void oem_to_utf8(char *buf, size_t cap) {
-    UINT cp = GetACP();
+    UINT cp = GetOEMCP();
     if (cp == CP_UTF8 || buf[0] == '\0') return;
 
     int wlen = MultiByteToWideChar(cp, 0, buf, -1, NULL, 0);
@@ -853,29 +854,43 @@ static void oem_to_utf8(char *buf, size_t cap) {
     free(w);
 }
 
-/* 危险命令模式表 (子串匹配, 宁可误报不漏报) */
-static const char *DANGEROUS[] = {
-    "rm", "del", "erase", "rmdir", "rd", "format", "shutdown",
-    "taskkill", "reg delete", "diskpart", "mklink", "takeown", "icacls"
-};
-
-/* 检查命令是否危险 (子串匹配 DANGEROUS 表) */
-static int is_dangerous(const char *command) {
-    for (size_t i = 0; i < sizeof(DANGEROUS)/sizeof(DANGEROUS[0]); i++) {
-        if (strstr(command, DANGEROUS[i])) return 1;
-    }
-    return 0;
-}
-
 static void execute_bash(const char *command) {
     int n = run_pipe(command, tool_out, BUFSZ);
     if (n <= 0) { strcpy(tool_out, "(no output)"); return; }
     oem_to_utf8(tool_out, BUFSZ);
 }
 
+/* ===== 工作目录限制 ===== */
+
+/* 确保 g_workspace 已初始化 (默认 exe 目录) */
+static void ensure_workspace(void) {
+    if (g_workspace[0]) return;
+    char exe[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) { GetCurrentDirectoryA(MAX_PATH, g_workspace); return; }
+    char *slash = strrchr(exe, '\\');
+    if (slash) *slash = '\0';
+    snprintf(g_workspace, sizeof(g_workspace), "%s", exe);
+}
+
+/* 检查 path 规范化后是否在 g_workspace 内。返回 1 合法, 0 非法。 */
+static int path_in_workspace(const char *path) {
+    ensure_workspace();
+    char abs[MAX_PATH], ws[MAX_PATH];
+    DWORD n = GetFullPathNameA(path, MAX_PATH, abs, NULL);
+    if (n == 0 || n >= MAX_PATH) return 0;
+    n = GetFullPathNameA(g_workspace, MAX_PATH, ws, NULL);
+    if (n == 0 || n >= MAX_PATH) return 0;
+    size_t wl = strlen(ws);
+    if (strncmp(abs, ws, wl) != 0) return 0;
+    if (abs[wl] != '\\' && abs[wl] != '\0') return 0;
+    return 1;
+}
+
 /* ===== 结构化工具 (写入全局 tool_out) ===== */
 
 static void tool_read_file(const char *path) {
+    if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
     FILE *f = fopen(path, "rb");
     if (!f) { snprintf(tool_out, BUFSZ, "(读取失败: 无法打开 %s)", path); return; }
     size_t n = fread(tool_out, 1, BUFSZ - 64, f);
@@ -888,6 +903,7 @@ static void tool_read_file(const char *path) {
 }
 
 static void tool_write_file(const char *path, const char *content) {
+    if (!path_in_workspace(path)) { strcpy(tool_out, "(拒绝: 路径在工作目录外)"); return; }
     /* 覆盖确认: 文件已存在则弹窗 (工作线程, 同命令沙箱) */
     FILE *test = fopen(path, "rb");
     if (test) {
@@ -905,6 +921,7 @@ static void tool_write_file(const char *path, const char *content) {
 }
 
 static void tool_list_dir(const char *path) {
+    if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
     char pattern[MAX_PATH];
     snprintf(pattern, sizeof(pattern), "%s\\*", path);
     WIN32_FIND_DATAA fd;
@@ -929,6 +946,7 @@ static void tool_list_dir(const char *path) {
 }
 
 static void tool_search(const char *pattern, const char *path) {
+    if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
     char glob[MAX_PATH];
     snprintf(glob, sizeof(glob), "%s\\*", path);
     WIN32_FIND_DATAA fd;
@@ -1126,19 +1144,7 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             JValue *argsj = json_parse(c->args);
             if (strcmp(c->name, "execute_bash") == 0) {
                 const char *cmd = json_as_str(json_obj_get(argsj, "command"));
-                const char *ccmd = cmd ? cmd : "";
-                if (is_dangerous(ccmd)) {
-                    /* 高危命令确认: 只提示是否执行, 不显示具体命令 (避免信息不全/截断) */
-                    if (MessageBoxW(NULL, L"模型请求执行高危命令, 是否执行?",
-                                    L"高危命令确认",
-                                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
-                        strcpy(tool_out, "(用户拒绝执行)");
-                    } else {
-                        execute_bash(ccmd);
-                    }
-                } else {
-                    execute_bash(ccmd);
-                }
+                execute_bash(cmd ? cmd : "");
             } else if (strcmp(c->name, "read_file") == 0) {
                 const char *p = json_as_str(json_obj_get(argsj, "path"));
                 tool_read_file(p ? p : "");
@@ -1361,6 +1367,8 @@ static void config_load(void) {
             snprintf(g_model, sizeof(g_model), "%s", val);
         else if (strcmp(key, "skip_cert_verify") == 0)
             g_skip_cert_verify = (atoi(val) != 0);
+        else if (strcmp(key, "workspace") == 0)
+            snprintf(g_workspace, sizeof(g_workspace), "%s", val);
     }
     fclose(f);
 }
@@ -1387,6 +1395,7 @@ static void config_save(void) {
     }
     fprintf(f, "model=%s\r\n",    g_model);
     fprintf(f, "skip_cert_verify=%d\r\n", g_skip_cert_verify);
+    fprintf(f, "workspace=%s\r\n", g_workspace);
     fclose(f);
 }
 
