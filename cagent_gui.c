@@ -27,6 +27,7 @@
 #include <commctrl.h>
 #include <winhttp.h>
 #include <wincrypt.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -437,6 +438,9 @@ void json_free(JValue *v) {
 #define ID_CLEAR    1004
 #define ID_CFG_BASE 1005   /* +0 url, +1 key, +2 model */
 #define ID_LBL_BASE 1008   /* +0 url, +1 key, +2 model */
+#define ID_LBL_WS   1011   /* 工作目录标签 */
+#define ID_WS_EDIT  1012   /* 工作目录输入框 */
+#define ID_WS_BTN   1013   /* 浏览按钮 */
 
 #define WM_APP_APPEND  (WM_APP + 1)   /* lParam = UTF-8 char* (须 free) */
 #define WM_APP_DONE    (WM_APP + 2)   /* Agent 任务完成,启用 UI */
@@ -448,6 +452,7 @@ void json_free(JValue *v) {
 /* ===== 全局状态 ===== */
 static HWND g_hHistory, g_hInput, g_hSend, g_hClear;
 static HWND g_hCfg[3];                 /* [url, key, model] */
+static HWND g_hWorkspace, g_hWsBrowse; /* 工作目录 Edit + 浏览按钮 */
 static HFONT g_hFont;
 static HANDLE g_hThread = NULL;
 static volatile LONG g_running = 0;   /* 1 = Agent 工作线程运行中 */
@@ -1414,6 +1419,7 @@ static void start_task(HWND hwnd) {
     read_edit_utf8(g_hCfg[CFG_URL], g_api_url, sizeof(g_api_url));
     read_edit_utf8(g_hCfg[CFG_KEY], g_api_key, sizeof(g_api_key));
     read_edit_utf8(g_hCfg[CFG_MDL], g_model,   sizeof(g_model));
+    read_edit_utf8(g_hWorkspace, g_workspace, sizeof(g_workspace));
 
     if (!g_api_url[0] || !g_api_key[0] || !g_model[0]) {
         MessageBoxW(hwnd, L"请填写 Url-Base、Key、Model 三项配置。",
@@ -1445,19 +1451,28 @@ static void layout(HWND hwnd) {
     int gap = 8;
     int row_h = 26;             /* 配置区每行高度 */
     int lbl_w = 80;             /* 标签宽 (容纳 "Url-Base:") */
-    int top_h = row_h * 3 + gap * 4;  /* 3 行 + 4 个间隙 */
+    int top_h = row_h * 4 + gap * 5;  /* 4 行 + 5 个间隙 */
     int btn_w = 80;
     int clear_w = 80;
+    int ws_btn_w = 72;           /* 工作目录浏览按钮宽 */
     int input_h = 72;           /* 多行输入框, 约 3 行高 (Enter 发送, Shift+Enter 换行) */
     int input_y = H - input_h - gap;
     int input_w = W - btn_w - clear_w - gap * 4;
 
-    /* 三行配置 */
+    /* 四行配置: url / key / model / workspace */
     for (int i = 0; i < 3; i++) {
         int y = gap + i * (row_h + gap);
         HWND lbl = GetDlgItem(hwnd, ID_LBL_BASE + i);
         MoveWindow(lbl,        gap,         y + 4, lbl_w,               row_h, TRUE);
         MoveWindow(g_hCfg[i],  gap + lbl_w, y,     W - gap*2 - lbl_w,   row_h, TRUE);
+    }
+    /* 第 4 行: 工作目录 (标签 + Edit + 浏览按钮) */
+    {
+        int y = gap + 3 * (row_h + gap);
+        HWND lbl = GetDlgItem(hwnd, ID_LBL_WS);
+        MoveWindow(lbl,           gap,         y + 4, lbl_w,             row_h, TRUE);
+        MoveWindow(g_hWorkspace,  gap + lbl_w, y,     W - gap*2 - lbl_w - ws_btn_w - gap, row_h, TRUE);
+        MoveWindow(g_hWsBrowse,   W - gap - ws_btn_w, y, ws_btn_w,       row_h, TRUE);
     }
 
     MoveWindow(g_hHistory, gap, top_h, W - gap * 2,
@@ -1518,6 +1533,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         set_edit_utf8(g_hCfg[CFG_KEY], g_api_key);
         set_edit_utf8(g_hCfg[CFG_MDL], g_model);
 
+        /* 第 4 行: 工作目录 (标签 + Edit + 浏览按钮) */
+        {
+            HWND lbl = CreateWindowW(L"STATIC", L"工作目录:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                0,0,0,0, hwnd, (HMENU)(LONG_PTR)ID_LBL_WS, NULL, NULL);
+            SendMessage(lbl, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            g_hWorkspace = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                0,0,0,0, hwnd, (HMENU)(LONG_PTR)ID_WS_EDIT, NULL, NULL);
+            SendMessage(g_hWorkspace, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            g_hWsBrowse = CreateWindowW(L"BUTTON", L"浏览...",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0,0,0,0, hwnd, (HMENU)(LONG_PTR)ID_WS_BTN, NULL, NULL);
+            SendMessage(g_hWsBrowse, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            ensure_workspace();
+            set_edit_utf8(g_hWorkspace, g_workspace);
+        }
+
         g_hHistory = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL |
             ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
@@ -1570,6 +1603,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 append_text("(正在停止...)\r\n");
             } else {
                 start_task(hwnd);
+            }
+            return 0;
+        }
+        if (LOWORD(wp) == ID_WS_BTN && HIWORD(wp) == BN_CLICKED) {
+            /* 浏览选择工作目录 */
+            BROWSEINFOW bi;
+            memset(&bi, 0, sizeof(bi));
+            bi.hwndOwner = hwnd;
+            bi.lpszTitle = L"选择工作目录";
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+            if (pidl) {
+                WCHAR wpath[MAX_PATH];
+                if (SHGetPathFromIDListW(pidl, wpath)) {
+                    char utf8[MAX_PATH];
+                    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, utf8, sizeof(utf8), NULL, NULL);
+                    snprintf(g_workspace, sizeof(g_workspace), "%s", utf8);
+                    set_edit_utf8(g_hWorkspace, g_workspace);
+                }
+                CoTaskMemFree(pidl);
             }
             return 0;
         }
