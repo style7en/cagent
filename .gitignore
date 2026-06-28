@@ -9,6 +9,9 @@ cagent.ini
 # 自测输出 (--selftest 生成, 临时文件)
 selftest.txt
 
+# 对话历史 (运行时生成)
+cagent_history.json
+
 # 编辑器/IDE
 .vscode/
 .idea/
