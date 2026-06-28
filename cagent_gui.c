@@ -28,6 +28,7 @@
 #include <winhttp.h>
 #include <wincrypt.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -457,6 +458,7 @@ static HFONT g_hFont;
 static HANDLE g_hThread = NULL;
 static volatile LONG g_running = 0;   /* 1 = Agent 工作线程运行中 */
 static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
+static volatile LONG g_danger_denied = 0;  /* 1 = 本轮已拒绝危险命令, 后续直接拒不再弹 */
 
 /* 运行时配置(在 start_task 时从 Edit 控件同步) */
 static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
@@ -859,13 +861,69 @@ static void oem_to_utf8(char *buf, size_t cap) {
     free(w);
 }
 
+/* 危险命令模式表 (子串匹配, 宁可误报不漏报) */
+static const char *DANGEROUS[] = {
+    "rm", "del", "erase", "rmdir", "rd", "format", "shutdown",
+    "taskkill", "reg delete", "diskpart", "mklink", "takeown", "icacls"
+};
+
+/* 危险命令词边界匹配: pat 作为独立 token 出现 (前为命令首/分隔符, 后为分隔符/结束)。
+ * 避免 "rd" 误命中 standard/keyboard 等。多词 pat (如 "reg delete") 整体匹配。 */
+static int danger_match(const char *cmd, const char *pat) {
+    size_t plen = strlen(pat);
+    if (plen == 0) return 0;
+    const char *p = cmd;
+    while ((p = strstr(p, pat)) != NULL) {
+        int at_start = (p == cmd);
+        char prev  = at_start ? '\0' : p[-1];
+        char after = p[plen];
+        int left_ok  = at_start || prev==' '||prev=='\t'||prev=='|'||prev=='&'||prev==';'||prev=='(';
+        int right_ok = after=='\0'||after==' '||after=='\t'||after=='|'||after=='&'||after==';'||after==')';
+        if (left_ok && right_ok) return 1;
+        p += 1;
+    }
+    return 0;
+}
+
 static void execute_bash(const char *command) {
+    /* 危险命令确认: 命中模式表则弹 MessageBox 让用户决定 */
+    for (size_t i = 0; i < sizeof(DANGEROUS)/sizeof(DANGEROUS[0]); i++) {
+        if (danger_match(command, DANGEROUS[i])) {
+            if (g_danger_denied) { strcpy(tool_out, "(用户拒绝执行)"); return; }
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, command, -1, NULL, 0);
+            WCHAR *wcmd = (WCHAR*)malloc(wlen * sizeof(WCHAR));
+            WCHAR msg[8192];
+            if (wcmd) {
+                MultiByteToWideChar(CP_UTF8, 0, command, -1, wcmd, wlen);
+                swprintf(msg, sizeof(msg)/sizeof(msg[0]),
+                         L"模型请求执行以下命令:\n\n%ls\n\n确认执行?", wcmd);
+                free(wcmd);
+            } else {
+                swprintf(msg, sizeof(msg)/sizeof(msg[0]),
+                         L"模型请求执行一条危险命令, 确认执行?");
+            }
+            int rc = MessageBoxW(NULL, msg, L"危险命令确认",
+                                 MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+            if (rc != IDYES) {
+                InterlockedExchange(&g_danger_denied, 1);
+                strcpy(tool_out, "(用户拒绝执行)");
+                return;   /* 拒绝: 把结果交给模型, 不执行 */
+            }
+            break;   /* 确认后不再重复弹 */
+        }
+    }
+
     int n = run_pipe(command, tool_out, BUFSZ);
     if (n <= 0) { strcpy(tool_out, "(no output)"); return; }
     oem_to_utf8(tool_out, BUFSZ);
 }
 
 /* ===== 工作目录限制 ===== */
+
+/* UTF-8 -> UTF-16, 写入 out (cap 为 wchar 数). 成功返回非 0. */
+static int utf8_to_wide(const char *u8, wchar_t *out, int cap) {
+    return MultiByteToWideChar(CP_UTF8, 0, u8, -1, out, cap) > 0;
+}
 
 /* 确保 g_workspace 已初始化 (默认 exe 目录) */
 static void ensure_workspace(void) {
@@ -881,14 +939,23 @@ static void ensure_workspace(void) {
 /* 检查 path 规范化后是否在 g_workspace 内。返回 1 合法, 0 非法。 */
 static int path_in_workspace(const char *path) {
     ensure_workspace();
-    char abs[MAX_PATH], ws[MAX_PATH];
-    DWORD n = GetFullPathNameA(path, MAX_PATH, abs, NULL);
+    wchar_t wbase[MAX_PATH], wabs[MAX_PATH], wws[MAX_PATH], wwsfull[MAX_PATH];
+    if (path[0] == '\\' || path[0] == '/' || (path[0] && path[1] == ':')) {
+        if (!utf8_to_wide(path, wbase, MAX_PATH)) return 0;
+    } else {
+        char base[MAX_PATH];
+        int m = snprintf(base, sizeof(base), "%s\\%s", g_workspace, path);
+        if (m < 0 || (size_t)m >= sizeof(base)) return 0;
+        if (!utf8_to_wide(base, wbase, MAX_PATH)) return 0;
+    }
+    DWORD n = GetFullPathNameW(wbase, MAX_PATH, wabs, NULL);
     if (n == 0 || n >= MAX_PATH) return 0;
-    n = GetFullPathNameA(g_workspace, MAX_PATH, ws, NULL);
+    if (!utf8_to_wide(g_workspace, wws, MAX_PATH)) return 0;
+    n = GetFullPathNameW(wws, MAX_PATH, wwsfull, NULL);
     if (n == 0 || n >= MAX_PATH) return 0;
-    size_t wl = strlen(ws);
-    if (strncmp(abs, ws, wl) != 0) return 0;
-    if (abs[wl] != '\\' && abs[wl] != '\0') return 0;
+    size_t wl = wcslen(wwsfull);
+    if (wcsncmp(wabs, wwsfull, wl) != 0) return 0;
+    if (wabs[wl] != L'\\' && wabs[wl] != L'\0') return 0;
     return 1;
 }
 
@@ -896,7 +963,9 @@ static int path_in_workspace(const char *path) {
 
 static void tool_read_file(const char *path) {
     if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
-    FILE *f = fopen(path, "rb");
+    wchar_t wpath[MAX_PATH];
+    if (!utf8_to_wide(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(读取失败: 路径过长)"); return; }
+    FILE *f = _wfopen(wpath, L"rb");
     if (!f) { snprintf(tool_out, BUFSZ, "(读取失败: 无法打开 %s)", path); return; }
     size_t n = fread(tool_out, 1, BUFSZ - 64, f);
     fclose(f);
@@ -909,15 +978,17 @@ static void tool_read_file(const char *path) {
 
 static void tool_write_file(const char *path, const char *content) {
     if (!path_in_workspace(path)) { strcpy(tool_out, "(拒绝: 路径在工作目录外)"); return; }
+    wchar_t wpath[MAX_PATH];
+    if (!utf8_to_wide(path, wpath, MAX_PATH)) { strcpy(tool_out, "(写入失败: 路径过长)"); return; }
     /* 覆盖确认: 文件已存在则弹窗 (工作线程, 同命令沙箱) */
-    FILE *test = fopen(path, "rb");
+    FILE *test = _wfopen(wpath, L"rb");
     if (test) {
         fclose(test);
         int rc = MessageBoxW(NULL, L"文件已存在, 确认覆盖?", L"write_file 确认",
                              MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
         if (rc != IDYES) { strcpy(tool_out, "(用户拒绝覆盖)"); return; }
     }
-    FILE *f = fopen(path, "wb");
+    FILE *f = _wfopen(wpath, L"wb");
     if (!f) { strcpy(tool_out, "(写入失败)"); return; }
     size_t len = strlen(content);
     fwrite(content, 1, len, f);
@@ -927,43 +998,47 @@ static void tool_write_file(const char *path, const char *content) {
 
 static void tool_list_dir(const char *path) {
     if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
-    char pattern[MAX_PATH];
-    snprintf(pattern, sizeof(pattern), "%s\\*", path);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
+    wchar_t wpath[MAX_PATH], wpattern[MAX_PATH];
+    if (!utf8_to_wide(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(列目录失败: 路径过长)"); return; }
+    swprintf(wpattern, MAX_PATH, L"%ls\\*", wpath);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
     if (h == INVALID_HANDLE_VALUE) { snprintf(tool_out, BUFSZ, "(列目录失败: %s)", path); return; }
     size_t pos = 0;
     int count = 0;
     do {
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
         const char *type = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "<DIR>" : "file";
+        char name_utf8[MAX_PATH * 3];
+        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name_utf8, sizeof(name_utf8), NULL, NULL);
+        unsigned long long sz = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         char line[512];
-        snprintf(line, sizeof(line), "%s\t%llu\t%s\n", fd.cFileName,
-                 (unsigned long long)fd.nFileSizeLow, type);
+        snprintf(line, sizeof(line), "%s\t%llu\t%s\n", name_utf8, sz, type);
         size_t ln = strlen(line);
-        if (pos + ln + 32 >= BUFSZ) { strcat(tool_out, "(更多条目已截断)"); break; }
+        if (pos + ln + 32 >= BUFSZ) { strcpy(tool_out + pos, "(更多条目已截断)"); break; }
         memcpy(tool_out + pos, line, ln);
         pos += ln;
-        if (++count >= 200) { strcat(tool_out, "(更多条目已截断)"); break; }
-    } while (FindNextFileA(h, &fd));
+        if (++count >= 200) { strcpy(tool_out + pos, "(更多条目已截断)"); break; }
+    } while (FindNextFileW(h, &fd));
     tool_out[pos] = '\0';
     FindClose(h);
 }
 
 static void tool_search(const char *pattern, const char *path) {
     if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
-    char glob[MAX_PATH];
-    snprintf(glob, sizeof(glob), "%s\\*", path);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(glob, &fd);
+    wchar_t wpath[MAX_PATH], wpattern[MAX_PATH];
+    if (!utf8_to_wide(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(搜索失败: 路径过长)"); return; }
+    swprintf(wpattern, MAX_PATH, L"%ls\\*", wpath);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
     if (h == INVALID_HANDLE_VALUE) { snprintf(tool_out, BUFSZ, "(搜索失败: %s)", path); return; }
     size_t pos = 0;
     int matches = 0;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;  /* 非递归: 跳过子目录 */
-        char fpath[MAX_PATH];
-        snprintf(fpath, sizeof(fpath), "%s\\%s", path, fd.cFileName);
-        FILE *f = fopen(fpath, "rb");
+        wchar_t wfpath[MAX_PATH];
+        swprintf(wfpath, MAX_PATH, L"%ls\\%ls", wpath, fd.cFileName);
+        FILE *f = _wfopen(wfpath, L"rb");
         if (!f) continue;
         char *buf = (char*)malloc(256 * 1024);
         if (!buf) { fclose(f); continue; }
@@ -971,6 +1046,8 @@ static void tool_search(const char *pattern, const char *path) {
         fclose(f);
         if (n == 0) { free(buf); continue; }
         buf[n] = '\0';
+        char name_utf8[MAX_PATH * 3];
+        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name_utf8, sizeof(name_utf8), NULL, NULL);
         char *line = buf;
         while (line < buf + n && matches < 50) {
             char *eol = strchr(line, '\n');
@@ -979,7 +1056,7 @@ static void tool_search(const char *pattern, const char *path) {
             line[linelen] = '\0';
             if (strstr(line, pattern)) {
                 char ml[1024];
-                snprintf(ml, sizeof(ml), "%s: %s\n", fd.cFileName, line);
+                snprintf(ml, sizeof(ml), "%s: %s\n", name_utf8, line);
                 size_t mlen = strlen(ml);
                 if (pos + mlen + 32 >= BUFSZ) {
                     pos += snprintf(tool_out + pos, BUFSZ - pos, "(更多匹配已截断)");
@@ -997,7 +1074,7 @@ static void tool_search(const char *pattern, const char *path) {
         }
         free(buf);
         if (matches >= 50) { pos += snprintf(tool_out + pos, BUFSZ - pos, "(更多匹配已截断)"); break; }
-    } while (FindNextFileA(h, &fd));
+    } while (FindNextFileW(h, &fd));
 done:
     tool_out[pos] = '\0';
     FindClose(h);
@@ -1009,7 +1086,9 @@ done:
 typedef struct { char user_msg[BUFSZ]; } AgentTask;
 
 #define SYSTEM_PROMPT \
-    "{\"role\":\"system\",\"content\":\"你是 cagent,一个由 C 语言实现的极简 AI Agent。" \
+    "{\"role\":\"system\",\"content\":\"你是 cagent,一个由 C 语言实现的极简 AI Agent,运行在 Windows 上。" \
+    "命令通过 cmd /c 执行,请用 Windows 命令风格:不要用 mkdir -p(直接 mkdir 即可)," \
+    "运行当前目录程序不要加 ./ 前缀。文件工具仅限工作目录内,用相对路径。" \
     "请始终使用中文回答。需要时调用工具。回答简洁。\"}"
 
 /* messages 缓冲水位线: 接近上限时整轮对话重置, 防止越界. */
@@ -1288,27 +1367,19 @@ static void set_edit_utf8(HWND h, const char *utf8) {
 
 /* ===== 配置文件 cagent.ini ===== */
 
-/* 取 exe 同目录下的 cagent.ini 绝对路径 */
-static void get_ini_path(char *out, size_t cap) {
+/* 取 exe 同目录下某文件的绝对路径 */
+static void get_app_path(char *out, size_t cap, const char *filename) {
     char exe[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) { snprintf(out, cap, "cagent.ini"); return; }
+    if (n == 0 || n >= MAX_PATH) { snprintf(out, cap, "%s", filename); return; }
     char *slash = strrchr(exe, '\\');
     if (slash) *(slash + 1) = '\0';
     else exe[0] = '\0';
-    snprintf(out, cap, "%scagent.ini", exe);
+    snprintf(out, cap, "%s%s", exe, filename);
 }
 
-/* 取 exe 同目录下的 cagent_history.json 绝对路径 */
-static void get_history_path(char *out, size_t cap) {
-    char exe[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) { snprintf(out, cap, "cagent_history.json"); return; }
-    char *slash = strrchr(exe, '\\');
-    if (slash) *(slash + 1) = '\0';
-    else exe[0] = '\0';
-    snprintf(out, cap, "%scagent_history.json", exe);
-}
+static void get_ini_path(char *out, size_t cap)     { get_app_path(out, cap, "cagent.ini"); }
+static void get_history_path(char *out, size_t cap) { get_app_path(out, cap, "cagent_history.json"); }
 
 /* 把 messages 写入历史文件 (失败静默) */
 static void history_save(void) {
@@ -1396,7 +1467,7 @@ static void config_save(void) {
     {
         char *enc = dpapi_protect(g_api_key);
         if (enc) { fprintf(f, "api_key=%s\r\n", enc); free(enc); }
-        else fprintf(f, "api_key=%s\r\n", g_api_key);   /* 加密失败降级明文 */
+        /* 加密失败: 不写 api_key 行, 避免明文落盘; 下次启动提示重填 */
     }
     fprintf(f, "model=%s\r\n",    g_model);
     fprintf(f, "skip_cert_verify=%d\r\n", g_skip_cert_verify);
@@ -1427,6 +1498,10 @@ static void start_task(HWND hwnd) {
         return;
     }
 
+    /* 同步进程 CWD 到工作目录 (execute_bash 子进程继承); 用 W 版以支持中文路径 */
+    wchar_t wws[MAX_PATH];
+    if (utf8_to_wide(g_workspace, wws, MAX_PATH)) SetCurrentDirectoryW(wws);
+
     WCHAR *wbuf = (WCHAR*)malloc((wlen + 1) * sizeof(WCHAR));
     GetWindowTextW(g_hInput, wbuf, wlen + 1);
 
@@ -1437,6 +1512,7 @@ static void start_task(HWND hwnd) {
     SetWindowTextW(g_hInput, L"");
 
     InterlockedExchange(&g_cancel, 0);          /* 清除取消标志 */
+    InterlockedExchange(&g_danger_denied, 0);   /* 清除危险命令拒绝标志 */
     EnableWindow(g_hInput, FALSE);              /* 输入框禁用 */
     EnableWindow(g_hClear, FALSE);              /* 清空按钮禁用 */
     SetWindowTextW(g_hSend, L"停止");           /* 发送按钮变停止, 保持启用 (点击即取消) */
@@ -1607,22 +1683,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (LOWORD(wp) == ID_WS_BTN && HIWORD(wp) == BN_CLICKED) {
-            /* 浏览选择工作目录 */
-            BROWSEINFOW bi;
-            memset(&bi, 0, sizeof(bi));
-            bi.hwndOwner = hwnd;
-            bi.lpszTitle = L"选择工作目录";
-            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-            LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
-            if (pidl) {
-                WCHAR wpath[MAX_PATH];
-                if (SHGetPathFromIDListW(pidl, wpath)) {
-                    char utf8[MAX_PATH];
-                    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, utf8, sizeof(utf8), NULL, NULL);
-                    snprintf(g_workspace, sizeof(g_workspace), "%s", utf8);
-                    set_edit_utf8(g_hWorkspace, g_workspace);
+            /* 浏览选择工作目录 (现代 IFileOpenDialog, 同文件选择对话框样式) */
+            IFileOpenDialog *pfd = NULL;
+            if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC,
+                                            &IID_IFileOpenDialog, (void**)&pfd))) {
+                FILEOPENDIALOGOPTIONS opts = 0;
+                pfd->lpVtbl->GetOptions(pfd, &opts);
+                pfd->lpVtbl->SetOptions(pfd, opts | FOS_PICKFOLDERS);
+                pfd->lpVtbl->SetTitle(pfd, L"选择工作目录");
+                if (SUCCEEDED(pfd->lpVtbl->Show(pfd, hwnd))) {
+                    IShellItem *psi = NULL;
+                    if (SUCCEEDED(pfd->lpVtbl->GetResult(pfd, &psi)) && psi) {
+                        PWSTR ppath = NULL;
+                        if (SUCCEEDED(psi->lpVtbl->GetDisplayName(psi, SIGDN_FILESYSPATH, &ppath)) && ppath) {
+                            char utf8[MAX_PATH];
+                            WideCharToMultiByte(CP_UTF8, 0, ppath, -1, utf8, sizeof(utf8), NULL, NULL);
+                            snprintf(g_workspace, sizeof(g_workspace), "%s", utf8);
+                            set_edit_utf8(g_hWorkspace, g_workspace);
+                            CoTaskMemFree(ppath);
+                        }
+                        psi->lpVtbl->Release(psi);
+                    }
                 }
-                CoTaskMemFree(pidl);
+                pfd->lpVtbl->Release(pfd);
             }
             return 0;
         }
@@ -1664,6 +1747,7 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_APP_DONE) {
         InterlockedExchange(&g_running, 0);
         InterlockedExchange(&g_cancel, 0);
+        InterlockedExchange(&g_danger_denied, 0);
         SetWindowTextW(g_hSend, L"发送");       /* 恢复按钮文本 */
         EnableWindow(g_hSend, TRUE);
         EnableWindow(g_hInput, TRUE);
@@ -1721,6 +1805,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
         freopen("selftest.txt", "w", stdout);
         return json_selftest();
     }
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);   /* COM 初始化 (IFileOpenDialog 用) */
     enable_dpi_awareness();   /* 必须在创建任何窗口之前调用 */
     InitCommonControls();
 
