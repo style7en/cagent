@@ -859,32 +859,15 @@ static const char *DANGEROUS[] = {
     "taskkill", "reg delete", "diskpart", "mklink", "takeown", "icacls"
 };
 
-static void execute_bash(const char *command) {
-    /* 危险命令确认: 命中模式表则弹 MessageBox 让用户决定 */
+/* 检查命令是否危险 (子串匹配 DANGEROUS 表) */
+static int is_dangerous(const char *command) {
     for (size_t i = 0; i < sizeof(DANGEROUS)/sizeof(DANGEROUS[0]); i++) {
-        if (strstr(command, DANGEROUS[i])) {
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, command, -1, NULL, 0);
-            WCHAR *wcmd = (WCHAR*)malloc(wlen * sizeof(WCHAR));
-            WCHAR msg[8192];
-            if (wcmd) {
-                MultiByteToWideChar(CP_UTF8, 0, command, -1, wcmd, wlen);
-                swprintf(msg, sizeof(msg)/sizeof(msg[0]),
-                         L"模型请求执行以下命令:\n\n%s\n\n确认执行?", wcmd);
-                free(wcmd);
-            } else {
-                swprintf(msg, sizeof(msg)/sizeof(msg[0]),
-                         L"模型请求执行一条危险命令, 确认执行?");
-            }
-            int rc = MessageBoxW(NULL, msg, L"危险命令确认",
-                                 MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-            if (rc != IDYES) {
-                strcpy(tool_out, "(用户拒绝执行)");
-                return;
-            }
-            break;
-        }
+        if (strstr(command, DANGEROUS[i])) return 1;
     }
+    return 0;
+}
 
+static void execute_bash(const char *command) {
     int n = run_pipe(command, tool_out, BUFSZ);
     if (n <= 0) { strcpy(tool_out, "(no output)"); return; }
     oem_to_utf8(tool_out, BUFSZ);
@@ -1143,7 +1126,30 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             JValue *argsj = json_parse(c->args);
             if (strcmp(c->name, "execute_bash") == 0) {
                 const char *cmd = json_as_str(json_obj_get(argsj, "command"));
-                execute_bash(cmd ? cmd : "");
+                const char *ccmd = cmd ? cmd : "";
+                if (is_dangerous(ccmd)) {
+                    /* 危险确认: 显示完整 arguments (工具名已在上文 [Tool] 行) */
+                    int wlen = MultiByteToWideChar(CP_UTF8, 0, c->args, -1, NULL, 0);
+                    WCHAR *wargs = (WCHAR*)malloc(wlen * sizeof(WCHAR));
+                    WCHAR msg[8192];
+                    if (wargs) {
+                        MultiByteToWideChar(CP_UTF8, 0, c->args, -1, wargs, wlen);
+                        swprintf(msg, sizeof(msg)/sizeof(msg[0]),
+                                 L"模型请求执行 execute_bash, 参数:\n\n%s\n\n确认执行?", wargs);
+                        free(wargs);
+                    } else {
+                        swprintf(msg, sizeof(msg)/sizeof(msg[0]),
+                                 L"模型请求执行一条危险命令, 确认执行?");
+                    }
+                    if (MessageBoxW(NULL, msg, L"危险命令确认",
+                                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                        strcpy(tool_out, "(用户拒绝执行)");
+                    } else {
+                        execute_bash(ccmd);
+                    }
+                } else {
+                    execute_bash(ccmd);
+                }
             } else if (strcmp(c->name, "read_file") == 0) {
                 const char *p = json_as_str(json_obj_get(argsj, "path"));
                 tool_read_file(p ? p : "");
