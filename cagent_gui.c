@@ -1128,20 +1128,9 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
                 const char *cmd = json_as_str(json_obj_get(argsj, "command"));
                 const char *ccmd = cmd ? cmd : "";
                 if (is_dangerous(ccmd)) {
-                    /* 危险确认: 显示完整 arguments (工具名已在上文 [Tool] 行) */
-                    int wlen = MultiByteToWideChar(CP_UTF8, 0, c->args, -1, NULL, 0);
-                    WCHAR *wargs = (WCHAR*)malloc(wlen * sizeof(WCHAR));
-                    WCHAR msg[8192];
-                    if (wargs) {
-                        MultiByteToWideChar(CP_UTF8, 0, c->args, -1, wargs, wlen);
-                        swprintf(msg, sizeof(msg)/sizeof(msg[0]),
-                                 L"模型请求执行 execute_bash, 参数:\n\n%s\n\n确认执行?", wargs);
-                        free(wargs);
-                    } else {
-                        swprintf(msg, sizeof(msg)/sizeof(msg[0]),
-                                 L"模型请求执行一条危险命令, 确认执行?");
-                    }
-                    if (MessageBoxW(NULL, msg, L"危险命令确认",
+                    /* 高危命令确认: 只提示是否执行, 不显示具体命令 (避免信息不全/截断) */
+                    if (MessageBoxW(NULL, L"模型请求执行高危命令, 是否执行?",
+                                    L"高危命令确认",
                                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
                         strcpy(tool_out, "(用户拒绝执行)");
                     } else {
