@@ -4,11 +4,10 @@
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
+/* 核心只依赖: 基础窗口类型 / WinHTTP / WinCrypt / C 运行时 */
 #include <windows.h>
 #include <winhttp.h>
 #include <wincrypt.h>
-#include <shlobj.h>
-#include <shobjidl.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

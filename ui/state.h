@@ -4,6 +4,10 @@
  * cagent 界面层的一部分, 由 cagent.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
+/* 界面层额外依赖: Shell/COM (选目录对话框) */
+#include <shlobj.h>
+#include <shobjidl.h>
+
 /* ===== 控件 ID ===== */
 #define ID_HISTORY  1001
 #define ID_INPUT    1002
@@ -14,7 +18,7 @@
 #define ID_LBL_WS   1011   /* 工作目录标签 */
 #define ID_WS_EDIT  1012   /* 工作目录输入框 */
 #define ID_WS_BTN   1013   /* 浏览按钮 */
-#define ID_SESS_BTN 1015   /* 加载会话按钮 */
+#define ID_SESS_BTN 1014   /* 加载会话按钮 */
 #define ID_SESS_LB  2001   /* 会话列表 ListBox */
 #define ID_SESS_OK  2002   /* 载入 */
 #define ID_SESS_CAN 2003   /* 取消 */

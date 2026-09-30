@@ -8,7 +8,6 @@
 
 static HWND g_sess_dlg   = NULL;
 static HWND g_sess_owner = NULL;
-static char g_sess_sel[MAX_PATH];
 static char g_sess_paths[64][MAX_PATH];
 static char g_sess_ws[64][200];      /* 第一行: 工作目录 */
 static char g_sess_sub[64][300];     /* 第二行: N 条消息 · 时间 · 预览 */
@@ -121,7 +120,13 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         for (int i = 0; i < g_sess_n; i++)
             SendMessageW(lb, LB_ADDSTRING, 0, 0);
-        if (g_sess_n > 0) SendMessageW(lb, LB_SETCURSEL, 0, 0);
+        /* 预选最近使用的会话 (ini 里记录的 last_session), 否则选第一条 */
+        {
+            int sel = 0;
+            for (int i = 0; i < g_sess_n; i++)
+                if (g_last_session[0] && strcmp(g_sess_paths[i], g_last_session) == 0) { sel = i; break; }
+            if (g_sess_n > 0) SendMessageW(lb, LB_SETCURSEL, sel, 0);
+        }
         CreateWindowW(L"BUTTON", L"载入", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
             300, 356, 100, 32, hwnd, (HMENU)(LONG_PTR)ID_SESS_OK, NULL, NULL);
         CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -165,10 +170,8 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == ID_SESS_OK && HIWORD(wp) == BN_CLICKED) {
             HWND lb = GetDlgItem(hwnd, ID_SESS_LB);
             LRESULT idx = SendMessageW(lb, LB_GETCURSEL, 0, 0);
-            if (idx != LB_ERR && idx < g_sess_n) {
-                snprintf(g_sess_sel, sizeof(g_sess_sel), "%s", g_sess_paths[idx]);
-                sess_apply_selected(g_sess_sel);
-            }
+            if (idx != LB_ERR && idx < g_sess_n)
+                sess_apply_selected(g_sess_paths[idx]);
             DestroyWindow(hwnd);
             return 0;
         }
