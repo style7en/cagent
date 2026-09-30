@@ -159,11 +159,20 @@ make cagent.exe
 
 目前内置(对齐 pi.dev 的极简理念,核心只保留 3 个工具):
 
-- `execute_bash(command)` — 通过 `cmd /c` 执行命令并捕获输出(不拦截,由用户自担风险)
-- `read_file(path)` — 读取文件文本内容(超大截断)
-- `write_file(path, content)` — 写入文件(直接覆盖,无确认)
+- `execute_bash(command)` — 执行 shell 命令并捕获输出(不拦截,由用户自担风险);
+  默认超时 60s(超时杀掉整个进程树),输出超限自动截断并附提示
+- `read_file(path)` — 读取文件文本内容;非 UTF-8(如 GBK)文本会自动转成 UTF-8;
+  超过上限时截断并告知文件总大小与续读方式
+- `write_file(path, content)` — 写入文件(直接覆盖,无确认);父目录需已存在
 
 > 没有专门的列目录/搜索工具:查看目录用 `dir`,递归搜索内容用 `findstr /s /i "关键词" *.*`,都走 `execute_bash`。
+
+**结果上限与调参**(避免单次工具输出撑爆上下文):
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `CAGENT_TOOL_OUTPUT_MAX` | 16384 (16KB) | 单次工具结果进入上下文的上限,超出即截断并附提示 |
+| `CAGENT_CMD_TIMEOUT` | 60 (秒) | 命令执行超时,超时终止整个进程树 |
 
 ---
 

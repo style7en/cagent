@@ -6,6 +6,7 @@
 
 #define BUFSZ           (256 * 1024)
 #define ARGS_MAX        8192   /* tool_calls.arguments 累积上限 (流式与执行期统一) */
+#define TOOL_OUTPUT_CAP (16 * 1024)  /* 单个工具结果进入上下文的上限, 超出即截断 */
 
 /* ===== 全局状态 ===== */
 static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
@@ -30,20 +31,33 @@ static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
 static const char *TOOLS_JSON =
     "[{\"type\":\"function\",\"function\":{"
     "\"name\":\"execute_bash\","
-    "\"description\":\"Execute a shell command via cmd /c\","
+    "\"description\":\"Run a shell command via 'cmd /c' on Windows, in the current workspace directory. "
+        "stdout and stderr are captured together and returned as text. Default timeout 60s "
+        "(env CAGENT_CMD_TIMEOUT overrides, in seconds), after which the whole process tree is killed. "
+        "Output longer than about 16KB is truncated, so prefer precise commands "
+        "(dir /b, findstr, type with a range) over dumping large files.\","
     "\"parameters\":{\"type\":\"object\","
-    "\"properties\":{\"command\":{\"type\":\"string\"}},"
+    "\"properties\":{\"command\":{\"type\":\"string\","
+        "\"description\":\"The full command line, e.g. 'dir /b' or 'gcc -o hello.exe hello.c'\"}},"
     "\"required\":[\"command\"]}}},"
     "{\"type\":\"function\",\"function\":{"
     "\"name\":\"read_file\","
-    "\"description\":\"Read text content of a file\","
+    "\"description\":\"Read a text file as UTF-8. Path must stay inside the workspace directory, "
+        "otherwise the call is rejected. At most about 16KB is returned; when the file is larger, "
+        "the result ends with a truncation note giving the total size, and the rest can be read "
+        "via execute_bash (findstr or a chunked command).\","
     "\"parameters\":{\"type\":\"object\","
-    "\"properties\":{\"path\":{\"type\":\"string\"}},"
+    "\"properties\":{\"path\":{\"type\":\"string\","
+        "\"description\":\"File path, absolute or relative to the workspace directory\"}},"
     "\"required\":[\"path\"]}}},"
     "{\"type\":\"function\",\"function\":{"
     "\"name\":\"write_file\","
-    "\"description\":\"Write content to a file (overwrite)\","
+    "\"description\":\"Create a file or overwrite it completely with UTF-8 content. Path must stay "
+        "inside the workspace directory, otherwise the call is rejected. The parent directory must "
+        "already exist (create it with execute_bash first if needed). Returns the bytes written.\","
     "\"parameters\":{\"type\":\"object\","
-    "\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},"
+    "\"properties\":{\"path\":{\"type\":\"string\","
+        "\"description\":\"File path, absolute or relative to the workspace directory\"},"
+        "\"content\":{\"type\":\"string\",\"description\":\"Full new file content (UTF-8)\"}},"
     "\"required\":[\"path\",\"content\"]}}}]";
 

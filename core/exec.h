@@ -17,6 +17,18 @@ static int cmd_timeout_ms(void) {
  * 返回实际读到的字节数,失败返回 -1。超过 timeout 则终止整个进程树。 */
 static size_t utf8_trim_len(const char *s, size_t len);   /* 前向声明 */
 
+/* 追加一段提示到输出尾部: 空间不足时先回退内容(对齐字符边界), 保证提示一定可见 */
+static void append_note(char *output, size_t *pos, size_t out_cap, const char *note) {
+    size_t nl = strlen(note);
+    if (*pos + nl + 1 > out_cap) {
+        size_t cut = (out_cap > nl + 1) ? (out_cap - nl - 1) : 0;
+        *pos = utf8_trim_len(output, cut);
+    }
+    memcpy(output + *pos, note, nl);
+    *pos += nl;
+    output[*pos] = '\0';
+}
+
 static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     if (out_cap) memset(output, 0, out_cap);   /* 清空, 避免上一轮残留泄漏 */
     HANDLE outR = NULL, outW = NULL;
@@ -65,35 +77,47 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     size_t pos = 0;
     DWORD nread;
     char tmp[8192];
-    int timedout = 0;
+    int timedout = 0, truncated = 0;
     int timeout = cmd_timeout_ms();
     DWORD deadline = GetTickCount() + (DWORD)timeout;
 
-    while (pos + 1 < out_cap) {
+    /* 持续抽干管道直到子进程退出或超时。
+     * 关键 1: 即使输出缓冲已满也必须继续读并丢弃多余数据, 否则子进程写满管道后会阻塞,
+     *         而下方 WaitForSingleObject(INFINITE) 将永远等不到它 -> 死锁。
+     * 关键 2: PeekNamedPipe 在写端关闭后即失败(即使管道内仍有缓冲数据), 因此失败时必须
+     *         改用 ReadFile 读净残留, 否则"写得快、退出快"的命令会整段丢输出。 */
+    for (;;) {
+        if (GetTickCount() >= deadline) { timedout = 1; break; }
         DWORD avail = 0;
-        if (!PeekNamedPipe(outR, NULL, 0, NULL, &avail, NULL)) break; /* 管道关闭/出错 */
-        if (avail == 0) {
-            if (GetTickCount() >= deadline) { timedout = 1; break; }
+        if (!PeekNamedPipe(outR, NULL, 0, NULL, &avail, NULL)) {
+            /* 写端已关闭: 读净缓冲中剩余数据, 读完即结束 */
+            if (!ReadFile(outR, tmp, sizeof(tmp), &nread, NULL) || nread == 0) break;
+        } else if (avail == 0) {
             Sleep(15);
             continue;
+        } else {
+            DWORD toread = (avail > sizeof(tmp)) ? (DWORD)sizeof(tmp) : avail;
+            if (!ReadFile(outR, tmp, toread, &nread, NULL) || nread == 0) break;
         }
-        DWORD toread = (avail > sizeof(tmp)) ? (DWORD)sizeof(tmp) : avail;
-        if (!ReadFile(outR, tmp, toread, &nread, NULL) || nread == 0) break;
-        size_t copy = nread;
-        if (pos + copy >= out_cap) copy = out_cap - 1 - pos;
-        memcpy(output + pos, tmp, copy);
-        pos += copy;
+        size_t room = (out_cap > pos + 1) ? (out_cap - 1 - pos) : 0;
+        size_t copy = (nread < room) ? nread : room;
+        if (copy < nread) truncated = 1;          /* 超限部分丢弃 */
+        if (copy) { memcpy(output + pos, tmp, copy); pos += copy; }
     }
     /* 缓冲可能在多字节字符中间被截断: 回退到字符边界, 保证输出是合法 UTF-8 */
     pos = utf8_trim_len(output, pos);
     output[pos] = '\0';
 
+    if (truncated) {
+        append_note(output, &pos, out_cap,
+                    "\n...(输出过长已截断; 需要完整结果请改用更精确的命令, "
+                    "如 findstr 过滤或重定向到文件后分段读取)");
+    }
+
     if (timedout) {
         if (hJob) TerminateJobObject(hJob, 1);
         else TerminateProcess(pi.hProcess, 1);
-        char note[] = "\n(命令执行超时, 已终止)";
-        size_t nl = sizeof(note) - 1;
-        if (pos + nl < out_cap) memcpy(output + pos, note, nl);
+        append_note(output, &pos, out_cap, "\n(命令执行超时, 已终止)");
         pos = strlen(output);   /* 让返回值 > 0, 超时提示不被当作"无输出" */
     }
 

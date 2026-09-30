@@ -11,7 +11,9 @@ static int utf8_to_wide(const char *u8, wchar_t *out, int cap) {
     return MultiByteToWideChar(CP_UTF8, 0, u8, -1, out, cap) > 0;
 }
 
-/* 把截断长度回退到 UTF-8 字符边界: 避免切出半个字符 (非法 UTF-8 会让整段文本被丢弃) */
+/* 把截断长度回退到 UTF-8 字符边界: 避免切出半个字符 (非法 UTF-8 会让整段文本被丢弃)。
+ * 注意: 数据本身可能不是 UTF-8 (如 cmd 的 GBK 输出), 无法解析时原样返回 len——
+ * 绝不能因为"不像 UTF-8"就把内容截成 0。 */
 static size_t utf8_trim_len(const char *s, size_t len) {
     size_t i = 0;
     while (i < len) {
@@ -25,7 +27,7 @@ static size_t utf8_trim_len(const char *s, size_t len) {
         int ok = 1;
         for (size_t k = 1; k < need; k++)
             if (((unsigned char)s[i + k] & 0xC0) != 0x80) { ok = 0; break; }
-        if (!ok) break;                             /* 非法序列 -> 停 */
+        if (!ok) return len;                        /* 非 UTF-8 数据: 不做截断 */
         i += need;
     }
     return i;
