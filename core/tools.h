@@ -65,6 +65,76 @@ static void tool_read_file(const char *path) {
     }
 }
 
+/* 定点替换编辑: old_text 必须在文件中"唯一"出现, 否则不改动文件并说明原因。
+ * 大文件改一行无需重写全文; 文件非 UTF-8(如 GBK)时拒绝, 提示改用 write_file。 */
+static void tool_edit_file(const char *path, const char *old_text, const char *new_text) {
+    if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
+    if (!old_text || !old_text[0]) { strcpy(tool_out, "(编辑失败: old_text 不能为空)"); return; }
+    wchar_t wpath[MAX_PATH];
+    if (!resolve_in_workspace(path, wpath, MAX_PATH)) { strcpy(tool_out, "(编辑失败: 路径过长)"); return; }
+
+    FILE *f = _wfopen(wpath, L"rb");
+    if (!f) { snprintf(tool_out, BUFSZ, "(编辑失败: 无法打开 %s)", path); return; }
+    if (_fseeki64(f, 0, SEEK_END) != 0) { fclose(f); strcpy(tool_out, "(编辑失败: 无法读取文件大小)"); return; }
+    long long fsz = _ftelli64(f);
+    if (fsz <= 0) { fclose(f); strcpy(tool_out, "(编辑失败: 文件为空)"); return; }
+    if (fsz > EDIT_MAX_BYTES) {
+        fclose(f);
+        snprintf(tool_out, BUFSZ, "(编辑失败: 文件 %lld 字节超过增量编辑上限 %d 字节; "
+                                  "请用 execute_bash 处理或分段修改大文件)", fsz, EDIT_MAX_BYTES);
+        return;
+    }
+    if (_fseeki64(f, 0, SEEK_SET) != 0) { fclose(f); strcpy(tool_out, "(编辑失败: 无法回到文件头)"); return; }
+    char *buf = (char*)malloc((size_t)fsz + 1);
+    if (!buf) { fclose(f); strcpy(tool_out, "(编辑失败: 内存不足)"); return; }
+    size_t got = fread(buf, 1, (size_t)fsz, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    if (!is_valid_utf8((const unsigned char *)buf, got)) {
+        free(buf);
+        snprintf(tool_out, BUFSZ, "(编辑失败: %s 不是 UTF-8 文本(可能是 GBK), 增量编辑无法定位; "
+                                  "如确需改写请用 write_file 全量覆盖)", path);
+        return;
+    }
+
+    /* 统计出现次数: 必须唯一, 避免改错位置 */
+    const char *hit = NULL; int count = 0;
+    for (const char *p2 = buf; (p2 = strstr(p2, old_text)) != NULL; p2 += strlen(old_text)) {
+        if (++count == 1) hit = p2;
+        if (count > 1) break;
+    }
+    if (count == 0) {
+        free(buf);
+        snprintf(tool_out, BUFSZ, "(未找到匹配文本, 文件未修改; 请先 read_file 确认原文, "
+                                  "注意空白与换行需完全一致)");
+        return;
+    }
+    if (count > 1) {
+        free(buf);
+        snprintf(tool_out, BUFSZ, "(匹配到 %d 处, 文件未修改; 请在 old_text 中带上更多上下文使其唯一)", count);
+        return;
+    }
+
+    size_t off = (size_t)(hit - buf);
+    size_t olen = strlen(old_text), nlen = strlen(new_text ? new_text : "");
+    size_t nsz = got - olen + nlen;
+    char *nw = (char*)malloc(nsz + 1);
+    if (!nw) { free(buf); strcpy(tool_out, "(编辑失败: 内存不足)"); return; }
+    memcpy(nw, buf, off);
+    memcpy(nw + off, new_text ? new_text : "", nlen);
+    memcpy(nw + off + nlen, buf + off + olen, got - off - olen);
+    nw[nsz] = '\0';
+    free(buf);
+
+    FILE *w = _wfopen(wpath, L"wb");
+    if (!w) { free(nw); snprintf(tool_out, BUFSZ, "(编辑失败: 无法写入 %s)", path); return; }
+    fwrite(nw, 1, nsz, w);
+    fclose(w);
+    free(nw);
+    snprintf(tool_out, BUFSZ, "(已完成定点替换: %s, %lld 字节 -> %zu 字节)", path, fsz, nsz);
+}
+
 static void tool_write_file(const char *path, const char *content) {
     if (!path_in_workspace(path)) { strcpy(tool_out, "(拒绝: 路径在工作目录外)"); return; }
     wchar_t wpath[MAX_PATH];
@@ -94,6 +164,14 @@ static void dispatch_tool(const char *name, const char *args_json, const char *f
             const char *p = json_as_str(json_obj_get(argsj, "path"));
             if (p) tool_read_file(p);
             else   snprintf(tool_out, BUFSZ, "(参数缺失: %s 需要字符串参数 \"path\")", nm);
+        } else if (strcmp(nm, "edit_file") == 0) {
+            const char *p  = json_as_str(json_obj_get(argsj, "path"));
+            const char *ot = json_as_str(json_obj_get(argsj, "old_text"));
+            const char *nt = json_as_str(json_obj_get(argsj, "new_text"));
+            if (!p)       snprintf(tool_out, BUFSZ, "(参数缺失: edit_file 需要字符串参数 \"path\")");
+            else if (!ot) snprintf(tool_out, BUFSZ, "(参数缺失: edit_file 需要字符串参数 \"old_text\")");
+            else if (!nt) snprintf(tool_out, BUFSZ, "(参数缺失: edit_file 需要字符串参数 \"new_text\")");
+            else          tool_edit_file(p, ot, nt);
         } else if (strcmp(nm, "write_file") == 0) {
             const char *p  = json_as_str(json_obj_get(argsj, "path"));
             const char *ct = json_as_str(json_obj_get(argsj, "content"));
@@ -101,7 +179,7 @@ static void dispatch_tool(const char *name, const char *args_json, const char *f
             else if (!p)  snprintf(tool_out, BUFSZ, "(参数缺失: write_file 需要字符串参数 \"path\")");
             else          snprintf(tool_out, BUFSZ, "(参数缺失: write_file 需要字符串参数 \"content\")");
         } else {
-            snprintf(tool_out, BUFSZ, "(未知工具: %s; 可用工具: execute_bash / read_file / write_file)", nm);
+            snprintf(tool_out, BUFSZ, "(未知工具: %s; 可用工具: execute_bash / read_file / write_file / edit_file)", nm);
         }
     } else if (!argsj) {
         snprintf(tool_out, BUFSZ,

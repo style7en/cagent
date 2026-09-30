@@ -7,6 +7,7 @@
 #define BUFSZ           (256 * 1024)
 #define ARGS_MAX        8192   /* tool_calls.arguments 累积上限 (流式与执行期统一) */
 #define TOOL_OUTPUT_CAP (16 * 1024)  /* 单个工具结果进入上下文的上限, 超出即截断 */
+#define EDIT_MAX_BYTES  (2 * 1024 * 1024) /* edit_file 可处理的最大文件体积 */
 
 /* ===== 全局状态 ===== */
 static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
@@ -59,5 +60,19 @@ static const char *TOOLS_JSON =
     "\"properties\":{\"path\":{\"type\":\"string\","
         "\"description\":\"File path, absolute or relative to the workspace directory\"},"
         "\"content\":{\"type\":\"string\",\"description\":\"Full new file content (UTF-8)\"}},"
-    "\"required\":[\"path\",\"content\"]}}}]";
+    "\"required\":[\"path\",\"content\"]}}},"
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"edit_file\","
+    "\"description\":\"Targeted edit: replace old_text with new_text in an existing UTF-8 file. "
+        "Preferred way to change part of a file - no need to rewrite the whole content. old_text must "
+        "match exactly once, including whitespace and line breaks; otherwise the file is left "
+        "untouched and the reason is returned, so read the file first when unsure. Path must stay "
+        "inside the workspace directory.\","
+    "\"parameters\":{\"type\":\"object\","
+    "\"properties\":{\"path\":{\"type\":\"string\","
+        "\"description\":\"File path, absolute or relative to the workspace directory\"},"
+        "\"old_text\":{\"type\":\"string\","
+        "\"description\":\"Exact existing snippet to replace (must be unique in the file)\"},"
+        "\"new_text\":{\"type\":\"string\",\"description\":\"Replacement text; empty string deletes it\"}},"
+    "\"required\":[\"path\",\"old_text\",\"new_text\"]}}}]";
 

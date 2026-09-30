@@ -10,9 +10,10 @@ typedef struct { char user_msg[BUFSZ]; } AgentTask;
 
 #define SYSTEM_PROMPT \
     "{\"role\":\"system\",\"content\":\"你是 cagent,一个极简的编程 Agent。" \
-    "你有三个工具: execute_bash(执行命令)、read_file(读文件)、write_file(写文件)。" \
-    "写入或覆盖文件前,先 read_file 读取现有内容。" \
-    "修改已有文件时,先读取再用 write_file 写入完整新内容(本 Agent 没有增量编辑工具)。" \
+    "你有四个工具: execute_bash(执行命令)、read_file(读文件)、write_file(写文件)、edit_file(定点替换编辑)。" \
+    "改已有文件的局部内容,优先用 edit_file: old_text 必须与文件中的原文完全一致(含空白与换行)且在文件中唯一, 只出现一次才会替换。" \
+    "edit_file 报告未找到匹配或匹配到多处时, 先 read_file 看清原文, 再调整 old_text 重试。" \
+    "新建文件用 write_file; 需要整体重写时先用 read_file 读取现有内容再整体写入。" \
     "列目录用 execute_bash 跑 dir,递归搜索内容用 findstr /s /i 关键词 *.* 。" \
     "命令通过 cmd /c 执行,用 Windows 命令风格:不要 mkdir -p(直接 mkdir),运行当前程序不要 ./ 前缀。" \
     "文件工具仅限工作目录内,用相对路径。" \
@@ -36,16 +37,80 @@ static void reset_conversation(void) {
 /* 前向声明: agent_turn 调用历史函数, 其定义在 config 区之后 */
 static void history_save(void);
 
+/* 拼接 chat/completions 完整 URL (agent_turn 与上下文压缩共用) */
+static void chat_completions_url(char *out, size_t cap) {
+    size_t nurl = strlen(g_api_url);
+    snprintf(out, cap, "%s%schat/completions", g_api_url,
+             (nurl > 0 && g_api_url[nurl - 1] == '/') ? "" : "/");
+}
+
+/* 上下文压缩: 请模型把已有对话压成一份交接摘要, 用它替换原上下文后继续。
+ * 成功返回 1 (messages 变为 system + 摘要), 失败返回 0 (调用方退化为另起会话)。 */
+static int compact_conversation(void) {
+    static const char *ask =
+        "上下文即将超出长度上限。请把以上对话压缩成一份交接摘要, 供后续继续工作。"
+        "必须保留: 1) 用户的目标与约束; 2) 已完成的关键步骤与结论; 3) 创建或改动过的文件路径; "
+        "4) 仍未完成的事项与下一步。不要寒暄、不要复述原文, 直接输出摘要, 控制在 800 字以内。";
+
+    char *esc_ask = json_escape_alloc(ask);
+    if (!esc_ask) return 0;
+    size_t mlen = strlen(messages);
+    size_t rcap = mlen + strlen(esc_ask) + 96;
+    char *req_msgs = (char*)malloc(rcap);
+    if (!req_msgs) { free(esc_ask); return 0; }
+    snprintf(req_msgs, rcap, "%s,{\"role\":\"user\",\"content\":\"%s\"}", messages, esc_ask);
+    free(esc_ask);
+
+    size_t bcap = strlen(req_msgs) + strlen(g_model) + strlen(TOOLS_JSON) + 256;
+    char *bodybuf = (char*)malloc(bcap);
+    if (!bodybuf) { free(req_msgs); return 0; }
+    /* 不带 tools: 避免模型改为调用工具而不是给出摘要 */
+    snprintf(bodybuf, bcap, "{\"model\":\"%s\",\"messages\":[%s],\"stream\":true}", g_model, req_msgs);
+    free(req_msgs);
+
+    char url[1280]; chat_completions_url(url, sizeof(url));
+    StreamCtx *sctx = (StreamCtx*)calloc(1, sizeof(StreamCtx));
+    if (!sctx) { free(bodybuf); return 0; }
+    char err[512]; err[0] = '\0';
+    int status = http_post_stream(url, g_api_key, bodybuf, strlen(bodybuf), err, sizeof(err), sctx);
+    free(bodybuf);
+
+    int ok = 0;
+    if (status == 200 && sctx->content_len > 0) {
+        size_t slen = sctx->content_len;
+        if (slen > 8192) slen = utf8_trim_len(sctx->content_buf, 8192);   /* 摘要本身也设上限 */
+        sctx->content_buf[slen] = '\0';
+        char *esc = json_escape_alloc(sctx->content_buf);
+        if (esc) {
+            reset_conversation();
+            size_t sp = strlen(messages);
+            int n = snprintf(messages + sp, BUFSZ - sp,
+                ",{\"role\":\"user\",\"content\":\"[上下文已压缩] 以下是此前对话的摘要, "
+                "请据此继续, 不要重复已完成的工作:\\n\\n%s\"}", esc);
+            if (n > 0 && (size_t)n < BUFSZ - sp) {
+                append_text("(上下文已压缩为摘要, 继续对话)\r\n");
+                ok = 1;
+            }
+            free(esc);
+        }
+    }
+    free(sctx);
+    return ok;
+}
+
 /* 执行一轮对话 (user_msg -> 直至最终回复或回滚)。线程无关, 可在主线程直接调用。
  * 用户消息的界面回显由前端负责 (核心不管渲染)。 */
 static void agent_turn(const char *user_msg) {
     InterlockedExchange(&g_cancel, 0);          /* 清除取消标志 */
 
-    /* 1. 若历史接近溢出, 重开一个新会话 (旧会话文件保留, 不删除) */
+    /* 1. 若历史接近溢出: 先尝试压缩为摘要继续, 压缩失败才另起新会话(旧会话文件保留) */
     if (strlen(messages) > MESSAGES_WATERMARK) {
-        append_text("(对话历史过长, 已自动另起新会话)\r\n");
-        reset_conversation();
-        g_history_file[0] = '\0';
+        append_text("(上下文接近上限, 正在压缩为摘要...)\r\n");
+        if (!compact_conversation()) {
+            append_text("(压缩失败, 已自动另起新会话)\r\n");
+            reset_conversation();
+            g_history_file[0] = '\0';
+        }
     }
 
     /* 2. 若首次发言, messages 还是空(没经过 config_load 之外的初始化) */
@@ -88,10 +153,7 @@ static void agent_turn(const char *user_msg) {
         memset(&ctx, 0, sizeof(ctx));
 
         char full_url[1280];
-        size_t nurl = strlen(g_api_url);
-        int has_slash = (nurl > 0 && g_api_url[nurl-1] == '/');
-        snprintf(full_url, sizeof(full_url), "%s%schat/completions",
-                 g_api_url, has_slash ? "" : "/");
+        chat_completions_url(full_url, sizeof(full_url));
 
         int status = http_post_stream(full_url, g_api_key, body, strlen(body),
                                       resp, BUFSZ, &ctx);
