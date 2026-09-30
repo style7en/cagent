@@ -25,6 +25,47 @@ static void http_set_err(char *out, size_t cap) {
     else snprintf(out, cap, "[网络错误] WinHTTP 错误 %lu", e);
 }
 
+/* ===== HTTP 重试/退避 (缺口 ③) =====
+ * 网络抖动 (DNS/连接重置/超时/限流/5xx) 不应让整轮对话回滚。
+ * 仅对"瞬时可恢复"的错误重试; 取消、成功、以及 4xx 客户端错误 (参数/鉴权问题,
+ * 重试无益) 一律不重试。退避采用指数增长, 可用环境变量覆盖默认。 */
+
+static int http_max_retries(void) {
+    char *e = getenv("CAGENT_HTTP_RETRIES");
+    int v = (e && atoi(e) > 0) ? atoi(e) : 3;
+    if (v > 8) v = 8;           /* 上限, 避免退避过久 */
+    return v;
+}
+
+static DWORD http_retry_base_ms(void) {
+    char *e = getenv("CAGENT_HTTP_RETRY_MS");
+    long v = (e && atol(e) > 0) ? atol(e) : 800;   /* 首次退避 */
+    if (v > 30000) v = 30000;
+    return (DWORD)v;
+}
+
+/* 该次失败是否值得重试: 1=重试, 0=不重试 */
+static int http_should_retry(int status) {
+    if (status == -1) return 1;                 /* 网络层错误 (DNS/连接/超时) */
+    if (status == -2) return 0;                 /* 用户取消: 立即退出 */
+    if (status == 200) return 0;                /* 成功 */
+    if (status == 429) return 1;                /* 限流 */
+    if (status == 408) return 1;                /* 请求超时 */
+    if (status >= 500 && status <= 599) return 1; /* 服务端错误 */
+    return 0;                                   /* 其余 4xx 客户端错误 */
+}
+
+/* 可中断睡眠: 期间若被取消则提前返回, 避免卡在退避里 */
+static void cancelable_sleep_ms(DWORD total) {
+    DWORD step = 50;
+    while (total > 0) {
+        if (InterlockedCompareExchange(&g_cancel, 0, 0)) break;
+        DWORD d = (total < step) ? total : step;
+        Sleep(d);
+        total -= d;
+    }
+}
+
 /* ===== SSE 流式 ===== */
 
 /* 流式累积的 tool_call (按 index 累积 delta 片段) */
@@ -60,13 +101,15 @@ static void on_content_delta(void *ud, const char *delta) {
     }
 }
 
-/* SSE 流式 POST: 增量读取, content delta 回调, tool_calls delta 累积到 ctx。
+/* 单次请求尝试 (无重试): 建立连接、发送、流式读取 SSE、解析 tool_calls。
+ * completed 输出参数: 是否完整收到 [DONE] (用于区分"200 但流被截断")。
  * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断)。 */
-static int http_post_stream(const char *url, const char *api_key,
-                            const char *body, size_t body_len,
-                            char *err_out, size_t err_cap,
-                            StreamCtx *ctx) {
+static int http_post_stream_once(const char *url, const char *api_key,
+                                 const char *body, size_t body_len,
+                                 char *err_out, size_t err_cap,
+                                 StreamCtx *ctx, int *completed) {
     if (err_cap > 0) err_out[0] = '\0';
+    if (completed) *completed = 0;
 
     const char *p = url;
     int https = 0;
@@ -163,7 +206,7 @@ static int http_post_stream(const char *url, const char *api_key,
                 while (lbLen > 0 && linebuf[lbLen-1] == '\r') linebuf[--lbLen] = '\0';
                 if (strncmp(linebuf, "data: ", 6) == 0) {
                     const char *json = linebuf + 6;
-                    if (strcmp(json, "[DONE]") == 0) { lpos = 0; goto stream_done; }
+                    if (strcmp(json, "[DONE]") == 0) { if (completed) *completed = 1; lpos = 0; goto stream_done; }
                     JValue *root = json_parse(json);
                     if (root) {
                         const JValue *choices = json_obj_get(root, "choices");
@@ -210,4 +253,42 @@ stream_done:
     return status;
 }
 
-/* 把 cmd.exe 的 OEM/ANSI 输出转成 UTF-8。 */
+/* 流式 SSE POST (对外入口): 在单次尝试之上叠加指数退避重试。
+ * 仅在瞬时错误时重试; 取消/成功/客户端错误直接返回。
+ * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断)。 */
+static int http_post_stream(const char *url, const char *api_key,
+                            const char *body, size_t body_len,
+                            char *err_out, size_t err_cap,
+                            StreamCtx *ctx) {
+    int maxr = http_max_retries();
+    DWORD base = http_retry_base_ms();
+    int last_status = -1;
+
+    for (int attempt = 0; ; attempt++) {
+        /* 取消优先: 任何阶段被取消都直接退出, 不重试 */
+        if (InterlockedCompareExchange(&g_cancel, 0, 0)) return -2;
+
+        /* 每次尝试前清空上下文与错误, 避免上次部分结果泄漏 */
+        memset(ctx, 0, sizeof(*ctx));
+        if (err_cap > 0) err_out[0] = '\0';
+
+        int completed = 0;
+        int status = http_post_stream_once(url, api_key, body, body_len,
+                                          err_out, err_cap, ctx, &completed);
+        last_status = status;
+
+        if (status == -2) return -2;                  /* 取消 */
+        if (status == 200 && completed) return 200;   /* 成功且流完整 */
+
+        /* 判断是否值得重试: 瞬时错误, 或 200 但流被截断 (需重取) */
+        int retryable = http_should_retry(status) || (status == 200 && !completed);
+        if (!retryable) break;
+        if (attempt >= maxr) break;
+
+        if (cagent_emit) append_text("(网络瞬时错误, 正在重试...)\r\n");
+        /* 指数退避: base, 2*base, 4*base ... (累计可在长链路上叠加) */
+        DWORD wait = base * (1u << attempt);
+        cancelable_sleep_ms(wait);
+    }
+    return last_status;
+}

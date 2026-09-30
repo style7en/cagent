@@ -43,5 +43,6 @@
 #include "core/agent.h"
 #include "core/session.h"
 #include "core/config.h"
+#include "core/test.h"   /* 自动化回归测试 (纯静态, 由 run_all_tests 触发) */
 
 #endif /* CAGENT_CORE_H */

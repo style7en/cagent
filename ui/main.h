@@ -8,7 +8,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     (void)hPrev;
     if (cmd && strstr(cmd, "--selftest")) {
         freopen("selftest.txt", "w", stdout);
-        return json_selftest();
+        return run_all_tests();   /* 覆盖 JSON/编码/工具/HTTP 的全套回归 */
     }
 
     /* 安装宿主钩子 (必须在 agent 运行前设置) */
