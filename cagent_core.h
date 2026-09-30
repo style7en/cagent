@@ -31,6 +31,7 @@
 #ifndef CAGENT_CORE_H
 #define CAGENT_CORE_H
 
+#include "core/version.h"   /* 版本号单一事实来源, 供 RC/--version/标题栏引用 */
 #include "core/base.h"
 #include "core/state.h"
 #include "core/crypto.h"

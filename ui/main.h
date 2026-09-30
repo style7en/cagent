@@ -6,6 +6,18 @@
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     (void)hPrev;
+    if (cmd && strstr(cmd, "--version")) {
+        /* GUI 子系统默认无控制台: 若有父控制台则接管并打印 (脚本可捕获),
+           否则用对话框显示 (双击启动也能看到) */
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            freopen("CONOUT$", "w", stdout);
+            printf("cagent %s\n", CAGENT_VERSION_STR);
+            fflush(stdout);
+        } else {
+            MessageBoxW(NULL, CAGENT_VERSION_WSTR, L"cagent", MB_OK | MB_ICONINFORMATION);
+        }
+        return 0;
+    }
     if (cmd && strstr(cmd, "--selftest")) {
         freopen("selftest.txt", "w", stdout);
         return run_all_tests();   /* 覆盖 JSON/编码/工具/HTTP 的全套回归 */
@@ -29,7 +41,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     wc.lpszClassName = L"CagentGuiWnd";
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowW(L"CagentGuiWnd", L"cagent",
+    HWND hwnd = CreateWindowW(L"CagentGuiWnd", L"cagent " CAGENT_VERSION_WSTR,
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 720, 560,
         NULL, NULL, hInst, NULL);

@@ -288,6 +288,16 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 
 ---
 
+## 版本号
+
+版本号的**唯一事实来源**在 `core/version.h`（`CAGENT_VER_MAJOR/MINOR/PATCH` 与 `CAGENT_VERSION_STR`），改动版本只改这一处，三处同步引用：
+
+- **Windows 文件属性**：`app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（数值 `1.0.0.0` + 字符串 `1.0.0`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。
+- **命令行**：`cagent.exe --version` 打印 `cagent 1.0.0`（有父控制台则打印到终端，否则弹对话框）。
+- **窗口标题栏**：显示 `cagent 1.0.0`。
+
+---
+
 ## 许可
 
 代码为学习用途,无许可证限制。
