@@ -1,30 +1,23 @@
 /*
- * cagent_gui.c - Win32 GUI 版极简 Agent
+ * cagent_core.h - cagent 平台无关核心 (零依赖, Windows 平台)
  *
- * 布局:
- *   +-----------------------------------+
- *   | API:   [ url-base       ]         |  (可编辑配置区)
- *   | Key:   [ ********       ]         |
- *   | Model: [ model-id       ]         |
- *   +-----------------------------------+
- *   |                                   |
- *   |  消息历史 (只读多行)              |
- *   |                                   |
- *   +-----------------------------------+
- *   | [输入框 单行]            [发送]   |
- *   +-----------------------------------+
+ * 包含: 轻量 JSON 解析器 / DPAPI Key 加密 / UTF 转码 / WinHTTP SSE 流式 /
+ *       工具系统 / Agent 循环 / 配置与历史持久化。
  *
- * 设计:
- *   - 后台线程跑 Agent 循环, 通过 PostMessage(WM_APP_APPEND) 向 UI 追加文本
- *   - 工具调用过程也追加显示
- *   - LLM 调用期间禁用 输入框 + 发送按钮
+ * 与界面解耦: 通过一组宿主钩子 (cagent_emit / cagent_on_done / cagent_read_config_ui)
+ * 与前端交互, 因此 Win32 GUI 复用同一段 Agent 循环。
  *
- * 编译: gcc -mwindows -o cagent_gui.exe cagent_gui.c -lcomctl32 -lwinhttp
- * 依赖: 无外部命令(WinHTTP 内置,工具调用走 cmd /c)
+ * 设计取向 (对齐 pi.dev 的极简理念): 仅 3 个工具 (bash/read/write), 无权限弹窗,
+ * 无轮次上限, 由模型自行决定何时停止, 用户随时可用停止按钮取消。
+ *
+ * 使用方式: 前端 .c 文件 #include 本头文件, 并在调用 agent_thread / agent_turn
+ * 之前设置钩子; 钩子未设置时采用安全默认 (不读 UI 配置)。
  */
 
+#ifndef CAGENT_CORE_H
+#define CAGENT_CORE_H
+
 #include <windows.h>
-#include <commctrl.h>
 #include <winhttp.h>
 #include <wincrypt.h>
 #include <shlobj.h>
@@ -32,6 +25,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+
+/* ===== 宿主钩子 (由 GUI 前端实现) ===== */
+#define CAGENT_ROLE_SYS   0   /* 系统/过程提示 (thinking/回滚/工具结果/载入提示) */
+#define CAGENT_ROLE_USER  1   /* 用户输入 */
+#define CAGENT_ROLE_AI    2   /* AI 输出 */
+static void (*cagent_emit)(const char *utf8, int role) = NULL;  /* 输出一段文本 (role 区分角色) */
+static void (*cagent_on_done)(void) = NULL;                   /* 一轮 Agent 结束 */
+static void (*cagent_read_config_ui)(void) = NULL;            /* 从 UI 同步配置到全局 */
+
+/* 安全的输出封装: 前端只需提供 cagent_emit。默认按 SYS 角色输出。 */
+static void append_text(const char *utf8) {
+    if (cagent_emit) cagent_emit(utf8, CAGENT_ROLE_SYS);
+}
 
 /* ===== 轻量 JSON 解析器 (零依赖, 递归下降) =====
  * 仅用于解析 LLM 响应与 tool_call.arguments。严格 JSON, 不支持注释/trailing comma。
@@ -58,13 +65,9 @@ const JValue *json_obj_get(const JValue *obj, const char *key);
 const JValue *json_arr_at(const JValue *arr, size_t i);
 const char   *json_as_str(const JValue *v);
 
-/* 解析器自测: 返回 0 通过, 非 0 失败。由 WinMain --selftest 触发。 */
 /* ===== DPAPI Key 加密 =====
  * 加密: 明文 -> "dpapi:<base64>"。解密: "dpapi:<base64>" 或明文 -> 明文。
  * 失败返回 NULL。返回值 malloc, 调用者 free。 */
-static char *dpapi_protect(const char *plain);
-static char *dpapi_unprotect(const char *stored);
-
 static char *dpapi_protect(const char *plain) {
     if (!plain) return NULL;
     DATA_BLOB in = { (DWORD)strlen(plain), (BYTE*)plain };
@@ -431,48 +434,27 @@ void json_free(JValue *v) {
 }
 
 #define BUFSZ           (256 * 1024)
-#define MAX_ITERATIONS  20
-
-#define ID_HISTORY  1001
-#define ID_INPUT    1002
-#define ID_SEND     1003
-#define ID_CLEAR    1004
-#define ID_CFG_BASE 1005   /* +0 url, +1 key, +2 model */
-#define ID_LBL_BASE 1008   /* +0 url, +1 key, +2 model */
-#define ID_LBL_WS   1011   /* 工作目录标签 */
-#define ID_WS_EDIT  1012   /* 工作目录输入框 */
-#define ID_WS_BTN   1013   /* 浏览按钮 */
-
-#define WM_APP_APPEND  (WM_APP + 1)   /* lParam = UTF-8 char* (须 free) */
-#define WM_APP_DONE    (WM_APP + 2)   /* Agent 任务完成,启用 UI */
-
-#define CFG_URL 0
-#define CFG_KEY 1
-#define CFG_MDL 2
+#define ARGS_MAX        8192   /* tool_calls.arguments 累积上限 (流式与执行期统一) */
 
 /* ===== 全局状态 ===== */
-static HWND g_hHistory, g_hInput, g_hSend, g_hClear;
-static HWND g_hCfg[3];                 /* [url, key, model] */
-static HWND g_hWorkspace, g_hWsBrowse; /* 工作目录 Edit + 浏览按钮 */
-static HFONT g_hFont;
-static HANDLE g_hThread = NULL;
-static volatile LONG g_running = 0;   /* 1 = Agent 工作线程运行中 */
-static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
-static volatile LONG g_danger_denied = 0;  /* 1 = 本轮已拒绝危险命令, 后续直接拒不再弹 */
-
-/* 运行时配置(在 start_task 时从 Edit 控件同步) */
 static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
 static char g_api_key[512]  = "";
 static char g_model[128]    = "";
 static int g_key_decrypt_failed = 0;   /* DPAPI 解密失败标志, 启动后提示 */
 static int g_skip_cert_verify = 0;     /* 1=跳过 SSL 证书校验 (自签端点用) */
 static char g_workspace[MAX_PATH] = "";/* 工作目录 (文件工具限制在此目录内, 默认 exe 目录) */
+static char g_active_ws[MAX_PATH] = "";/* 当前已加载历史所对应的工作目录 */
+static char g_last_session[MAX_PATH] = ""; /* 最近使用的会话文件 (持久化到 ini) */
+static char g_history_file[MAX_PATH] = ""; /* 当前对话绑定的会话文件 (懒生成) */
 
 /* Agent 工作缓冲(只在工作线程使用,主线程不碰) */
 static char messages[BUFSZ];
 static char body[BUFSZ];
 static char resp[BUFSZ];
 static char tool_out[BUFSZ];
+
+static volatile LONG g_running = 0;   /* 1 = Agent 工作线程运行中 */
+static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
 
 static const char *TOOLS_JSON =
     "[{\"type\":\"function\",\"function\":{"
@@ -492,72 +474,17 @@ static const char *TOOLS_JSON =
     "\"description\":\"Write content to a file (overwrite)\","
     "\"parameters\":{\"type\":\"object\","
     "\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},"
-    "\"required\":[\"path\",\"content\"]}}},"
-    "{\"type\":\"function\",\"function\":{"
-    "\"name\":\"list_dir\","
-    "\"description\":\"List directory entries (name, size, type)\","
-    "\"parameters\":{\"type\":\"object\","
-    "\"properties\":{\"path\":{\"type\":\"string\"}},"
-    "\"required\":[\"path\"]}}},"
-    "{\"type\":\"function\",\"function\":{"
-    "\"name\":\"search\","
-    "\"description\":\"Search pattern in files under a directory (non-recursive)\","
-    "\"parameters\":{\"type\":\"object\","
-    "\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}},"
-    "\"required\":[\"pattern\",\"path\"]}}}]";
+    "\"required\":[\"path\",\"content\"]}}}]";
 
-/* ===== 工具函数: UTF-8 <-> UTF-16 ===== */
+/* ===== JSON 转义 ===== */
 
-/* 向历史框追加一段文本(UTF-8)。线程安全:通过 PostMessage 投递 */
-static void append_text(const char *utf8) {
-    char *copy = strdup(utf8);
-    if (copy) PostMessage(g_hHistory, WM_APP_APPEND, 0, (LPARAM)copy);
-}
-
-/* 主线程处理:把 UTF-8 -> UTF-16,LF 自动补成 CRLF,追加到 Edit 末尾 */
-static void do_append(const char *utf8) {
-    /* 先把 \n (非 \r\n 中的) 替换为 \r\n,避免 Edit 控件忽略 LF */
-    size_t in_len = strlen(utf8);
-    char *norm = (char*)malloc(in_len * 2 + 1);
-    if (!norm) return;
-    size_t j = 0;
-    for (size_t i = 0; i < in_len; i++) {
-        char c = utf8[i];
-        if (c == '\n' && (i == 0 || utf8[i-1] != '\r')) {
-            norm[j++] = '\r';
-            norm[j++] = '\n';
-        } else {
-            norm[j++] = c;
-        }
-    }
-    norm[j] = '\0';
-
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, norm, -1, NULL, 0);
-    if (wlen <= 0) { free(norm); return; }
-    WCHAR *wbuf = (WCHAR*)malloc(wlen * sizeof(WCHAR));
-    MultiByteToWideChar(CP_UTF8, 0, norm, -1, wbuf, wlen);
-    free(norm);
-
-    int len = GetWindowTextLengthW(g_hHistory);
-    SendMessageW(g_hHistory, EM_SETSEL, len, len);
-    SendMessageW(g_hHistory, EM_REPLACESEL, FALSE, (LPARAM)wbuf);
-    SendMessageW(g_hHistory, EM_SCROLLCARET, 0, 0);
-
-    free(wbuf);
-}
-
-/* ===== JSON / HTTP / 工具 ===== */
-
-/* JSON 字符串转义: 必须覆盖所有 0x00-0x1F 控制字符, 否则服务端解析失败.
- * \r 直接丢弃 (Windows 换行多余的部分, 显示和 LLM 都不需要).
- * 有界写入: 至多写 dst_cap-1 字节 + '\0'. 返回 1 成功, 0 容量不足.
- * 最坏膨胀比 6x (每控制字符 -> \u00XX). */
+/* JSON 字符串转义: 覆盖所有 0x00-0x1F 控制字符, 否则服务端解析失败.
+ * \r 直接丢弃。有界写入。返回 1 成功, 0 容量不足。最坏膨胀比 6x。 */
 static int json_escape(const char *src, char *dst, size_t dst_cap) {
     if (dst_cap == 0) return 0;
     size_t j = 0;
     while (*src) {
         unsigned char c = (unsigned char)*src++;
-        /* 预估本字符最多写入 6 字节 (\u00XX), 再留 1 字节给 '\0' */
         if (j + 6 >= dst_cap) { dst[dst_cap - 1] = '\0'; return 0; }
         switch (c) {
         case '"':  dst[j++] = '\\'; dst[j++] = '"';  break;
@@ -579,27 +506,35 @@ static int json_escape(const char *src, char *dst, size_t dst_cap) {
     return 1;
 }
 
-/* 分配一块刚好够 src 转义后存放的 heap 缓冲并执行 escape.
- * 返回 NULL 表示分配失败. 调用者负责 free. */
 static char *json_escape_alloc(const char *src) {
     size_t cap = strlen(src) * 6 + 1;
     char *buf = (char*)malloc(cap);
     if (!buf) return NULL;
-    json_escape(src, buf, cap);   /* cap 足够, 不会失败 */
+    json_escape(src, buf, cap);
     return buf;
+}
+
+/* 命令执行超时 (毫秒): 默认 60s, 可用环境变量 CAGENT_CMD_TIMEOUT (秒) 覆盖。 */
+static int cmd_timeout_ms(void) {
+    char *e = getenv("CAGENT_CMD_TIMEOUT");
+    if (e && atoi(e) > 0) return atoi(e) * 1000;
+    return 60000;
 }
 
 /* 用 CreateProcess + 匿名管道静默运行命令(仅本地工具用),纯内存收发数据。
  * 子进程的 stdout+stderr 合并写入 output (含 \0)。
- * 返回实际读到的字节数,失败返回 -1。 */
+ * 返回实际读到的字节数,失败返回 -1。超过 timeout 则终止整个进程树。 */
+static size_t utf8_trim_len(const char *s, size_t len);   /* 前向声明 */
+
 static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
+    if (out_cap) memset(output, 0, out_cap);   /* 清空, 避免上一轮残留泄漏 */
     HANDLE outR = NULL, outW = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
 
     if (!CreatePipe(&outR, &outW, &sa, 0)) return -1;
     SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
@@ -608,37 +543,78 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     si.hStdOutput = outW;
     si.hStdError  = outW;
 
+    /* 命令行必须转宽字符交给 CreateProcessW, 否则中文参数会被按 ANSI 解释 */
     char buf[16384];
     snprintf(buf, sizeof(buf), "cmd /c %s", cmdline);
+    wchar_t wbuf[16384];
+    if (MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf, 16384) <= 0) {
+        CloseHandle(outR); CloseHandle(outW);
+        return -1;
+    }
 
     PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessA(NULL, buf, NULL, NULL, TRUE,
+    if (!CreateProcessW(NULL, wbuf, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(outR); CloseHandle(outW);
         return -1;
     }
     CloseHandle(outW);
 
+    /* 作业对象: 超时统一杀死进程树 (含 cmd 派生的子进程) */
+    HANDLE hJob = NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+    memset(&jeli, 0, sizeof(jeli));
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    hJob = CreateJobObjectA(NULL, NULL);
+    if (hJob && SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                        &jeli, sizeof(jeli))) {
+        AssignProcessToJobObject(hJob, pi.hProcess); /* 失败则退化为仅杀主进程 */
+    }
+
     size_t pos = 0;
     DWORD nread;
     char tmp[8192];
-    while (pos + 1 < out_cap &&
-           ReadFile(outR, tmp, sizeof(tmp), &nread, NULL) && nread > 0) {
+    int timedout = 0;
+    int timeout = cmd_timeout_ms();
+    DWORD deadline = GetTickCount() + (DWORD)timeout;
+
+    while (pos + 1 < out_cap) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(outR, NULL, 0, NULL, &avail, NULL)) break; /* 管道关闭/出错 */
+        if (avail == 0) {
+            if (GetTickCount() >= deadline) { timedout = 1; break; }
+            Sleep(15);
+            continue;
+        }
+        DWORD toread = (avail > sizeof(tmp)) ? (DWORD)sizeof(tmp) : avail;
+        if (!ReadFile(outR, tmp, toread, &nread, NULL) || nread == 0) break;
         size_t copy = nread;
         if (pos + copy >= out_cap) copy = out_cap - 1 - pos;
         memcpy(output + pos, tmp, copy);
         pos += copy;
     }
+    /* 缓冲可能在多字节字符中间被截断: 回退到字符边界, 保证输出是合法 UTF-8 */
+    pos = utf8_trim_len(output, pos);
     output[pos] = '\0';
-    CloseHandle(outR);
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (timedout) {
+        if (hJob) TerminateJobObject(hJob, 1);
+        else TerminateProcess(pi.hProcess, 1);
+        char note[] = "\n(命令执行超时, 已终止)";
+        size_t nl = sizeof(note) - 1;
+        if (pos + nl < out_cap) memcpy(output + pos, note, nl);
+        pos = strlen(output);   /* 让返回值 > 0, 超时提示不被当作"无输出" */
+    }
+
+    WaitForSingleObject(pi.hProcess, timedout ? 2000 : INFINITE);
+    if (hJob) CloseHandle(hJob);
+    CloseHandle(outR);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return (int)pos;
 }
 
-/* 把 WinHTTP/系统错误码翻译为中文可读文本 (静态字符串, 勿 free)。 */
+/* 把 WinHTTP/系统错误码翻译为中文可读文本。 */
 static const char *winhttp_err_msg(DWORD code) {
     switch (code) {
     case ERROR_WINHTTP_NAME_NOT_RESOLVED:        return "DNS 解析失败, 请检查 Url-Base";
@@ -653,7 +629,6 @@ static const char *winhttp_err_msg(DWORD code) {
     }
 }
 
-/* 把当前 GetLastError() 翻译后写入 out。 */
 static void http_set_err(char *out, size_t cap) {
     DWORD e = GetLastError();
     const char *m = winhttp_err_msg(e);
@@ -661,16 +636,13 @@ static void http_set_err(char *out, size_t cap) {
     else snprintf(out, cap, "[网络错误] WinHTTP 错误 %lu", e);
 }
 
-/* ===== WinHTTP POST =====
- * 解析 url 得到 host/port/path/是否 https,然后 WinHTTP 发起请求。
- * 响应正文写入 out (含 \0),返回 HTTP 状态码,失败返回 -1。 */
 /* ===== SSE 流式 ===== */
 
 /* 流式累积的 tool_call (按 index 累积 delta 片段) */
 typedef struct {
     char id[256];
     char name[64];
-    char args[8192];   /* arguments 片段累积 */
+    char args[ARGS_MAX];   /* arguments 片段累积 */
 } StreamToolCall;
 
 /* 流式上下文: 跨 http_post_stream 传递 */
@@ -681,10 +653,15 @@ typedef struct {
     int n_calls;
 } StreamCtx;
 
-/* content delta 回调: 增量显示 + 累积到 content_buf */
+/* content delta 回调: 增量显示 + 累积到 content_buf。
+ * 首个增量跳过前导换行, 避免 (thinking...) 后出现多余空行。 */
 static void on_content_delta(void *ud, const char *delta) {
     StreamCtx *ctx = (StreamCtx*)ud;
-    append_text(delta);
+    if (ctx->content_len == 0) {
+        while (*delta == '\r' || *delta == '\n') delta++;
+        if (!*delta) return;
+    }
+    if (cagent_emit) cagent_emit(delta, CAGENT_ROLE_AI);
     size_t dl = strlen(delta);
     if (ctx->content_len + dl < sizeof(ctx->content_buf) - 1) {
         memcpy(ctx->content_buf + ctx->content_len, delta, dl);
@@ -694,7 +671,7 @@ static void on_content_delta(void *ud, const char *delta) {
 }
 
 /* SSE 流式 POST: 增量读取, content delta 回调, tool_calls delta 累积到 ctx。
- * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断). */
+ * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断)。 */
 static int http_post_stream(const char *url, const char *api_key,
                             const char *body, size_t body_len,
                             char *err_out, size_t err_cap,
@@ -730,7 +707,7 @@ static int http_post_stream(const char *url, const char *api_key,
     MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 256);
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024);
 
-    HINTERNET hSession = WinHttpOpen(L"cagent-gui/1.0",
+    HINTERNET hSession = WinHttpOpen(L"cagent/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) { http_set_err(err_out, err_cap); return -1; }
     HINTERNET hConnect = WinHttpConnect(hSession, whost, port, 0);
@@ -840,10 +817,7 @@ stream_done:
     return status;
 }
 
-/* 把 cmd.exe 的 OEM/ANSI 输出转成 UTF-8.
- * cmd.exe 的 stdout 用当前控制台的 OEM 代码页 (中文系统 = CP936/GBK),
- * 直接当 UTF-8 处理会得到 ????. 用 GetOEMCP() 拿到 cmd 输出代码页 (OEM/GBK), GBK→UTF-16→UTF-8.
- * 转换失败则原样保留(降级而非崩溃). */
+/* 把 cmd.exe 的 OEM/ANSI 输出转成 UTF-8。 */
 static void oem_to_utf8(char *buf, size_t cap) {
     UINT cp = GetOEMCP();
     if (cp == CP_UTF8 || buf[0] == '\0') return;
@@ -861,79 +835,97 @@ static void oem_to_utf8(char *buf, size_t cap) {
     free(w);
 }
 
-/* 危险命令模式表 (子串匹配, 宁可误报不漏报) */
-static const char *DANGEROUS[] = {
-    "rm", "del", "erase", "rmdir", "rd", "format", "shutdown",
-    "taskkill", "reg delete", "diskpart", "mklink", "takeown", "icacls"
-};
-
-/* 危险命令词边界匹配: pat 作为独立 token 出现 (前为命令首/分隔符, 后为分隔符/结束)。
- * 避免 "rd" 误命中 standard/keyboard 等。多词 pat (如 "reg delete") 整体匹配。 */
-static int danger_match(const char *cmd, const char *pat) {
-    size_t plen = strlen(pat);
-    if (plen == 0) return 0;
-    const char *p = cmd;
-    while ((p = strstr(p, pat)) != NULL) {
-        int at_start = (p == cmd);
-        char prev  = at_start ? '\0' : p[-1];
-        char after = p[plen];
-        int left_ok  = at_start || prev==' '||prev=='\t'||prev=='|'||prev=='&'||prev==';'||prev=='(';
-        int right_ok = after=='\0'||after==' '||after=='\t'||after=='|'||after=='&'||after==';'||after==')';
-        if (left_ok && right_ok) return 1;
-        p += 1;
+/* 严格 UTF-8 校验: 合法则原样保留, 否则按 OEM(GBK) 转换。
+   命令输出可能来自本地 cmd (GBK) 或网络 (curl 拿到的 UTF-8), 无法先验, 只能检测。 */
+static int is_valid_utf8(const unsigned char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = s[i];
+        int len; unsigned int cp;
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
+        else return 0;
+        if (i + (size_t)len > n) return 0;
+        for (int k = 1; k < len; k++) {
+            if ((s[i + k] & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (unsigned)(s[i + k] & 0x3F);
+        }
+        if (len == 2 && cp < 0x80) return 0;          /* 超长编码 */
+        if (len == 3 && cp < 0x800) return 0;
+        if (len == 4 && cp < 0x10000) return 0;
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return 0;
+        i += (size_t)len;
     }
-    return 0;
+    return 1;
 }
 
 static void execute_bash(const char *command) {
-    /* 危险命令确认: 命中模式表则弹 MessageBox 让用户决定 */
-    for (size_t i = 0; i < sizeof(DANGEROUS)/sizeof(DANGEROUS[0]); i++) {
-        if (danger_match(command, DANGEROUS[i])) {
-            if (g_danger_denied) { strcpy(tool_out, "(用户拒绝执行)"); return; }
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, command, -1, NULL, 0);
-            WCHAR *wcmd = (WCHAR*)malloc(wlen * sizeof(WCHAR));
-            WCHAR msg[8192];
-            if (wcmd) {
-                MultiByteToWideChar(CP_UTF8, 0, command, -1, wcmd, wlen);
-                swprintf(msg, sizeof(msg)/sizeof(msg[0]),
-                         L"模型请求执行以下命令:\n\n%ls\n\n确认执行?", wcmd);
-                free(wcmd);
-            } else {
-                swprintf(msg, sizeof(msg)/sizeof(msg[0]),
-                         L"模型请求执行一条危险命令, 确认执行?");
-            }
-            int rc = MessageBoxW(NULL, msg, L"危险命令确认",
-                                 MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-            if (rc != IDYES) {
-                InterlockedExchange(&g_danger_denied, 1);
-                strcpy(tool_out, "(用户拒绝执行)");
-                return;   /* 拒绝: 把结果交给模型, 不执行 */
-            }
-            break;   /* 确认后不再重复弹 */
-        }
-    }
-
+    /* 极简理念: 不拦截命令, 由用户自己承担运行环境的风险 (建议跑在容器中)。 */
     int n = run_pipe(command, tool_out, BUFSZ);
     if (n <= 0) { strcpy(tool_out, "(no output)"); return; }
-    oem_to_utf8(tool_out, BUFSZ);
+    /* 输出已是合法 UTF-8 则原样保留, 否则才做 OEM(GBK) -> UTF-8 转换 */
+    if (!is_valid_utf8((const unsigned char *)tool_out, (size_t)n))
+        oem_to_utf8(tool_out, BUFSZ);
 }
 
 /* ===== 工作目录限制 ===== */
 
-/* UTF-8 -> UTF-16, 写入 out (cap 为 wchar 数). 成功返回非 0. */
+/* UTF-8 -> UTF-16, 写入 out (cap 为 wchar 数)。成功返回非 0。 */
 static int utf8_to_wide(const char *u8, wchar_t *out, int cap) {
     return MultiByteToWideChar(CP_UTF8, 0, u8, -1, out, cap) > 0;
+}
+
+/* 把截断长度回退到 UTF-8 字符边界: 避免切出半个字符 (非法 UTF-8 会让整段文本被丢弃) */
+static size_t utf8_trim_len(const char *s, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)s[i];
+        size_t need;
+        if (c >= 0xF0)      need = 4;
+        else if (c >= 0xE0) need = 3;
+        else if (c >= 0xC0) need = 2;
+        else                need = 1;
+        if (need > 1 && i + need > len) break;      /* 该字符被截断 -> 停 */
+        int ok = 1;
+        for (size_t k = 1; k < need; k++)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) { ok = 0; break; }
+        if (!ok) break;                             /* 非法序列 -> 停 */
+        i += need;
+    }
+    return i;
+}
+
+/* UTF-8 路径打开文件: 必须走宽字符, 否则非 ASCII 路径 (中文目录) 会打不开 */
+static FILE *fopen_utf8(const char *path, const char *mode) {
+    wchar_t wp[MAX_PATH], wm[16];
+    if (!utf8_to_wide(path, wp, MAX_PATH)) return NULL;
+    int n = MultiByteToWideChar(CP_UTF8, 0, mode, -1, NULL, 0);
+    if (n <= 0 || n > 16) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, mode, -1, wm, n);
+    return _wfopen(wp, wm);
+}
+
+/* 取 exe 所在目录 (UTF-8, 无结尾反斜杠); 失败回退当前目录 */
+static void get_exe_dir_utf8(char *out, size_t cap) {
+    wchar_t wexe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, wexe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        wchar_t wcd[MAX_PATH];
+        if (GetCurrentDirectoryW(MAX_PATH, wcd) == 0) { out[0] = '\0'; return; }
+        WideCharToMultiByte(CP_UTF8, 0, wcd, -1, out, (int)cap, NULL, NULL);
+        return;
+    }
+    wchar_t *slash = wcsrchr(wexe, L'\\');
+    if (slash) *slash = L'\0';
+    WideCharToMultiByte(CP_UTF8, 0, wexe, -1, out, (int)cap, NULL, NULL);
 }
 
 /* 确保 g_workspace 已初始化 (默认 exe 目录) */
 static void ensure_workspace(void) {
     if (g_workspace[0]) return;
-    char exe[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) { GetCurrentDirectoryA(MAX_PATH, g_workspace); return; }
-    char *slash = strrchr(exe, '\\');
-    if (slash) *slash = '\0';
-    snprintf(g_workspace, sizeof(g_workspace), "%s", exe);
+    get_exe_dir_utf8(g_workspace, sizeof(g_workspace));
 }
 
 /* 检查 path 规范化后是否在 g_workspace 内。返回 1 合法, 0 非法。 */
@@ -959,35 +951,41 @@ static int path_in_workspace(const char *path) {
     return 1;
 }
 
+/* 把 path 解析为工作目录内的实际路径: 相对路径在 g_workspace 下拼接,
+ * 绝对路径 (盘符或 \ 开头) 原样使用。写入 out (cap 为 wchar 数)。返回 1 成功。
+ * 这样文件工具的枚举/打开目标与沙箱校验一致, 避免 CWD≠工作目录时越界。 */
+static int resolve_in_workspace(const char *path, wchar_t *out, int cap) {
+    ensure_workspace();
+    if (path[0] == '\\' || path[0] == '/' || (path[0] && path[1] == ':')) {
+        return utf8_to_wide(path, out, cap);
+    }
+    char full[MAX_PATH];
+    int m = snprintf(full, sizeof(full), "%s\\%s", g_workspace, path);
+    if (m < 0 || (size_t)m >= sizeof(full)) return 0;
+    return utf8_to_wide(full, out, cap);
+}
+
 /* ===== 结构化工具 (写入全局 tool_out) ===== */
 
 static void tool_read_file(const char *path) {
     if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
     wchar_t wpath[MAX_PATH];
-    if (!utf8_to_wide(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(读取失败: 路径过长)"); return; }
+    if (!resolve_in_workspace(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(读取失败: 路径过长)"); return; }
     FILE *f = _wfopen(wpath, L"rb");
     if (!f) { snprintf(tool_out, BUFSZ, "(读取失败: 无法打开 %s)", path); return; }
     size_t n = fread(tool_out, 1, BUFSZ - 64, f);
+    n = utf8_trim_len(tool_out, n);          /* 截断对齐到字符边界, 避免半个字符 */
     fclose(f);
     tool_out[n] = '\0';
     if (n >= BUFSZ - 64) {
         strcat(tool_out, "\n(已截断, 文件过大)");
     }
-    /* 文件内容直接用 (假设 UTF-8); 不调 oem_to_utf8 (那是给 cmd 的 GBK 输出用的) */
 }
 
 static void tool_write_file(const char *path, const char *content) {
     if (!path_in_workspace(path)) { strcpy(tool_out, "(拒绝: 路径在工作目录外)"); return; }
     wchar_t wpath[MAX_PATH];
-    if (!utf8_to_wide(path, wpath, MAX_PATH)) { strcpy(tool_out, "(写入失败: 路径过长)"); return; }
-    /* 覆盖确认: 文件已存在则弹窗 (工作线程, 同命令沙箱) */
-    FILE *test = _wfopen(wpath, L"rb");
-    if (test) {
-        fclose(test);
-        int rc = MessageBoxW(NULL, L"文件已存在, 确认覆盖?", L"write_file 确认",
-                             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-        if (rc != IDYES) { strcpy(tool_out, "(用户拒绝覆盖)"); return; }
-    }
+    if (!resolve_in_workspace(path, wpath, MAX_PATH)) { strcpy(tool_out, "(写入失败: 路径过长)"); return; }
     FILE *f = _wfopen(wpath, L"wb");
     if (!f) { strcpy(tool_out, "(写入失败)"); return; }
     size_t len = strlen(content);
@@ -996,133 +994,45 @@ static void tool_write_file(const char *path, const char *content) {
     snprintf(tool_out, BUFSZ, "(已写入 %zu 字节)", len);
 }
 
-static void tool_list_dir(const char *path) {
-    if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
-    wchar_t wpath[MAX_PATH], wpattern[MAX_PATH];
-    if (!utf8_to_wide(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(列目录失败: 路径过长)"); return; }
-    swprintf(wpattern, MAX_PATH, L"%ls\\*", wpath);
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(wpattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) { snprintf(tool_out, BUFSZ, "(列目录失败: %s)", path); return; }
-    size_t pos = 0;
-    int count = 0;
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        const char *type = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "<DIR>" : "file";
-        char name_utf8[MAX_PATH * 3];
-        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name_utf8, sizeof(name_utf8), NULL, NULL);
-        unsigned long long sz = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-        char line[512];
-        snprintf(line, sizeof(line), "%s\t%llu\t%s\n", name_utf8, sz, type);
-        size_t ln = strlen(line);
-        if (pos + ln + 32 >= BUFSZ) { strcpy(tool_out + pos, "(更多条目已截断)"); break; }
-        memcpy(tool_out + pos, line, ln);
-        pos += ln;
-        if (++count >= 200) { strcpy(tool_out + pos, "(更多条目已截断)"); break; }
-    } while (FindNextFileW(h, &fd));
-    tool_out[pos] = '\0';
-    FindClose(h);
-}
-
-static void tool_search(const char *pattern, const char *path) {
-    if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
-    wchar_t wpath[MAX_PATH], wpattern[MAX_PATH];
-    if (!utf8_to_wide(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(搜索失败: 路径过长)"); return; }
-    swprintf(wpattern, MAX_PATH, L"%ls\\*", wpath);
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(wpattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) { snprintf(tool_out, BUFSZ, "(搜索失败: %s)", path); return; }
-    size_t pos = 0;
-    int matches = 0;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;  /* 非递归: 跳过子目录 */
-        wchar_t wfpath[MAX_PATH];
-        swprintf(wfpath, MAX_PATH, L"%ls\\%ls", wpath, fd.cFileName);
-        FILE *f = _wfopen(wfpath, L"rb");
-        if (!f) continue;
-        char *buf = (char*)malloc(256 * 1024);
-        if (!buf) { fclose(f); continue; }
-        size_t n = fread(buf, 1, 256 * 1024 - 1, f);
-        fclose(f);
-        if (n == 0) { free(buf); continue; }
-        buf[n] = '\0';
-        char name_utf8[MAX_PATH * 3];
-        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name_utf8, sizeof(name_utf8), NULL, NULL);
-        char *line = buf;
-        while (line < buf + n && matches < 50) {
-            char *eol = strchr(line, '\n');
-            int linelen = eol ? (int)(eol - line) : (int)(buf + n - line);
-            char save = line[linelen];
-            line[linelen] = '\0';
-            if (strstr(line, pattern)) {
-                char ml[1024];
-                snprintf(ml, sizeof(ml), "%s: %s\n", name_utf8, line);
-                size_t mlen = strlen(ml);
-                if (pos + mlen + 32 >= BUFSZ) {
-                    pos += snprintf(tool_out + pos, BUFSZ - pos, "(更多匹配已截断)");
-                    line[linelen] = save;
-                    free(buf);
-                    goto done;
-                }
-                memcpy(tool_out + pos, ml, mlen);
-                pos += mlen;
-                matches++;
-            }
-            line[linelen] = save;
-            if (!eol) break;
-            line = eol + 1;
-        }
-        free(buf);
-        if (matches >= 50) { pos += snprintf(tool_out + pos, BUFSZ - pos, "(更多匹配已截断)"); break; }
-    } while (FindNextFileW(h, &fd));
-done:
-    tool_out[pos] = '\0';
-    FindClose(h);
-    if (matches == 0 && pos == 0) strcpy(tool_out, "(无匹配)");
-}
-
-/* ===== Agent 工作线程 ===== */
+/* ===== Agent 循环 ===== */
 
 typedef struct { char user_msg[BUFSZ]; } AgentTask;
 
 #define SYSTEM_PROMPT \
-    "{\"role\":\"system\",\"content\":\"你是 cagent,一个由 C 语言实现的极简 AI Agent,运行在 Windows 上。" \
-    "命令通过 cmd /c 执行,请用 Windows 命令风格:不要用 mkdir -p(直接 mkdir 即可)," \
-    "运行当前目录程序不要加 ./ 前缀。文件工具仅限工作目录内,用相对路径。" \
-    "请始终使用中文回答。需要时调用工具。回答简洁。\"}"
+    "{\"role\":\"system\",\"content\":\"你是 cagent,一个极简的编程 Agent。" \
+    "你有三个工具: execute_bash(执行命令)、read_file(读文件)、write_file(写文件)。" \
+    "写入或覆盖文件前,先 read_file 读取现有内容。" \
+    "修改已有文件时,先读取再用 write_file 写入完整新内容(本 Agent 没有增量编辑工具)。" \
+    "列目录用 execute_bash 跑 dir,递归搜索内容用 findstr /s /i 关键词 *.* 。" \
+    "命令通过 cmd /c 执行,用 Windows 命令风格:不要 mkdir -p(直接 mkdir),运行当前程序不要 ./ 前缀。" \
+    "文件工具仅限工作目录内,用相对路径。" \
+    "任务不明确时,先向用户澄清。" \
+    "任务完成后,停止并简要总结你做了什么。" \
+    "始终用中文回答。回答简洁。\"}"
 
 /* messages 缓冲水位线: 接近上限时整轮对话重置, 防止越界. */
 #define MESSAGES_WATERMARK  ((BUFSZ * 3) / 4)
 
 static const char *ROLLBACK_HINT = "\r\n(本轮已回滚, 不影响后续对话)\r\n";
 
-/* 初始化 messages 为只含 system prompt 的状态. 在程序启动和 "清空对话" 时调用. */
+/* 初始化 messages 为只含 system prompt 的状态。 */
 static void reset_conversation(void) {
     snprintf(messages, BUFSZ, "%s", SYSTEM_PROMPT);
 }
 
-/* 前向声明: agent_thread 调用历史函数, 其定义在 config 区之后 */
-static void get_history_path(char *out, size_t cap);
+/* 前向声明: agent_turn 调用历史函数, 其定义在 config 区之后 */
 static void history_save(void);
-static int  history_load(void);
 
-static DWORD WINAPI agent_thread(LPVOID arg) {
-    AgentTask *task = (AgentTask*)arg;
+/* 执行一轮对话 (user_msg -> 直至最终回复或回滚)。线程无关, 可在主线程直接调用。
+ * 用户消息的界面回显由前端负责 (核心不管渲染)。 */
+static void agent_turn(const char *user_msg) {
+    InterlockedExchange(&g_cancel, 0);          /* 清除取消标志 */
 
-    /* 显示用户消息 */
-    {
-        char line[BUFSZ + 16];
-        snprintf(line, sizeof(line), "\r\n>>> %s\r\n\r\n", task->user_msg);
-        append_text(line);
-    }
-
-    /* 1. 若历史接近溢出, 整体重置(并提示用户) */
+    /* 1. 若历史接近溢出, 重开一个新会话 (旧会话文件保留, 不删除) */
     if (strlen(messages) > MESSAGES_WATERMARK) {
-        append_text("(对话历史过长, 已自动清空上下文)\r\n");
+        append_text("(对话历史过长, 已自动另起新会话)\r\n");
         reset_conversation();
-        char hpath[MAX_PATH];
-        get_history_path(hpath, sizeof(hpath));
-        DeleteFileA(hpath);
+        g_history_file[0] = '\0';
     }
 
     /* 2. 若首次发言, messages 还是空(没经过 config_load 之外的初始化) */
@@ -1133,7 +1043,7 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
     int rolled_back = 0;   /* 在 done 之前标记是否需要回滚 */
 
     /* 4. 追加本轮 user message */
-    char *escaped = json_escape_alloc(task->user_msg);
+    char *escaped = json_escape_alloc(user_msg);
     if (!escaped) {
         append_text("(内存不足, 已忽略本轮)\r\n");
         goto done;
@@ -1147,7 +1057,7 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
         goto done;
     }
 
-    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+    for (;;) {
         /* 取消检查点 1: 每轮迭代顶部 (LLM 调用前) */
         if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
             append_text("(已取消)\r\n");
@@ -1190,7 +1100,7 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
         if (ctx.n_calls > 0) {
             /* 有 tool_calls: 从 ctx.calls 转 ToolCall 并执行 */
             typedef struct {
-                char id[256]; char name[64]; char args[4096]; char *output;
+                char id[256]; char name[64]; char args[ARGS_MAX]; char *output;
             } ToolCall;
             ToolCall calls[8];
             int n_calls = 0;
@@ -1236,21 +1146,18 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
                 const char *p = json_as_str(json_obj_get(argsj, "path"));
                 const char *ct = json_as_str(json_obj_get(argsj, "content"));
                 tool_write_file(p ? p : "", ct ? ct : "");
-            } else if (strcmp(c->name, "list_dir") == 0) {
-                const char *p = json_as_str(json_obj_get(argsj, "path"));
-                tool_list_dir(p ? p : "");
-            } else if (strcmp(c->name, "search") == 0) {
-                const char *pat = json_as_str(json_obj_get(argsj, "pattern"));
-                const char *p = json_as_str(json_obj_get(argsj, "path"));
-                tool_search(pat ? pat : "", p ? p : "");
             } else {
                 strcpy(tool_out, "(未知工具)");
             }
             json_free(argsj);
             c->output = strdup(tool_out);
             {
+                size_t tl = strlen(tool_out);
                 char line[BUFSZ + 32];
-                snprintf(line, sizeof(line), "[Output]\r\n%s\r\n", tool_out);
+                if (tl > 0 && (tool_out[tl-1] == '\n' || tool_out[tl-1] == '\r'))
+                    snprintf(line, sizeof(line), "[Output]\r\n%s", tool_out);
+                else
+                    snprintf(line, sizeof(line), "[Output]\r\n%s\r\n", tool_out);
                 append_text(line);
             }
         }
@@ -1309,7 +1216,10 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
         } else {
             /* 无 tool_calls: content 收尾。流式已逐字显示, 这里只追加换行 + messages。 */
             if (ctx.content_len > 0) {
-                append_text("\r\n");
+                /* 内容末尾已带换行则不再补, 避免双倍空行 */
+                if (ctx.content_buf[ctx.content_len - 1] != '\n' &&
+                    ctx.content_buf[ctx.content_len - 1] != '\r')
+                    append_text("\r\n");
                 char *esc = json_escape_alloc(ctx.content_buf);
                 if (esc) {
                     size_t len = strlen(messages);
@@ -1329,98 +1239,364 @@ static DWORD WINAPI agent_thread(LPVOID arg) {
             goto done;
         }
     }
-    append_text("(max iterations reached)\r\n");
-    /* 达到上限不算失败: 此前已多次成功调用, 保留历史. */
-
 done:
     if (rolled_back) {
         messages[savepoint] = '\0';
     }
     history_save();   /* 每轮 done 后保存 (含回滚后状态) */
+}
+
+/* 后台线程入口: 跑一轮后通过钩子通知前端。 */
+static DWORD WINAPI agent_thread(LPVOID arg) {
+    AgentTask *task = (AgentTask*)arg;
+    agent_turn(task->user_msg);
     free(task);
-    PostMessage(g_hHistory, WM_APP_DONE, 0, 0);
+    if (cagent_on_done) cagent_on_done();
     return 0;
-}
-
-/* ===== UI ===== */
-
-/* 从一个 Edit 控件读 UTF-8 文本到指定缓冲(若空则保留原值) */
-static void read_edit_utf8(HWND h, char *out, size_t cap) {
-    int wlen = GetWindowTextLengthW(h);
-    if (wlen <= 0) return;
-    WCHAR *wbuf = (WCHAR*)malloc((wlen + 1) * sizeof(WCHAR));
-    GetWindowTextW(h, wbuf, wlen + 1);
-    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)cap, NULL, NULL);
-    free(wbuf);
-}
-
-/* 把 UTF-8 字符串设到 Edit 控件 */
-static void set_edit_utf8(HWND h, const char *utf8) {
-    if (!utf8 || !*utf8) return;
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
-    if (wlen <= 0) return;
-    WCHAR *wbuf = (WCHAR*)malloc(wlen * sizeof(WCHAR));
-    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wbuf, wlen);
-    SetWindowTextW(h, wbuf);
-    free(wbuf);
 }
 
 /* ===== 配置文件 cagent.ini ===== */
 
 /* 取 exe 同目录下某文件的绝对路径 */
 static void get_app_path(char *out, size_t cap, const char *filename) {
-    char exe[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) { snprintf(out, cap, "%s", filename); return; }
-    char *slash = strrchr(exe, '\\');
-    if (slash) *(slash + 1) = '\0';
-    else exe[0] = '\0';
-    snprintf(out, cap, "%s%s", exe, filename);
+    char dir[MAX_PATH];
+    get_exe_dir_utf8(dir, sizeof(dir));
+    if (dir[0]) snprintf(out, cap, "%s\\%s", dir, filename);
+    else        snprintf(out, cap, "%s", filename);
 }
 
 static void get_ini_path(char *out, size_t cap)     { get_app_path(out, cap, "cagent.ini"); }
-static void get_history_path(char *out, size_t cap) { get_app_path(out, cap, "cagent_history.json"); }
 
-/* 把 messages 写入历史文件 (失败静默) */
-static void history_save(void) {
-    char path[MAX_PATH];
-    get_history_path(path, sizeof(path));
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
-    fputs(messages, f);
-    fclose(f);
+/* 记录最近使用的会话文件路径 (存内存全局, 随 config_save 持久化到 ini)。 */
+static void record_last_session(const char *path) {
+    snprintf(g_last_session, sizeof(g_last_session), "%s", path);
 }
 
-/* 读历史文件到 messages, 成功返回 1, 失败/不存在返回 0 */
-static int history_load(void) {
-    char path[MAX_PATH];
-    get_history_path(path, sizeof(path));
-    FILE *f = fopen(path, "rb");
+/* djb2 字符串哈希, 用于工作目录的稳定摘要 (防文件名超长/冲突) */
+static unsigned int djb2_hash(const char *s) {
+    unsigned int h = 5381; int c;
+    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) + (unsigned int)c;
+    return h;
+}
+
+/* 把工作目录编码为安全的历史文件名: 替换非法字符 + 附 8 位哈希后缀。
+   不同工作目录 => 不同文件名; 同名前导便于人读, 哈希保证唯一。 */
+static void ws_to_histname(const char *ws, char *out, size_t cap) {
+    char san[128];
+    size_t j = 0;
+    for (size_t i = 0; ws[i] && j + 1 < sizeof(san); i++) {
+        char c = ws[i];
+        if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' ||
+            c == '"'  || c == '<' || c == '>' || c == '|' || c == ' ') {
+            if (j == 0 || san[j-1] != '_') san[j++] = '_';
+        } else {
+            san[j++] = c;
+        }
+    }
+    if (j == 0) { san[0]='d'; san[1]='e'; san[2]='f'; san[3]='\0'; }
+    else san[j] = '\0';
+    snprintf(out, cap, "history_%s_%08X.json", san, djb2_hash(ws));
+}
+
+/* 为新会话生成一个不存在的会话文件路径 (工作目录 + 哈希 + 时间戳, 支持同目录多会话) */
+static void build_new_session_path(char *out, size_t cap) {
+    char base[256];
+    ws_to_histname(g_workspace, base, sizeof(base));
+    base[strlen(base) - 5] = '\0';             /* 去掉 ".json" */
+    for (int n = 0; ; n++) {
+        char name[300];
+        if (n == 0)
+            snprintf(name, sizeof(name), "%s_%lld.json", base, (long long)time(NULL));
+        else
+            snprintf(name, sizeof(name), "%s_%lld_%d.json", base, (long long)time(NULL), n);
+        get_app_path(out, cap, name);
+        FILE *test = fopen_utf8(out, "rb");
+        if (!test) return;                     /* 不存在 -> 可用 */
+        fclose(test);
+    }
+}
+
+/* 新建会话: 当前对话若有内容先落盘 (旧会话文件保留), 然后重开一个空对话。 */
+static void history_start_new(void) {
+    if (g_active_ws[0] && strlen(messages) > strlen(SYSTEM_PROMPT))
+        history_save();                        /* 已有内容 -> 存到它绑定的文件 */
+    reset_conversation();
+    g_history_file[0] = '\0';                  /* 下次保存时生成新文件 */
+}
+
+/* 把 messages 写入历史文件 (失败静默) */
+/* 返回首个顶层 JSON 对象的结束下标 (指向其闭合 '}' 之后)。
+ * 正确处理字符串内的括号与转义。找不到返回 0。 */
+static size_t first_object_end(const char *s) {
+    size_t i = 0;
+    while (s[i] && s[i] != '{') i++;          /* 跳过前导空白/逗号 */
+    if (!s[i]) return 0;
+    int depth = 0, in_str = 0;
+    for (; s[i]; i++) {
+        char c = s[i];
+        if (in_str) {
+            if (c == '\\') { i++; continue; }
+            if (c == '"') in_str = 0;
+            continue;
+        }
+        if (c == '"') { in_str = 1; continue; }
+        if (c == '{') depth++;
+        else if (c == '}') { if (--depth == 0) return i + 1; }
+    }
+    return 0;
+}
+
+/* 在 text 中定位 "messages":[ ... ] 数组内部内容区间 (字符串/嵌套感知)。
+ * 输出内部起点 (首 '[' 之后) 与逻辑终点 (末 ']' 之前) 下标; 找不到返回 -1。 */
+static long find_messages_inner(const char *t, long *out_start, long *out_end) {
+    const char *p = strstr(t, "\"messages\"");
+    if (!p) return -1;
+    p += 10; /* "messages" 含引号共 10 字符 */
+    while (*p && *p != ':') p++;
+    if (!*p) return -1;
+    p++;
+    while (*p && *p != '[') p++;
+    if (!*p) return -1;
+    *out_start = (long)(p - t) + 1;            /* 跳过 '[' */
+    int depth = 0, in_str = 0; const char *q = p;
+    for (; *q; q++) {
+        char c = *q;
+        if (in_str) { if (c == '\\') { q++; continue; } if (c == '"') in_str = 0; continue; }
+        if (c == '"') { in_str = 1; continue; }
+        if (c == '[') depth++;
+        else if (c == ']') { if (--depth == 0) { *out_end = (long)(q - t); return 0; } }
+    }
+    return -1;
+}
+
+/* 把文件文本重建进 messages: 始终以最新系统提示词开场, 再追加对话。
+ * 支持两种格式: 自描述 {"workspace":...,"messages":[...]} 与旧版纯对话。
+ * 返回 1 成功; 若含 workspace 则同步写回 g_workspace / g_active_ws。 */
+static int load_messages_from_text(const char *text, size_t len) {
+    char buf[BUFSZ];
+    if (len >= BUFSZ) len = BUFSZ - 1;
+    memcpy(buf, text, len); buf[len] = '\0';
+
+    JValue *root = json_parse(buf);
+    if (root && root->type == J_OBJ) {
+        const JValue *ws = json_obj_get(root, "workspace");
+        if (ws && ws->type == J_STR && ws->str && ws->str[0]) {
+            snprintf(g_workspace, sizeof(g_workspace), "%s", ws->str);
+            snprintf(g_active_ws, sizeof(g_active_ws), "%s", ws->str);
+        }
+        long s, e;
+        if (find_messages_inner(buf, &s, &e) >= 0) {
+            long ilen = e - s;
+            reset_conversation();
+            if (ilen > 0 && strlen(messages) + (size_t)ilen + 1 < BUFSZ) {
+                strcat(messages, ",");
+                strncat(messages, buf + s, (size_t)ilen);
+            }
+            json_free(root);
+            return 1;
+        }
+        json_free(root);
+    }
+
+    /* 旧版: 纯对话文本 (messages 以系统提示词开头)。
+     * 只接受形如对话的内容, 防止损坏文件把垃圾文本混进请求体。 */
+    reset_conversation();
+    const char *conv = buf;
+    if (strncmp(buf, "{\"role\":\"system\"", 16) == 0) {
+        size_t end = first_object_end(buf);
+        if (end) conv = buf + end;
+    }
+    if (*conv == ',') conv++;
+    if (strncmp(conv, "{\"role\":", 8) == 0 &&
+        strlen(messages) + strlen(conv) < BUFSZ - 1) {
+        strcat(messages, conv);
+        return 1;
+    }
+    return 0;   /* 无法识别: 视为无有效历史, 从新对话开始 */
+}
+
+/* 保存历史: 自描述格式 {"workspace":...,"messages":[...]}, 仅存对话部分。 */
+static void history_save(void) {
+    /* 懒绑定: 新对话首次保存时生成自己的会话文件 */
+    if (g_history_file[0] == '\0')
+        build_new_session_path(g_history_file, sizeof(g_history_file));
+    const char *path = g_history_file;
+    FILE *f = fopen_utf8(path, "wb");
+    if (!f) return;
+    char *wse = json_escape_alloc(g_workspace);
+    if (!wse) { fclose(f); return; }
+    size_t skip = strlen(SYSTEM_PROMPT);
+    if (strlen(messages) < skip) skip = strlen(messages);  /* 防越界 (messages 未初始化时) */
+    const char *conv = messages + skip;        /* ',{...}' 对话 (含前导逗号) */
+    /* wse 只含转义内容不带引号, 此处必须自己补上 */
+    fprintf(f, "{\"workspace\":\"%s\",\"messages\":[", wse);
+    if (conv[0] == ',') conv++;                 /* 数组内部不需要前导逗号 */
+    fputs(conv, f);
+    fputs("]}", f);
+    free(wse);
+    fclose(f);
+    record_last_session(path);
+}
+
+/* 读取单个历史文件并重建 messages + 工作目录。返回 1 成功。 */
+static int history_load_from_file(const char *path) {
+    FILE *f = fopen_utf8(path, "rb");
     if (!f) return 0;
-    size_t n = fread(messages, 1, BUFSZ - 1, f);
+    char buf[BUFSZ];
+    size_t n = fread(buf, 1, BUFSZ - 1, f);
     fclose(f);
     if (n == 0) return 0;
-    messages[n] = '\0';
+    int ok = load_messages_from_text(buf, n);
+    if (ok) {
+        snprintf(g_history_file, sizeof(g_history_file), "%s", path); /* 绑定本对话到该文件 */
+        record_last_session(path);
+    }
+    return ok;
+}
+
+/* 把当前 messages 里的对话按角色回放到前端 (跳过系统提示词), 格式与实时对话一致。 */
+static void history_replay(void) {
+    if (!cagent_emit) return;
+    size_t skip = strlen(SYSTEM_PROMPT);
+    const char *conv = messages + skip;
+    if (*conv == ',') conv++;
+    if (!*conv) return;
+    char *arr = (char*)malloc(strlen(conv) + 3);
+    if (!arr) return;
+    sprintf(arr, "[%s]", conv);
+    JValue *root = json_parse(arr);
+    free(arr);
+    if (!root || root->type != J_ARR) { if (root) json_free(root); return; }
+    for (size_t i = 0; i < root->arr.n; i++) {
+        const JValue *m = root->arr.items[i];
+        if (m->type != J_OBJ) continue;
+        const JValue *role = json_obj_get(m, "role");
+        const JValue *c = json_obj_get(m, "content");
+        const char *r  = (role && role->type == J_STR) ? role->str : "";
+        const char *ct = (c && c->type == J_STR) ? c->str : "";
+        if (!*ct) continue;
+        if (strcmp(r, "user") == 0) {
+            char *line = (char*)malloc(strlen(ct) + 16);
+            if (!line) break;
+            snprintf(line, strlen(ct) + 16, "\r\n你：%s\r\n", ct);
+            cagent_emit(line, CAGENT_ROLE_USER);
+            free(line);
+        } else if (strcmp(r, "assistant") == 0) {
+            char *line = (char*)malloc(strlen(ct) + 8);
+            if (!line) break;
+            snprintf(line, strlen(ct) + 8, "%s\r\n", ct);
+            cagent_emit(line, CAGENT_ROLE_AI);
+            free(line);
+        } else if (strcmp(r, "tool") == 0) {
+            size_t tl = strlen(ct);
+            size_t cut = utf8_trim_len(ct, tl > 800 ? 800 : tl);
+            int trunc = (tl > 800);
+            char *line = (char*)malloc(cut + 48);
+            if (!line) break;
+            snprintf(line, cut + 48, "[Output]\r\n%.*s%s\r\n",
+                     (int)cut, ct, trunc ? "\r\n(已截断)" : "");
+            cagent_emit(line, CAGENT_ROLE_SYS);
+            free(line);
+        }
+    }
+    json_free(root);
+}
+
+/* 读取历史文件的元信息: 工作目录 + 首条 user 消息预览, 供 GUI 列表展示。
+ * 成功返回 1; ws_out / prev_out 始终以 '\0' 结尾 (无则空字符串)。 */
+/* 旧格式文件提取首条 user 消息预览 (纯文本扫描, 不建 JSON 树)。 */
+static void extract_old_preview(const char *text, char *out, size_t cap) {
+    out[0] = '\0';
+    const char *p = text;
+    if (p[0] == ',') p++;
+    if (strncmp(p, "{\"role\":\"system\"", 16) == 0) {
+        size_t end = first_object_end(p);
+        if (end) { p += end; if (p[0] == ',') p++; }
+    }
+    const char *u = strstr(p, "\"role\":\"user\"");
+    if (!u) u = p;
+    const char *c = strstr(u, "\"content\":\"");
+    if (!c) return;
+    c += strlen("\"content\":\"");
+    size_t i = 0;
+    while (*c && i + 1 < cap) {
+        if (*c == '\\' && c[1]) {
+            char nx = c[1];
+            out[i++] = (nx == 'n' || nx == 't' || nx == 'r') ? ' ' : nx;
+            c += 2;
+            continue;
+        }
+        if (*c == '"') break;
+        out[i++] = *c++;
+    }
+    out[i] = '\0';
+}
+
+/* 读取历史文件的元信息: 工作目录 + 首条 user 消息预览 + 消息条数, 供 GUI 列表展示。
+ * 成功返回 1; ws_out / prev_out 始终以 '\0' 结尾 (无则空字符串, 旧格式自动回退解析)。 */
+static int session_read_meta(const char *path, char *ws_out, size_t ws_cap,
+                             char *prev_out, size_t prev_cap, int *cnt_out) {
+    ws_out[0] = prev_out[0] = '\0';
+    if (cnt_out) *cnt_out = 0;
+    FILE *f = fopen_utf8(path, "rb");
+    if (!f) return 0;
+    char buf[BUFSZ];
+    size_t n = fread(buf, 1, BUFSZ - 1, f);
+    fclose(f);
+    if (n == 0) return 0;
+    buf[n] = '\0';
+
+    JValue *root = json_parse(buf);
+    if (root && root->type == J_OBJ) {
+        const JValue *ws = json_obj_get(root, "workspace");
+        if (ws && ws->type == J_STR && ws->str)
+            snprintf(ws_out, ws_cap, "%s", ws->str);
+        const JValue *msgs = json_obj_get(root, "messages");
+        if (msgs && msgs->type == J_ARR) {
+            if (cnt_out) *cnt_out = (int)msgs->arr.n;
+            for (size_t i = 0; i < msgs->arr.n && prev_out[0] == '\0'; i++) {
+                const JValue *m = msgs->arr.items[i];
+                if (m->type != J_OBJ) continue;
+                const JValue *role = json_obj_get(m, "role");
+                const char *r = (role && role->type == J_STR) ? role->str : "";
+                if (strcmp(r, "user") != 0) continue;
+                const JValue *c = json_obj_get(m, "content");
+                const char *cs = (c && c->type == J_STR) ? c->str : "";
+                if (cs) { strncpy(prev_out, cs, prev_cap - 1); prev_out[prev_cap - 1] = '\0'; }
+            }
+        }
+        json_free(root);
+        return 1;
+    }
+    /* 旧格式 (纯对话文本): 逐字扫描统计 + 提取预览 */
+    const char *p = buf;
+    if (p[0] == ',') p++;
+    if (strncmp(p, "{\"role\":\"system\"", 16) == 0) {
+        size_t end = first_object_end(p);
+        if (end) { p += end; if (p[0] == ',') p++; }
+    }
+    if (cnt_out)
+        for (const char *q = p; (q = strstr(q, "\"role\":")) != NULL; q += 7)
+            (*cnt_out)++;
+    extract_old_preview(p, prev_out, prev_cap);
     return 1;
 }
 
-/* 简单 key=value 解析器:遇到目标 key 把 value 拷入 out (去掉行尾 \r\n) */
+/* 简单 key=value 解析器 */
 static void config_load(void) {
     char path[MAX_PATH];
     get_ini_path(path, sizeof(path));
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen_utf8(path, "rb");
     if (!f) return;
 
     char line[2048];
     while (fgets(line, sizeof(line), f)) {
-        /* 去注释和空行 */
         if (line[0] == '#' || line[0] == ';' || line[0] == '\n' || line[0] == '\r') continue;
         char *eq = strchr(line, '=');
         if (!eq) continue;
         *eq = '\0';
         char *key = line, *val = eq + 1;
 
-        /* 去掉 val 尾部的 \r \n */
         size_t vlen = strlen(val);
         while (vlen > 0 && (val[vlen-1] == '\n' || val[vlen-1] == '\r')) {
             val[--vlen] = '\0';
@@ -1434,7 +1610,6 @@ static void config_load(void) {
                 snprintf(g_api_key, sizeof(g_api_key), "%s", dec);
                 free(dec);
             } else {
-                /* 解密失败: 置空并标记, 启动后提示用户重填 */
                 g_api_key[0] = '\0';
                 g_key_decrypt_failed = 1;
             }
@@ -1445,393 +1620,34 @@ static void config_load(void) {
             g_skip_cert_verify = (atoi(val) != 0);
         else if (strcmp(key, "workspace") == 0)
             snprintf(g_workspace, sizeof(g_workspace), "%s", val);
+        else if (strcmp(key, "last_session") == 0)
+            snprintf(g_last_session, sizeof(g_last_session), "%s", val);
     }
     fclose(f);
 }
 
-/* 把当前 Edit 控件的值同步到全局并写回 ini */
+/* 把当前全局配置写回 ini (若 cagent_read_config_ui 已设置, 先从中同步)。 */
 static void config_save(void) {
-    if (g_hCfg[CFG_URL]) read_edit_utf8(g_hCfg[CFG_URL], g_api_url, sizeof(g_api_url));
-    if (g_hCfg[CFG_KEY]) read_edit_utf8(g_hCfg[CFG_KEY], g_api_key, sizeof(g_api_key));
-    if (g_hCfg[CFG_MDL]) read_edit_utf8(g_hCfg[CFG_MDL], g_model,   sizeof(g_model));
+    if (cagent_read_config_ui) cagent_read_config_ui();
 
     /* 三个全空就不写,避免覆盖出"空文件" */
     if (!g_api_url[0] && !g_api_key[0] && !g_model[0]) return;
 
     char path[MAX_PATH];
     get_ini_path(path, sizeof(path));
-    FILE *f = fopen(path, "wb");
+    FILE *f = fopen_utf8(path, "wb");
     if (!f) return;
-    fprintf(f, "# cagent GUI 配置 (UTF-8, 退出时自动保存)\r\n");
+    fprintf(f, "# cagent 配置 (UTF-8, 退出时自动保存)\r\n");
     fprintf(f, "url_base=%s\r\n", g_api_url);
     {
         char *enc = dpapi_protect(g_api_key);
         if (enc) { fprintf(f, "api_key=%s\r\n", enc); free(enc); }
-        /* 加密失败: 不写 api_key 行, 避免明文落盘; 下次启动提示重填 */
     }
     fprintf(f, "model=%s\r\n",    g_model);
     fprintf(f, "skip_cert_verify=%d\r\n", g_skip_cert_verify);
     fprintf(f, "workspace=%s\r\n", g_workspace);
+    fprintf(f, "last_session=%s\r\n", g_last_session);
     fclose(f);
 }
 
-static void start_task(HWND hwnd) {
-    /* 防御性: 若仍有旧线程未回收, 等待其结束再关闭 (正常路径不会走到, 因按钮状态已挡) */
-    if (g_hThread) {
-        WaitForSingleObject(g_hThread, INFINITE);
-        CloseHandle(g_hThread);
-        g_hThread = NULL;
-    }
-
-    int wlen = GetWindowTextLengthW(g_hInput);
-    if (wlen <= 0) return;
-
-    /* 同步配置 */
-    read_edit_utf8(g_hCfg[CFG_URL], g_api_url, sizeof(g_api_url));
-    read_edit_utf8(g_hCfg[CFG_KEY], g_api_key, sizeof(g_api_key));
-    read_edit_utf8(g_hCfg[CFG_MDL], g_model,   sizeof(g_model));
-    read_edit_utf8(g_hWorkspace, g_workspace, sizeof(g_workspace));
-
-    if (!g_api_url[0] || !g_api_key[0] || !g_model[0]) {
-        MessageBoxW(hwnd, L"请填写 Url-Base、Key、Model 三项配置。",
-                    L"配置不完整", MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    /* 同步进程 CWD 到工作目录 (execute_bash 子进程继承); 用 W 版以支持中文路径 */
-    wchar_t wws[MAX_PATH];
-    if (utf8_to_wide(g_workspace, wws, MAX_PATH)) SetCurrentDirectoryW(wws);
-
-    WCHAR *wbuf = (WCHAR*)malloc((wlen + 1) * sizeof(WCHAR));
-    GetWindowTextW(g_hInput, wbuf, wlen + 1);
-
-    AgentTask *task = (AgentTask*)calloc(1, sizeof(AgentTask));
-    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, task->user_msg, BUFSZ, NULL, NULL);
-    free(wbuf);
-
-    SetWindowTextW(g_hInput, L"");
-
-    InterlockedExchange(&g_cancel, 0);          /* 清除取消标志 */
-    InterlockedExchange(&g_danger_denied, 0);   /* 清除危险命令拒绝标志 */
-    EnableWindow(g_hInput, FALSE);              /* 输入框禁用 */
-    EnableWindow(g_hClear, FALSE);              /* 清空按钮禁用 */
-    SetWindowTextW(g_hSend, L"停止");           /* 发送按钮变停止, 保持启用 (点击即取消) */
-
-    InterlockedExchange(&g_running, 1);
-    g_hThread = CreateThread(NULL, 0, agent_thread, task, 0, NULL);
-}
-
-static void layout(HWND hwnd) {
-    RECT rc; GetClientRect(hwnd, &rc);
-    int W = rc.right, H = rc.bottom;
-    int gap = 8;
-    int row_h = 26;             /* 配置区每行高度 */
-    int lbl_w = 80;             /* 标签宽 (容纳 "Url-Base:") */
-    int top_h = row_h * 4 + gap * 5;  /* 4 行 + 5 个间隙 */
-    int btn_w = 80;
-    int clear_w = 80;
-    int ws_btn_w = 72;           /* 工作目录浏览按钮宽 */
-    int input_h = 72;           /* 多行输入框, 约 3 行高 (Enter 发送, Shift+Enter 换行) */
-    int input_y = H - input_h - gap;
-    int input_w = W - btn_w - clear_w - gap * 4;
-
-    /* 四行配置: url / key / model / workspace */
-    for (int i = 0; i < 3; i++) {
-        int y = gap + i * (row_h + gap);
-        HWND lbl = GetDlgItem(hwnd, ID_LBL_BASE + i);
-        MoveWindow(lbl,        gap,         y + 4, lbl_w,               row_h, TRUE);
-        MoveWindow(g_hCfg[i],  gap + lbl_w, y,     W - gap*2 - lbl_w,   row_h, TRUE);
-    }
-    /* 第 4 行: 工作目录 (标签 + Edit + 浏览按钮) */
-    {
-        int y = gap + 3 * (row_h + gap);
-        HWND lbl = GetDlgItem(hwnd, ID_LBL_WS);
-        MoveWindow(lbl,           gap,         y + 4, lbl_w,             row_h, TRUE);
-        MoveWindow(g_hWorkspace,  gap + lbl_w, y,     W - gap*2 - lbl_w - ws_btn_w - gap, row_h, TRUE);
-        MoveWindow(g_hWsBrowse,   W - gap - ws_btn_w, y, ws_btn_w,       row_h, TRUE);
-    }
-
-    MoveWindow(g_hHistory, gap, top_h, W - gap * 2,
-               H - top_h - input_h - gap * 2, TRUE);
-    MoveWindow(g_hInput, gap, input_y, input_w, input_h, TRUE);
-    MoveWindow(g_hClear, gap * 2 + input_w, input_y, clear_w, input_h, TRUE);
-    MoveWindow(g_hSend,  gap * 3 + input_w + clear_w, input_y, btn_w, input_h, TRUE);
-}
-
-/* 输入框子类化: Enter 发送, Shift+Enter 插入换行 */
-static WNDPROC g_oldInputProc;
-static LRESULT CALLBACK InputProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN && wp == VK_RETURN) {
-        if (GetKeyState(VK_SHIFT) & 0x8000) {
-            /* Shift+Enter: 走默认处理插入换行 */
-            return CallWindowProc(g_oldInputProc, h, msg, wp, lp);
-        }
-        SendMessage(GetParent(h), WM_COMMAND, MAKEWPARAM(ID_SEND, BN_CLICKED), 0);
-        return 0;
-    }
-    if (msg == WM_CHAR && wp == VK_RETURN) {
-        /* 仅在没按 Shift 时抑制 (否则 Shift+Enter 会被吞,听不到 beep 也没换行) */
-        if (!(GetKeyState(VK_SHIFT) & 0x8000)) return 0;
-    }
-    return CallWindowProc(g_oldInputProc, h, msg, wp, lp);
-}
-
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_CREATE: {
-        /* 注意: 多行 EDIT + CLEARTYPE_QUALITY 在滚动时会出现字形 alpha 残留
-         * (新字画在旧字上而不先擦除背景), 改用 ANTIALIASED_QUALITY 可消除重影. */
-        g_hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              ANTIALIASED_QUALITY, FF_DONTCARE, L"Microsoft YaHei UI");
-
-        /* 顶部 3 行配置: Url-Base / Key / Model */
-        static const WCHAR *labels[3] = { L"Url-Base:", L"Key:", L"Model:" };
-        static const DWORD ed_styles[3] = { 0, ES_PASSWORD, 0 };
-
-        for (int i = 0; i < 3; i++) {
-            HWND lbl = CreateWindowW(L"STATIC", labels[i],
-                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)(ID_LBL_BASE + i), NULL, NULL);
-            SendMessage(lbl, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-            g_hCfg[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ed_styles[i],
-                0, 0, 0, 0, hwnd,
-                (HMENU)(LONG_PTR)(ID_CFG_BASE + i), NULL, NULL);
-            SendMessage(g_hCfg[i], WM_SETFONT, (WPARAM)g_hFont, TRUE);
-        }
-        SendMessage(g_hCfg[CFG_KEY], EM_SETPASSWORDCHAR, (WPARAM)'*', 0);
-
-        /* 读 cagent.ini 并填充三个 Edit */
-        config_load();
-        set_edit_utf8(g_hCfg[CFG_URL], g_api_url);
-        set_edit_utf8(g_hCfg[CFG_KEY], g_api_key);
-        set_edit_utf8(g_hCfg[CFG_MDL], g_model);
-
-        /* 第 4 行: 工作目录 (标签 + Edit + 浏览按钮) */
-        {
-            HWND lbl = CreateWindowW(L"STATIC", L"工作目录:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT,
-                0,0,0,0, hwnd, (HMENU)(LONG_PTR)ID_LBL_WS, NULL, NULL);
-            SendMessage(lbl, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-            g_hWorkspace = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                0,0,0,0, hwnd, (HMENU)(LONG_PTR)ID_WS_EDIT, NULL, NULL);
-            SendMessage(g_hWorkspace, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-            g_hWsBrowse = CreateWindowW(L"BUTTON", L"浏览...",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,0,0,0, hwnd, (HMENU)(LONG_PTR)ID_WS_BTN, NULL, NULL);
-            SendMessage(g_hWsBrowse, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-            ensure_workspace();
-            set_edit_utf8(g_hWorkspace, g_workspace);
-        }
-
-        g_hHistory = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL |
-            ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-            0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_HISTORY, NULL, NULL);
-        SendMessage(g_hHistory, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-        g_hInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL |
-            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
-            0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_INPUT, NULL, NULL);
-        SendMessage(g_hInput, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-        /* 子类化输入框,捕获 Enter */
-        g_oldInputProc = (WNDPROC)SetWindowLongPtr(g_hInput, GWLP_WNDPROC, (LONG_PTR)InputProc);
-
-        g_hSend = CreateWindowW(L"BUTTON", L"发送",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-            0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_SEND, NULL, NULL);
-        SendMessage(g_hSend, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-        g_hClear = CreateWindowW(L"BUTTON", L"清空对话",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_CLEAR, NULL, NULL);
-        SendMessage(g_hClear, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-        /* 加载历史对话; 失败则初始化为只含 system prompt */
-        if (!history_load()) reset_conversation();
-        else append_text("(已恢复历史对话, 可继续)\r\n");
-
-        /* DPAPI 解密失败提示 (config_load 在历史框创建前执行, 延迟到此处显示) */
-        if (g_key_decrypt_failed) {
-            append_text("API Key 解密失败 (可能换了用户/机器), 请重新填写 Key。\r\n");
-            g_key_decrypt_failed = 0;
-        }
-
-        SetFocus(g_hInput);
-        return 0;
-    }
-
-    case WM_SIZE:
-        layout(hwnd);
-        return 0;
-
-    case WM_COMMAND:
-        if (LOWORD(wp) == ID_SEND && HIWORD(wp) == BN_CLICKED) {
-            if (g_running) {
-                /* 任务运行中: 点击=请求取消 */
-                InterlockedExchange(&g_cancel, 1);
-                EnableWindow(g_hSend, FALSE);   /* 防重复点, 等 DONE 恢复 */
-                append_text("(正在停止...)\r\n");
-            } else {
-                start_task(hwnd);
-            }
-            return 0;
-        }
-        if (LOWORD(wp) == ID_WS_BTN && HIWORD(wp) == BN_CLICKED) {
-            /* 浏览选择工作目录 (现代 IFileOpenDialog, 同文件选择对话框样式) */
-            IFileOpenDialog *pfd = NULL;
-            if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC,
-                                            &IID_IFileOpenDialog, (void**)&pfd))) {
-                FILEOPENDIALOGOPTIONS opts = 0;
-                pfd->lpVtbl->GetOptions(pfd, &opts);
-                pfd->lpVtbl->SetOptions(pfd, opts | FOS_PICKFOLDERS);
-                pfd->lpVtbl->SetTitle(pfd, L"选择工作目录");
-                if (SUCCEEDED(pfd->lpVtbl->Show(pfd, hwnd))) {
-                    IShellItem *psi = NULL;
-                    if (SUCCEEDED(pfd->lpVtbl->GetResult(pfd, &psi)) && psi) {
-                        PWSTR ppath = NULL;
-                        if (SUCCEEDED(psi->lpVtbl->GetDisplayName(psi, SIGDN_FILESYSPATH, &ppath)) && ppath) {
-                            char utf8[MAX_PATH];
-                            WideCharToMultiByte(CP_UTF8, 0, ppath, -1, utf8, sizeof(utf8), NULL, NULL);
-                            snprintf(g_workspace, sizeof(g_workspace), "%s", utf8);
-                            set_edit_utf8(g_hWorkspace, g_workspace);
-                            CoTaskMemFree(ppath);
-                        }
-                        psi->lpVtbl->Release(psi);
-                    }
-                }
-                pfd->lpVtbl->Release(pfd);
-            }
-            return 0;
-        }
-        if (LOWORD(wp) == ID_CLEAR && HIWORD(wp) == BN_CLICKED) {
-            if (!g_running) {  /* 任务运行中不允许清空 */
-                reset_conversation();
-                char hpath[MAX_PATH];
-                get_history_path(hpath, sizeof(hpath));
-                DeleteFileA(hpath);   /* 同步删除历史文件 */
-                SetWindowTextW(g_hHistory, L"");
-                SetFocus(g_hInput);
-            }
-            return 0;
-        }
-        break;
-
-    case WM_CTLCOLORSTATIC:
-        SetBkMode((HDC)wp, TRANSPARENT);
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
-
-    case WM_DESTROY:
-        config_save();   /* 退出时保存当前 Edit 值到 cagent.ini */
-        if (g_hFont) DeleteObject(g_hFont);
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-/* 历史框子类化:接收 WM_APP_APPEND / WM_APP_DONE */
-static WNDPROC g_oldHistoryProc;
-static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_APP_APPEND) {
-        char *txt = (char*)lp;
-        do_append(txt);
-        free(txt);
-        return 0;
-    }
-    if (msg == WM_APP_DONE) {
-        InterlockedExchange(&g_running, 0);
-        InterlockedExchange(&g_cancel, 0);
-        InterlockedExchange(&g_danger_denied, 0);
-        SetWindowTextW(g_hSend, L"发送");       /* 恢复按钮文本 */
-        EnableWindow(g_hSend, TRUE);
-        EnableWindow(g_hInput, TRUE);
-        EnableWindow(g_hClear, TRUE);
-        SetFocus(g_hInput);
-        return 0;
-    }
-    /* 修复多行 EDIT 滚动后字形重叠 / 残留:
-     * Win32 EDIT 滚动时仅重绘新出现的行, 用自定义字体 + 中文 / 高 DPI 时
-     * 行高轻微错位会让旧字形未被擦除. 拦截所有可能引发滚动的消息,
-     * 在默认处理之后强制整个控件区域重绘. */
-    if (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL ||
-        msg == WM_KEYDOWN || msg == WM_KEYUP) {
-        LRESULT r = CallWindowProc(g_oldHistoryProc, h, msg, wp, lp);
-        InvalidateRect(h, NULL, TRUE);
-        UpdateWindow(h);
-        return r;
-    }
-    return CallWindowProc(g_oldHistoryProc, h, msg, wp, lp);
-}
-
-/* ===== DPI 适配 =====
- * 优先级: GDI 缩放 (Win10 1809+) > System DPI Aware (Win8.1+) > 基础 DPI Aware (Vista+)
- * 全部通过 GetProcAddress 动态加载,旧系统上自动降级,不影响可执行文件运行
- */
-static void enable_dpi_awareness(void) {
-    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
-    if (!hUser32) return;
-
-    typedef DPI_AWARENESS_CONTEXT (WINAPI *PFN_SetCtx)(DPI_AWARENESS_CONTEXT);
-    PFN_SetCtx pSetCtx = (PFN_SetCtx)(void*)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
-    if (pSetCtx) {
-        /* DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED = (HANDLE)-5
-         * 让 Windows 用 GDI 缩放整个程序,字体清晰、布局正确,等同"系统增强" */
-        if (pSetCtx((DPI_AWARENESS_CONTEXT)-5)) return;
-    }
-
-    typedef HRESULT (WINAPI *PFN_SetAwareness)(int);
-    PFN_SetAwareness pSetAwareness = (PFN_SetAwareness)(void*)GetProcAddress(hUser32, "SetProcessDpiAwareness");
-    if (pSetAwareness) {
-        pSetAwareness(1); /* PROCESS_SYSTEM_DPI_AWARE */
-        return;
-    }
-
-    typedef BOOL (WINAPI *PFN_SetAware)(void);
-    PFN_SetAware pSetAware = (PFN_SetAware)(void*)GetProcAddress(hUser32, "SetProcessDPIAware");
-    if (pSetAware) pSetAware();
-}
-
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
-    (void)hPrev;
-    /* 隐藏自测入口: 命令行含 --selftest 则跑解析器测试后退出。
-     * GUI 子系统无控制台, printf 不可见; 把 stdout 重定向到 selftest.txt 便于读取。 */
-    if (cmd && strstr(cmd, "--selftest")) {
-        freopen("selftest.txt", "w", stdout);
-        return json_selftest();
-    }
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);   /* COM 初始化 (IFileOpenDialog 用) */
-    enable_dpi_awareness();   /* 必须在创建任何窗口之前调用 */
-    InitCommonControls();
-
-    WNDCLASSW wc = {0};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = L"CagentGuiWnd";
-    RegisterClassW(&wc);
-
-    HWND hwnd = CreateWindowW(L"CagentGuiWnd", L"cagent GUI",
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 720, 560,
-        NULL, NULL, hInst, NULL);
-
-    /* 历史框创建完后再子类化(此时 g_hHistory 已设) */
-    g_oldHistoryProc = (WNDPROC)SetWindowLongPtr(g_hHistory, GWLP_WNDPROC, (LONG_PTR)HistoryProc);
-
-    ShowWindow(hwnd, show);
-    UpdateWindow(hwnd);
-
-    MSG m;
-    while (GetMessage(&m, NULL, 0, 0)) {
-        TranslateMessage(&m);
-        DispatchMessage(&m);
-    }
-    return 0;
-}
+#endif /* CAGENT_CORE_H */

@@ -1,6 +1,6 @@
 # cagent
 
-用 C 语言实现的极简 AI Agent,**单文件 + 零第三方依赖**,运行在 Windows 平台。Win32 GUI 版,核心是同一段 Agent 循环。
+用 C 语言实现的极简 AI Agent,**零第三方依赖**,运行在 Windows 平台。Win32 GUI 版,核心 (`cagent_core.h`) 与界面 (`cagent.c`) 分离,共用同一段 Agent 循环。
 
 ---
 
@@ -10,8 +10,9 @@
 cagent/
 ├── Makefile            # 构建脚本
 ├── cagent.ini          # 配置文件 (首次启动后自动生成)
-├── cagent_gui.c        # Win32 GUI 版 (~1300 行)
-└── cagent_gui.exe      # 编译产物
+├── cagent_core.h       # 平台无关核心 (~1100 行): JSON/HTTP/工具/Agent 循环
+├── cagent.c        # Win32 GUI 前端 (~740 行): 仅界面 + 宿主钩子
+└── cagent.exe      # 编译产物
 ```
 
 ---
@@ -27,28 +28,28 @@ cagent/
 ### 一键编译
 
 ```bash
-make            # 构建 cagent_gui
+make            # 构建 cagent.exe
 make clean      # 删除可执行文件
 ```
 
 或单独构建:
 
 ```bash
-make cagent_gui.exe
+make cagent.exe
 ```
 
 ---
 
-## GUI 版: `cagent_gui.exe`
+## GUI 版: `cagent.exe`
 
 聊天式对话窗口,**支持运行时配置、配置持久化、HTTPS 直连、多轮工具调用可视化**。
 
 ### 启动
 
-直接双击 `cagent_gui.exe`,或:
+直接双击 `cagent.exe`,或:
 
 ```bash
-./cagent_gui.exe
+./cagent.exe
 ```
 
 ### 界面布局
@@ -82,22 +83,26 @@ make cagent_gui.exe
 
 ### 配置文件 `cagent.ini`
 
-- **位置**:与 `cagent_gui.exe` 同目录
+- **位置**:与 `cagent.exe` 同目录
 - **编码**:UTF-8
 - **行为**:
   - 程序启动时自动读取(若文件不存在则跳过)
   - 程序关闭时自动把当前三个输入框的值写回
 - **格式**:
   ```ini
-  # cagent GUI 配置 (UTF-8, 退出时自动保存)
+  # cagent 配置 (UTF-8, 退出时自动保存)
   url_base=https://token.sensenova.cn/v1
   api_key=dpapi:<DPAPI 加密的 base64>
   model=deepseek-v4-flash
   skip_cert_verify=0
+  workspace=C:\path\to\workspace
+  last_session=history_<工作目录>_<哈希>.json
   ```
 
 ### 操作
 
+- **新建会话**:当前对话自动落盘保留,另起一个空对话(文件不删除,可随时加载回)
+- **加载会话**:列出已保存的会话(目录 + 条数 + 时间 + 首句预览),选中后回放到界面并继续
 - **回车**发送(等同点击"发送"按钮)
 - **运行中取消**:Agent 调用期间"发送"按钮变为"停止",点击即请求取消;取消在下一个安全点(下一轮迭代前或工具执行前)生效,正在进行的 HTTP 请求无法立即打断
 - **流式显示**:LLM 回复逐字流式显示(纯文本),结束后自动渲染 Markdown 格式(标题/粗体/代码块)
@@ -118,21 +123,22 @@ make cagent_gui.exe
 | 协作式取消 | Agent 运行时"发送"按钮变"停止",点击后在迭代间隙优雅退出并回滚本轮历史 |
 | 网络错误诊断 | WinHTTP 错误码翻译为中文(DNS/连接/超时/SSL 证书),便于排错 |
 | API Key 加密 | DPAPI (`CryptProtectData`) 加密存储 `cagent.ini` 中的 Key,明文不入盘 |
-| 命令沙箱 | 危险命令(rm/del/format 等)执行前弹窗确认,拒绝则把结果交回模型 |
-| 对话历史持久化 | 每轮 done 后保存 `cagent_history.json`,启动加载恢复 LLM 上下文 |
+| 工作目录隔离 | 文件工具仅限工作目录内(路径强制解析),越界访问被拒绝 |
+| 命令执行超时 | `run_pipe` 默认 60s,超时经作业对象终止整个进程树,避免长时间卡死(可用 `CAGENT_CMD_TIMEOUT` 以秒覆盖) |
+| 对话历史持久化 | 每轮 done 后按工作目录保存 `history_*.json`;启动不自动加载,通过"历史会话"按钮按需载入并按角色回放到界面 |
 | RichEdit 显示 | 历史框用 RichEdit 2.0,支持格式化文本 |
 | 流式 SSE | LLM 响应逐字流式显示(`stream:true`),工具调用 delta 累积 |
 | Markdown 渲染 | 标题/粗体/代码块/行内代码基础集渲染(content 结束后替换) |
 
 ### 工具
 
-目前内置:
+目前内置(对齐 pi.dev 的极简理念,核心只保留 3 个工具):
 
-- `execute_bash(command)` — 通过 `cmd /c` 执行命令并捕获输出(危险命令弹窗确认)
+- `execute_bash(command)` — 通过 `cmd /c` 执行命令并捕获输出(不拦截,由用户自担风险)
 - `read_file(path)` — 读取文件文本内容(超大截断)
-- `write_file(path, content)` — 写入文件(已存在时弹窗确认覆盖)
-- `list_dir(path)` — 列出目录条目(名/大小/类型,超 200 截断)
-- `search(pattern, path)` — 在目录下文件内容中搜索(非递归,超 50 匹配截断)
+- `write_file(path, content)` — 写入文件(直接覆盖,无确认)
+
+> 没有专门的列目录/搜索工具:查看目录用 `dir`,递归搜索内容用 `findstr /s /i "关键词" *.*`,都走 `execute_bash`。
 
 ---
 
@@ -141,7 +147,7 @@ make cagent_gui.exe
 ```
 ┌─────────────────────────────────────────┐
 │  messages = [system, user]              │
-│  loop (最多 MAX_ITERATIONS 轮):         │
+│  loop (无轮次上限, 由模型自行终止):     │
 │    resp = HTTP POST chat/completions    │
 │    if resp 含 "tool_calls":             │
 │      执行每个工具                       │
@@ -152,7 +158,7 @@ make cagent_gui.exe
 └─────────────────────────────────────────┘
 ```
 
-`cagent_gui.c` 的 `agent_thread` 就是这个循环的实现。
+`cagent_core.h` 中的 `agent_turn` / `agent_thread` 就是这个循环的实现,GUI 通过宿主钩子 (`cagent_emit` 等) 与之交互。
 
 ---
 
@@ -165,7 +171,7 @@ A: 首次启动 `cagent.ini` 不存在,请在三个 Edit 中填入配置;关闭�
 A: API Key 错误或未授权,检查 Key 字段。
 
 **Q: 工具调用反复执行不停止?**
-A: 达到 `MAX_ITERATIONS=20` 后会显示 "(max iterations reached)",这是模型未能终止的兜底。可在源码中调大。
+A: 循环无内置轮次上限,模型应自行终止;若陷入死循环,点"停止"会在下一个迭代间隙取消(取消是协作式的,已发出的请求无法中途打断)。
 
 **Q: 长输出被截断?**
 A: 缓冲区上限 `BUFSZ=256KB`(单次工具输出/单次 LLM 响应),按需调整。
@@ -179,11 +185,11 @@ A: 取消是协作式的:已发出的 HTTP 请求无法中途打断,会在下一
 **Q: 换了电脑/用户后 API Key 解密失败?**
 A: Key 用 DPAPI 加密,绑定当前 Windows 用户。换机/换用户无法解密,程序会提示并清空 Key,重新填写即可。
 
-**Q: 模型要删文件时弹了确认框?**
-A: 命令沙箱拦截了危险命令(rm/del/format 等)。选"否"会把"(用户拒绝执行)"返回模型,模型可改用其他方案。
+**Q: 如何开新会话? 如何回到旧会话?**
+A: 点"新建会话"另起一个空对话(当前对话自动存盘保留,不删除任何文件);点"加载会话"列出已保存的会话,选择后按角色回放到界面并可继续对话。每个工作目录支持多个会话文件。
 
-**Q: 重启后历史框没有显示之前的对话?**
-A: 历史持久化只恢复 LLM 上下文(`messages`),不重建历史框显示。历史框会提示"已恢复历史对话",继续对话时模型仍记得之前内容。点"清空对话"会删除历史文件。
+**Q: 启动后怎么没有之前的对话?**
+A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,点"加载会话"选择即可。
 
 ---
 
