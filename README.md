@@ -1,6 +1,6 @@
 # cagent
 
-用 C 语言实现的极简 AI Agent,**零第三方依赖**,运行在 Windows 平台。Win32 GUI 版,核心 (`cagent_core.h`) 与界面 (`cagent.c`) 分离,共用同一段 Agent 循环。
+用 C 语言实现的极简 AI Agent,**零第三方依赖**,运行在 Windows 平台。Win32 GUI 版,核心 (`cagent_core.h`) 与界面 (`cagent_ui.c`) 分离,共用同一段 Agent 循环。
 
 ---
 
@@ -10,7 +10,7 @@
 cagent/
 ├── Makefile            # 构建脚本
 ├── cagent.ini          # 配置文件 (首次启动后自动生成)
-├── cagent.c            # 界面聚合入口 (仅按依赖顺序 include ui/)
+├── cagent_ui.c         # 界面聚合入口 (仅按依赖顺序 include ui/)
 ├── cagent_core.h       # 核心聚合入口 (仅按依赖顺序 include core/)
 ├── core/               # 平台无关核心, 按子功能拆分 (单 TU, 全 static)
 │   ├── base.h          # 平台头 / 角色常量 / 宿主钩子 / 输出封装

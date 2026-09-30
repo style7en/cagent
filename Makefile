@@ -5,7 +5,7 @@ CFLAGS  = -Wall -Wextra -Os
 LDFLAGS = -s
 
 GUI_TARGET = cagent.exe
-GUI_SRC = cagent.c
+GUI_SRC = cagent_ui.c
 GUI_RES = app.res
 
 # 子模块头: 核心按功能拆在 core/, 界面拆在 ui/

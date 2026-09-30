@@ -1,7 +1,7 @@
 /*
  * ui/task.h - 启动一轮 Agent: 配置校验 / 工作目录 / 线程派发
  *
- * cagent 界面层的一部分, 由 cagent.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* ===== 启动一轮 Agent (GUI) ===== */

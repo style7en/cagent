@@ -1,7 +1,7 @@
 /*
  * ui/wndproc.h - 布局 / 输入框子类 / 主窗口过程 / 历史框子类
  *
- * cagent 界面层的一部分, 由 cagent.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* ===== 布局 / 子类化 / 窗口过程 ===== */

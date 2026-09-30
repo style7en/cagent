@@ -1,5 +1,5 @@
 /*
- * cagent.c - Win32 GUI 前端 (界面 + 宿主钩子)
+ * cagent_ui.c - Win32 GUI 前端 (界面 + 宿主钩子)
  *
  * 本文件只做聚合: 按依赖顺序包含 ui/ 下的各界面子模块。
  * 共用 cagent_core.h 中的 Agent 循环 / 工具 / 网络 / JSON 解析。

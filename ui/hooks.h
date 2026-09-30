@@ -1,7 +1,7 @@
 /*
  * ui/hooks.h - 宿主钩子实现: 输出投递 / 一轮结束 / 配置同步
  *
- * cagent 界面层的一部分, 由 cagent.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* ===== 宿主钩子实现 ===== */

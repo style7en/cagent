@@ -1,7 +1,7 @@
 /*
  * ui/helpers.h - UI 辅助: Edit 读写(UTF-8) 与 RichEdit 分角色追加
  *
- * cagent 界面层的一部分, 由 cagent.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* ===== UI 辅助 ===== */
