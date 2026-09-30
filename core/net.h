@@ -40,6 +40,7 @@ typedef struct {
     size_t content_len;
     StreamToolCall calls[8];
     int n_calls;
+    char finish[24];           /* stop / length / tool_calls / content_filter 等 */
 } StreamCtx;
 
 /* content delta 回调: 增量显示 + 累积到 content_buf。
@@ -166,6 +167,9 @@ static int http_post_stream(const char *url, const char *api_key,
                     JValue *root = json_parse(json);
                     if (root) {
                         const JValue *choices = json_obj_get(root, "choices");
+                        /* finish_reason: 中间分片为 null, 末片给出 stop/length/tool_calls/... */
+                        const char *frs = json_as_str(json_obj_get(json_arr_at(choices, 0), "finish_reason"));
+                        if (frs && *frs) snprintf(ctx->finish, sizeof(ctx->finish), "%s", frs);
                         const JValue *delta = json_obj_get(json_arr_at(choices, 0), "delta");
                         const char *content = json_as_str(json_obj_get(delta, "content"));
                         if (content) on_content_delta(ctx, content);

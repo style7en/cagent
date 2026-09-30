@@ -107,6 +107,12 @@ static void agent_turn(const char *user_msg) {
             goto done;
         }
 
+        /* 结束原因: 除正常 stop/tool_calls 外, 其余情况明确提示用户 */
+        if (strcmp(ctx.finish, "length") == 0)
+            append_text("(达到长度上限被截断; 可让模型继续补全)\r\n");
+        else if (strcmp(ctx.finish, "content_filter") == 0)
+            append_text("(内容被服务端的过滤策略拦截)\r\n");
+
         if (ctx.n_calls > 0) {
             /* 有 tool_calls: 从 ctx.calls 转 ToolCall 并执行 */
             typedef struct {
@@ -145,21 +151,8 @@ static void agent_turn(const char *user_msg) {
                 snprintf(line, sizeof(line), "[Tool] %s(%s)\r\n", c->name, c->args);
                 append_text(line);
             }
-            JValue *argsj = json_parse(c->args);
-            if (strcmp(c->name, "execute_bash") == 0) {
-                const char *cmd = json_as_str(json_obj_get(argsj, "command"));
-                execute_bash(cmd ? cmd : "");
-            } else if (strcmp(c->name, "read_file") == 0) {
-                const char *p = json_as_str(json_obj_get(argsj, "path"));
-                tool_read_file(p ? p : "");
-            } else if (strcmp(c->name, "write_file") == 0) {
-                const char *p = json_as_str(json_obj_get(argsj, "path"));
-                const char *ct = json_as_str(json_obj_get(argsj, "content"));
-                tool_write_file(p ? p : "", ct ? ct : "");
-            } else {
-                strcpy(tool_out, "(未知工具)");
-            }
-            json_free(argsj);
+            /* 分发 (含参数校验): 错误原因会写进 tool_out 交回模型 */
+            dispatch_tool(c->name, c->args, ctx.finish);
             c->output = strdup(tool_out);
             {
                 size_t tl = strlen(tool_out);
@@ -172,11 +165,22 @@ static void agent_turn(const char *user_msg) {
             }
         }
 
-        /* 第二遍: 写 assistant 消息 (含所有 tool_calls 数组) */
+        /* 第二遍: 写 assistant 消息 (含所有 tool_calls 数组)。
+         * content 保留模型本轮的自然语言说明: 否则下一轮它看不到自己说过什么。
+         * 说明文字过大放不下时退化为空串 (不影响工具调用本身)。 */
         size_t mstart = strlen(messages);
+        char *esc_narr = (ctx.content_len > 0) ? json_escape_alloc(ctx.content_buf) : NULL;
         int an = snprintf(messages + mstart, BUFSZ - mstart,
-            ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[");
+            ",{\"role\":\"assistant\",\"content\":\"%s\",\"tool_calls\":[",
+            esc_narr ? esc_narr : "");
+        if (esc_narr) free(esc_narr);
         int ok = (an > 0 && (size_t)an < BUFSZ - mstart);
+        if (!ok) {
+            /* 叙述过长: 退化为不带 content 的写法, 保证工具调用能写入 */
+            an = snprintf(messages + mstart, BUFSZ - mstart,
+                ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[");
+            ok = (an > 0 && (size_t)an < BUFSZ - mstart);
+        }
 
         for (int i = 0; i < n_calls && ok; i++) {
             ToolCall *c = &calls[i];
@@ -242,7 +246,10 @@ static void agent_turn(const char *user_msg) {
                     }
                 }
             } else {
-                append_text("(响应解析失败)\r\n");
+                if (strcmp(ctx.finish, "length") == 0)
+                    append_text("(响应为空且已达长度上限, 本轮回滚)\r\n");
+                else
+                    append_text("(响应解析失败)\r\n");
                 append_text(ROLLBACK_HINT);
                 rolled_back = 1;
             }

@@ -77,3 +77,39 @@ static void tool_write_file(const char *path, const char *content) {
     snprintf(tool_out, BUFSZ, "(已写入 %zu 字节)", len);
 }
 
+
+/* 按名称分发一次工具调用: arguments 是字符串化 JSON。
+ * 出错时把"可读的原因"写进 tool_out 交回模型 (缺失参数/非法 JSON/未知工具),
+ * 由模型自行决定重试或换策略。finish 用于在截断场景下给出更准确的提示。 */
+static void dispatch_tool(const char *name, const char *args_json, const char *finish) {
+    const char *nm = (name && name[0]) ? name : "(空)";
+    JValue *argsj = json_parse(args_json ? args_json : "");
+
+    if (argsj && argsj->type == J_OBJ) {
+        if (strcmp(nm, "execute_bash") == 0) {
+            const char *cmd = json_as_str(json_obj_get(argsj, "command"));
+            if (cmd) execute_bash(cmd);
+            else     snprintf(tool_out, BUFSZ, "(参数缺失: %s 需要字符串参数 \"command\")", nm);
+        } else if (strcmp(nm, "read_file") == 0) {
+            const char *p = json_as_str(json_obj_get(argsj, "path"));
+            if (p) tool_read_file(p);
+            else   snprintf(tool_out, BUFSZ, "(参数缺失: %s 需要字符串参数 \"path\")", nm);
+        } else if (strcmp(nm, "write_file") == 0) {
+            const char *p  = json_as_str(json_obj_get(argsj, "path"));
+            const char *ct = json_as_str(json_obj_get(argsj, "content"));
+            if (p && ct)  tool_write_file(p, ct);
+            else if (!p)  snprintf(tool_out, BUFSZ, "(参数缺失: write_file 需要字符串参数 \"path\")");
+            else          snprintf(tool_out, BUFSZ, "(参数缺失: write_file 需要字符串参数 \"content\")");
+        } else {
+            snprintf(tool_out, BUFSZ, "(未知工具: %s; 可用工具: execute_bash / read_file / write_file)", nm);
+        }
+    } else if (!argsj) {
+        snprintf(tool_out, BUFSZ,
+                 "(参数解析失败: %s 的 arguments 不是合法 JSON%s, 原始内容前 200 字节: %.200s)",
+                 nm, (finish && strcmp(finish, "length") == 0) ? " (疑似被长度上限截断)" : "",
+                 (args_json && args_json[0]) ? args_json : "(空)");
+    } else {
+        snprintf(tool_out, BUFSZ, "(参数类型错误: arguments 应为 JSON 对象)");
+    }
+    json_free(argsj);
+}

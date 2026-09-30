@@ -194,6 +194,24 @@ make cagent.exe
 
 `cagent_core.h` 中的 `agent_turn` / `agent_thread` 就是这个循环的实现,GUI 通过宿主钩子 (`cagent_emit` 等) 与之交互。
 
+### 工具调用协议
+
+采用**原生结构化 tool_calls**(非文本 `Action:` 解析),与 OpenAI 规范一致:
+
+1. 请求体带 `tools` 声明(三个函数的名称/参数/描述);
+2. 流式响应中按 `delta.tool_calls[].index` 累积 `id` / `name` / `arguments` 片段;
+3. 框架按 `name` 分发,`arguments` 二次 JSON 解析后执行;
+4. 回填一条 `assistant`(含 `tool_calls` 数组, **保留模型本轮的自然语言说明**)
+   与 N 条 `tool`(`tool_call_id` 与调用一一配对)消息,再进入下一轮。
+
+结束与错误语义:
+
+- 一轮结束原因取自 `finish_reason`:正常 `stop` / `tool_calls` 之外,`length`(长度截断)
+  与 `content_filter`(内容过滤)会在界面明确提示;
+- 工具失败不会中断循环:参数缺失、`arguments` 非法 JSON、未知工具等都会把
+  **可读的错误原因**作为工具结果交回模型,由它决定重试或换策略;
+- 未实现工具结果缓存:本地读写类工具结果随时可能变化,缓存会带来正确性风险。
+
 ---
 
 ## 常见问题
