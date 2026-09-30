@@ -10,10 +10,36 @@
 cagent/
 ├── Makefile            # 构建脚本
 ├── cagent.ini          # 配置文件 (首次启动后自动生成)
-├── cagent_core.h       # 平台无关核心 (~1100 行): JSON/HTTP/工具/Agent 循环
-├── cagent.c        # Win32 GUI 前端 (~740 行): 仅界面 + 宿主钩子
-└── cagent.exe      # 编译产物
+├── cagent.c            # 界面聚合入口 (仅按依赖顺序 include ui/)
+├── cagent_core.h       # 核心聚合入口 (仅按依赖顺序 include core/)
+├── core/               # 平台无关核心, 按子功能拆分 (单 TU, 全 static)
+│   ├── base.h          # 平台头 / 角色常量 / 宿主钩子 / 输出封装
+│   ├── state.h         # 缓冲常量 / 全局状态 / 工具声明
+│   ├── crypto.h        # DPAPI: API Key 加密存储
+│   ├── json.h          # 轻量 JSON 解析器 / 转义 / 自测
+│   ├── exec.h          # 命令执行: CreateProcess + 管道 + 超时
+│   ├── net.h           # WinHTTP 与 SSE 流式解析
+│   ├── encoding.h      # 编码转换: UTF-8/OEM 检测与转换、字符边界
+│   ├── workspace.h     # 工作目录解析、越界限制、UTF-8 文件/路径
+│   ├── tools.h         # 结构化工具: execute_bash / read_file / write_file
+│   ├── agent.h         # Agent 循环: LLM <-> 工具调用、取消与回滚
+│   ├── session.h       # 会话持久化: 存取 / 回放 / 多会话命名
+│   └── config.h        # ini 配置读写
+├── ui/                 # Win32 界面, 按子功能拆分
+│   ├── state.h         # 控件 ID / 消息 / 全局句柄与字体
+│   ├── hooks.h         # 宿主钩子实现
+│   ├── helpers.h       # Edit 读写(UTF-8) + RichEdit 分角色追加
+│   ├── task.h          # 启动一轮 Agent
+│   ├── wndproc.h       # 布局 / 子类 / 主窗口过程
+│   ├── dpi.h           # 高 DPI 适配
+│   ├── session_dlg.h   # 会话选择对话框 (枚举 / 自绘列表 / 载入)
+│   └── main.h          # 程序入口
+├── app.rc / app.ico    # 图标资源
+└── cagent.exe          # 编译产物
 ```
+
+> 拆分方式: `core/` 与 `ui/` 下的头文件全部是 `static` 实现, 由聚合头按依赖顺序
+> include, 仍是**单编译单元**, 无额外链接步骤, 也不引入任何第三方依赖。
 
 ---
 
