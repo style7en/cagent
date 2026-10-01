@@ -329,7 +329,7 @@ done:
 }
 
 /* 后台线程入口: 跑一轮后通过钩子通知前端。 */
-static DWORD WINAPI agent_thread(LPVOID arg) {
+static CAGENT_MAYBE_UNUSED DWORD WINAPI agent_thread(LPVOID arg) {
     AgentTask *task = (AgentTask*)arg;
     agent_turn(task->user_msg);
     free(task);

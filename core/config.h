@@ -5,7 +5,7 @@
  */
 
 /* 简单 key=value 解析器 */
-static void config_load(void) {
+static CAGENT_MAYBE_UNUSED void config_load(void) {
     char path[MAX_PATH];
     get_ini_path(path, sizeof(path));
     FILE *f = fopen_utf8(path, "rb");
@@ -49,7 +49,7 @@ static void config_load(void) {
 }
 
 /* 把当前全局配置写回 ini (若 cagent_read_config_ui 已设置, 先从中同步)。 */
-static void config_save(void) {
+static CAGENT_MAYBE_UNUSED void config_save(void) {
     if (cagent_read_config_ui) cagent_read_config_ui();
 
     /* 三个全空就不写,避免覆盖出"空文件" */

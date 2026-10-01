@@ -66,7 +66,7 @@ static void build_new_session_path(char *out, size_t cap) {
 }
 
 /* 新建会话: 当前对话若有内容先落盘 (旧会话文件保留), 然后重开一个空对话。 */
-static void history_start_new(void) {
+static CAGENT_MAYBE_UNUSED void history_start_new(void) {
     if (g_active_ws[0] && strlen(messages) > strlen(SYSTEM_PROMPT))
         history_save();                        /* 已有内容 -> 存到它绑定的文件 */
     reset_conversation();
@@ -188,7 +188,7 @@ static void history_save(void) {
 }
 
 /* 读取单个历史文件并重建 messages + 工作目录。返回 1 成功。 */
-static int history_load_from_file(const char *path) {
+static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
     FILE *f = fopen_utf8(path, "rb");
     if (!f) return 0;
     char buf[BUFSZ];
@@ -204,7 +204,7 @@ static int history_load_from_file(const char *path) {
 }
 
 /* 把当前 messages 里的对话按角色回放到前端 (跳过系统提示词), 格式与实时对话一致。 */
-static void history_replay(void) {
+static CAGENT_MAYBE_UNUSED void history_replay(void) {
     if (!cagent_emit) return;
     size_t skip = strlen(SYSTEM_PROMPT);
     const char *conv = messages + skip;
@@ -283,7 +283,7 @@ static void extract_old_preview(const char *text, char *out, size_t cap) {
 
 /* 读取历史文件的元信息: 工作目录 + 首条 user 消息预览 + 消息条数, 供 GUI 列表展示。
  * 成功返回 1; ws_out / prev_out 始终以 '\0' 结尾 (无则空字符串, 旧格式自动回退解析)。 */
-static int session_read_meta(const char *path, char *ws_out, size_t ws_cap,
+static CAGENT_MAYBE_UNUSED int session_read_meta(const char *path, char *ws_out, size_t ws_cap,
                              char *prev_out, size_t prev_cap, int *cnt_out) {
     ws_out[0] = prev_out[0] = '\0';
     if (cnt_out) *cnt_out = 0;

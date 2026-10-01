@@ -13,6 +13,17 @@
 #include <stdlib.h>
 #include <time.h>
 
+/* ===== 编译辅助 ===== */
+/* 单编译单元下, 各 static 函数会被所有前端(GUI / 控制台测试)一起编译,
+   而 GUI 专属的入口(如 config_load、agent_thread)在测试二进制里无人调用,
+   会触发 -Wunused-function。用本宏显式声明"允许在此前端不被使用",
+   其余真正没人用的函数仍会正常告警。 */
+#if defined(__GNUC__) || defined(__clang__)
+#define CAGENT_MAYBE_UNUSED __attribute__((unused))
+#else
+#define CAGENT_MAYBE_UNUSED
+#endif
+
 /* ===== 宿主钩子 (由 GUI 前端实现) ===== */
 #define CAGENT_ROLE_SYS   0   /* 系统/过程提示 (thinking/回滚/工具结果/载入提示) */
 #define CAGENT_ROLE_USER  1   /* 用户输入 */
