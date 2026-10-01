@@ -1,5 +1,5 @@
 /*
- * core/tools.h - 结构化工具: execute_bash / read_file / write_file
+ * core/tools.h - 结构化工具: execute_bash / read_file / write_file / edit_file
  *
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  */
@@ -34,14 +34,29 @@ static void execute_bash(const char *command) {
 
 
 
-static void tool_read_file(const char *path) {
+static void tool_read_file(const char *path, long long offset) {
     if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
     wchar_t wpath[MAX_PATH];
     if (!resolve_in_workspace(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(读取失败: 路径过长)"); return; }
     FILE *f = _wfopen(wpath, L"rb");
     if (!f) { snprintf(tool_out, BUFSZ, "(读取失败: 无法打开 %s)", path); return; }
+    /* offset 续读: 大文件不必反复整读, 按 note 里给的 next offset 分块取 */
+    if (offset > 0 && _fseeki64(f, offset, SEEK_SET) != 0) {
+        fclose(f);
+        snprintf(tool_out, BUFSZ, "(读取失败: offset %lld 超出文件范围)", offset);
+        return;
+    }
     size_t cap = tool_output_cap();
     size_t raw = fread(tool_out, 1, cap, f);
+    size_t used = raw;   /* 从文件实际消费的字节数 (含为对齐字符边界跳过的续字节) */
+    if (offset > 0 && raw > 0) {
+        /* 起点可能切在多字节字符中间: 跳过续字节对齐到字符边界 (UTF-8) */
+        size_t skip = utf8_skip_cont((const unsigned char *)tool_out, raw);
+        if (skip > 0 && skip < raw) {
+            memmove(tool_out, tool_out + skip, raw - skip);
+            raw -= skip;
+        }
+    }
     size_t n = utf8_trim_len(tool_out, raw);   /* 对齐字符边界, 避免切出半个字符 */
     /* 文本不是合法 UTF-8 (常见: 中文 Windows 下的 GBK 文本) -> 转成 UTF-8 */
     if (n > 0 && !is_valid_utf8((const unsigned char *)tool_out, n)) {
@@ -49,25 +64,30 @@ static void tool_read_file(const char *path) {
         oem_to_utf8(tool_out, BUFSZ);
         n = strlen(tool_out);
     }
-    /* 读满上限时确认是否还有剩余内容, 并给出文件总大小 */
+    /* 文件总大小与是否还有剩余 (fseek 失败则 total 未知; used 含跳过的续字节) */
     int more = 0;
     long long total = -1;
-    if (raw == cap) {
-        if (_fseeki64(f, 0, SEEK_END) == 0) {
-            total = _ftelli64(f);
-            more = (total > (long long)raw);
-        } else {
-            more = 1;
-        }
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        total = _ftelli64(f);
+        more = (total > (long long)offset + (long long)used);
+    } else {
+        more = (raw == cap);
     }
     fclose(f);
     tool_out[n] = '\0';
+    if (raw == 0) {
+        snprintf(tool_out, BUFSZ, "(offset %lld 处已无内容; 文件共 %lld 字节)",
+                 offset, total > 0 ? total : offset);
+        return;
+    }
     if (more) {
-        char note[256];
+        char note[320];
+        long long next = (long long)offset + (long long)used;
         if (total > 0)
             snprintf(note, sizeof(note),
-                     "\n...(已截断: 文件共 %lld 字节, 仅返回前 %zu 字节; "
-                     "剩余部分可用 execute_bash 配合 findstr/分段命令查看)", total, n);
+                     "\n...(已截断: 文件共 %lld 字节, 本次返回第 %lld~%lld 字节; "
+                     "用 read_file 的 offset=%lld 继续读取, 或用 execute_bash 的 findstr 定位内容)",
+                     total, offset + 1, next, next);
         else
             snprintf(note, sizeof(note),
                      "\n...(已截断: 仅返回前 %zu 字节; 文件较大, 请分段查看)", n);
@@ -174,7 +194,13 @@ static void dispatch_tool(const char *name, const char *args_json, const char *f
             else     snprintf(tool_out, BUFSZ, "(参数缺失: %s 需要字符串参数 \"command\")", nm);
         } else if (strcmp(nm, "read_file") == 0) {
             const char *p = json_as_str(json_obj_get(argsj, "path"));
-            if (p) tool_read_file(p);
+            if (p) {
+                /* offset 可选: 数字或数字字符串都接受, 缺省/非法一律从头读 */
+                const JValue *ov = json_obj_get(argsj, "offset");
+                long long off = 0;
+                if (ov && ov->type == J_NUM && ov->num > 0) off = (long long)ov->num;
+                tool_read_file(p, off);
+            }
             else   snprintf(tool_out, BUFSZ, "(参数缺失: %s 需要字符串参数 \"path\")", nm);
         } else if (strcmp(nm, "edit_file") == 0) {
             const char *p  = json_as_str(json_obj_get(argsj, "path"));

@@ -176,11 +176,11 @@ static long find_messages_inner(const char *t, long *out_start, long *out_end) {
  * 支持两种格式: 自描述 {"workspace":...,"messages":[...]} 与旧版纯对话。
  * 返回 1 成功; 若含 workspace 则同步写回 g_workspace / g_active_ws。 */
 static int load_messages_from_text(const char *text, size_t len) {
-    char buf[BUFSZ];
-    if (len >= BUFSZ) len = BUFSZ - 1;
-    memcpy(buf, text, len); buf[len] = '\0';
-
-    JValue *root = json_parse(buf);
+    /* 直接解析调用方传入的文本 (调用方已读全文件到堆缓冲), 不再用 256KB 栈副本、
+     * 也不做长度截断, 避免长会话历史被静默丢弃 (item A / P0)。
+     * messages 仍受 BUFSZ 容量限制, 这是架构上限而非此处引入。 */
+    (void)len;
+    JValue *root = json_parse(text);
     if (root && root->type == J_OBJ) {
         const JValue *ws = json_obj_get(root, "workspace");
         if (ws && ws->type == J_STR && ws->str && ws->str[0]) {
@@ -188,12 +188,17 @@ static int load_messages_from_text(const char *text, size_t len) {
             snprintf(g_active_ws, sizeof(g_active_ws), "%s", ws->str);
         }
         long s, e;
-        if (find_messages_inner(buf, &s, &e) >= 0) {
+        if (find_messages_inner(text, &s, &e) >= 0) {
             long ilen = e - s;
             reset_conversation();
             if (ilen > 0 && strlen(messages) + (size_t)ilen + 1 < BUFSZ) {
                 strcat(messages, ",");
-                strncat(messages, buf + s, (size_t)ilen);
+                strncat(messages, text + s, (size_t)ilen);
+            } else if (ilen > 0) {
+                /* 装不下就明确失败并说明原因, 不再静默丢弃整段历史 */
+                append_text("(加载失败: 会话历史超出上下文缓冲容量 (1MB))\r\n");
+                json_free(root);
+                return 0;
             }
             json_free(root);
             return 1;
@@ -204,10 +209,10 @@ static int load_messages_from_text(const char *text, size_t len) {
     /* 旧版: 纯对话文本 (messages 以系统提示词开头)。
      * 只接受形如对话的内容, 防止损坏文件把垃圾文本混进请求体。 */
     reset_conversation();
-    const char *conv = buf;
-    if (strncmp(buf, "{\"role\":\"system\"", 16) == 0) {
-        size_t end = first_object_end(buf);
-        if (end) conv = buf + end;
+    const char *conv = text;
+    if (strncmp(text, "{\"role\":\"system\"", 16) == 0) {
+        size_t end = first_object_end(text);
+        if (end) conv = text + end;
     }
     if (*conv == ',') conv++;
     if (strncmp(conv, "{\"role\":", 8) == 0 &&
@@ -220,17 +225,29 @@ static int load_messages_from_text(const char *text, size_t len) {
 
 /* 保存历史: 自描述格式 {"workspace":...,"messages":[...]}, 仅存对话部分。 */
 static void history_save(void) {
+    size_t skip = strlen(SYSTEM_PROMPT);
+    if (strlen(messages) < skip) skip = strlen(messages);  /* 防越界 (messages 未初始化时) */
+    const char *conv = messages + skip;        /* ',{...}' 对话 (含前导逗号) */
+    /* 空对话且尚未绑定文件: 不落盘 (压缩失败重置等场景, 避免产生空的会话文件) */
+    if (g_history_file[0] == '\0' &&
+        (conv[0] == '\0' || (conv[0] == ',' && conv[1] == '\0'))) return;
     /* 懒绑定: 新对话首次保存时生成自己的会话文件 */
     if (g_history_file[0] == '\0')
         build_new_session_path(g_history_file, sizeof(g_history_file));
     const char *path = g_history_file;
+    /* 覆盖前先备份上次内容, 防止压缩摘要/异常写入导致原历史不可恢复 (item 6 / P0) */
+    {
+        wchar_t wsrc[MAX_PATH], wbak[MAX_PATH];
+        if (utf8_to_wide(path, wsrc, MAX_PATH) &&
+            GetFileAttributesW(wsrc) != INVALID_FILE_ATTRIBUTES) {
+            wcscpy(wbak, wsrc); wcscat(wbak, L".bak");
+            CopyFileW(wsrc, wbak, FALSE);
+        }
+    }
     FILE *f = fopen_utf8(path, "wb");
     if (!f) return;
     char *wse = json_escape_alloc(g_workspace);
     if (!wse) { fclose(f); return; }
-    size_t skip = strlen(SYSTEM_PROMPT);
-    if (strlen(messages) < skip) skip = strlen(messages);  /* 防越界 (messages 未初始化时) */
-    const char *conv = messages + skip;        /* ',{...}' 对话 (含前导逗号) */
     /* wse 只含转义内容不带引号, 此处必须自己补上 */
     fprintf(f, "{\"workspace\":\"%s\",\"messages\":[", wse);
     if (conv[0] == ',') conv++;                 /* 数组内部不需要前导逗号 */
@@ -245,11 +262,19 @@ static void history_save(void) {
 static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
     FILE *f = fopen_utf8(path, "rb");
     if (!f) return 0;
-    char buf[BUFSZ];
-    size_t n = fread(buf, 1, BUFSZ - 1, f);
+    /* 读全文件到堆缓冲: 会话可能超过 256KB, 栈缓冲截断会导致历史永久丢失 (item A / P0) */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long fsz = ftell(f);
+    if (fsz < 0) { fclose(f); return 0; }
+    char *buf = (char*)malloc((size_t)fsz + 1);
+    if (!buf) { fclose(f); return 0; }
+    rewind(f);
+    size_t n = fread(buf, 1, (size_t)fsz, f);
     fclose(f);
-    if (n == 0) return 0;
+    if (n == 0) { free(buf); return 0; }
+    buf[n] = '\0';
     int ok = load_messages_from_text(buf, n);
+    free(buf);
     if (ok) {
         snprintf(g_history_file, sizeof(g_history_file), "%s", path); /* 绑定本对话到该文件 */
         record_last_session(path);
@@ -343,7 +368,7 @@ static CAGENT_MAYBE_UNUSED int session_read_meta(const char *path, char *ws_out,
     if (cnt_out) *cnt_out = 0;
     FILE *f = fopen_utf8(path, "rb");
     if (!f) return 0;
-    char buf[BUFSZ];
+    static char buf[BUFSZ];   /* 元信息读取缓冲: 改 static, 避免占 512KB 调用栈 (item 3) */
     size_t n = fread(buf, 1, BUFSZ - 1, f);
     fclose(f);
     if (n == 0) return 0;

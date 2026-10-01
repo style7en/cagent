@@ -4,7 +4,9 @@
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
-#define BUFSZ           (256 * 1024)
+/* 上下文缓冲 1MB: 装得下约 30 万+ 汉字 / 更多的英文 token。
+ * 静态缓冲共 4 块 (messages/body/resp/tool_out) + 请求期堆分配的 StreamCtx, 合计 ~5MB。 */
+#define BUFSZ           (1024 * 1024)
 #define ARGS_MAX        8192   /* tool_calls.arguments 累积上限 (流式与执行期统一) */
 #define TOOL_OUTPUT_CAP (16 * 1024)  /* 单个工具结果进入上下文的上限, 超出即截断 */
 #define EDIT_MAX_BYTES  (2 * 1024 * 1024) /* edit_file 可处理的最大文件体积 */
@@ -32,6 +34,11 @@ static char tool_out[BUFSZ];
 static volatile LONG g_running = 0;   /* 1 = Agent 工作线程运行中 */
 static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
 
+/* ===== 上下文水位 (token 优先, 字节兜底, 见 agent.h 的 context_pressure) ===== */
+static long g_context_tokens = 0;      /* 模型上下文窗口 (token), 来自 ini 的 context_tokens; 0=未知 */
+static long g_last_prompt_tokens = 0;  /* 上次请求服务端报告的 prompt_tokens (SSE usage; 无则 0) */
+static size_t g_last_prompt_bytes = 0; /* 上次请求发出时 messages 的字节数 (与上者配对做增量估算) */
+
 static const char *TOOLS_JSON =
     "[{\"type\":\"function\",\"function\":{"
     "\"name\":\"execute_bash\","
@@ -48,11 +55,15 @@ static const char *TOOLS_JSON =
     "\"name\":\"read_file\","
     "\"description\":\"Read a text file as UTF-8. Path must stay inside the workspace directory, "
         "otherwise the call is rejected. At most about 16KB is returned; when the file is larger, "
-        "the result ends with a truncation note giving the total size, and the rest can be read "
-        "via execute_bash (findstr or a chunked command).\","
+        "the result ends with a truncation note giving the total size and the next offset - "
+        "pass that offset to keep reading chunk by chunk, or use execute_bash (findstr) to locate "
+        "content directly.\","
     "\"parameters\":{\"type\":\"object\","
     "\"properties\":{\"path\":{\"type\":\"string\","
-        "\"description\":\"File path, absolute or relative to the workspace directory\"}},"
+        "\"description\":\"File path, absolute or relative to the workspace directory\"},"
+    "\"offset\":{\"type\":\"integer\","
+        "\"description\":\"Optional byte offset to start reading from (for chunked reading of "
+        "large files); omit or 0 to read from the beginning\"}},"
     "\"required\":[\"path\"]}}},"
     "{\"type\":\"function\",\"function\":{"
     "\"name\":\"write_file\","

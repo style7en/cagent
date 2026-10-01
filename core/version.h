@@ -9,12 +9,12 @@
 #define CAGENT_VERSION_H
 
 #define CAGENT_VER_MAJOR 1
-#define CAGENT_VER_MINOR 0
+#define CAGENT_VER_MINOR 1
 #define CAGENT_VER_PATCH 0
 #define CAGENT_VER_BUILD 0      /* 构建序号, 非正式发布可保持 0 */
 
 /* 人类可读版本串 (窄字符串); 标题栏用的宽串由它派生, 不要另写一份 */
-#define CAGENT_VERSION_STR "1.0.0"
+#define CAGENT_VERSION_STR "1.1.0"
 
 /* 由窄串派生宽串: L"1.0.0", 避免维护两份字面量 */
 #define CAGENT_WIDE_(s) L##s

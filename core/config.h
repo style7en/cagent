@@ -40,6 +40,8 @@ static CAGENT_MAYBE_UNUSED void config_load(void) {
             snprintf(g_model, sizeof(g_model), "%s", val);
         else if (strcmp(key, "skip_cert_verify") == 0)
             g_skip_cert_verify = (atoi(val) != 0);
+        else if (strcmp(key, "context_tokens") == 0)
+            g_context_tokens = atol(val);   /* 模型上下文窗口 (token), 0=未知则按字节水位 */
         else if (strcmp(key, "workspace") == 0)
             snprintf(g_workspace, sizeof(g_workspace), "%s", val);
         else if (strcmp(key, "last_session") == 0)
@@ -67,6 +69,7 @@ static CAGENT_MAYBE_UNUSED void config_save(void) {
     }
     fprintf(f, "model=%s\r\n",    g_model);
     fprintf(f, "skip_cert_verify=%d\r\n", g_skip_cert_verify);
+    fprintf(f, "context_tokens=%ld\r\n", g_context_tokens);
     fprintf(f, "workspace=%s\r\n", g_workspace);
     fprintf(f, "last_session=%s\r\n", g_last_session);
     fclose(f);

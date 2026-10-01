@@ -33,6 +33,15 @@ static size_t utf8_trim_len(const char *s, size_t len) {
     return i;
 }
 
+/* 从 offset 起跳过 UTF-8 续字节 (0b10xxxxxx), 让读取起点落在字符边界。
+ * 用于 read_file 的任意字节 offset: 起点切在多字节字符中间时向前对齐。
+ * 若整段都是续字节 (理论罕见) 返回 n, 调用方按原样处理。 */
+static size_t utf8_skip_cont(const unsigned char *s, size_t n) {
+    size_t i = 0;
+    while (i < n && (s[i] & 0xC0) == 0x80) i++;
+    return i;
+}
+
 /* UTF-8 路径打开文件: 必须走宽字符, 否则非 ASCII 路径 (中文目录) 会打不开 */
 static FILE *fopen_utf8(const char *path, const char *mode) {
     wchar_t wp[MAX_PATH], wm[16];
@@ -82,7 +91,7 @@ static int path_in_workspace(const char *path) {
     n = GetFullPathNameW(wws, MAX_PATH, wwsfull, NULL);
     if (n == 0 || n >= MAX_PATH) return 0;
     size_t wl = wcslen(wwsfull);
-    if (wcsncmp(wabs, wwsfull, wl) != 0) return 0;
+    if (_wcsnicmp(wabs, wwsfull, wl) != 0) return 0;   /* 大小写不敏感, 避免盘符大小写不同被误拒 (item 5) */
     if (wabs[wl] != L'\\' && wabs[wl] != L'\0') return 0;
     return 1;
 }

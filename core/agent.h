@@ -8,6 +8,12 @@
 
 typedef struct { char user_msg[BUFSZ]; } AgentTask;
 
+/* 本轮要执行的一个工具调用 (从 StreamCtx 拷贝而来)。
+ * 每项含 8KB 参数缓冲, 8 项约 68KB —— 必须放堆, 不能放栈 (工作线程默认栈 1MB)。 */
+typedef struct {
+    char id[256]; char name[64]; char args[ARGS_MAX]; char *output;
+} AgentToolCall;
+
 #define SYSTEM_PROMPT \
     "{\"role\":\"system\",\"content\":\"你是 cagent,一个极简的编程 Agent。" \
     "你有四个工具: execute_bash(执行命令)、read_file(读文件)、write_file(写文件)、edit_file(定点替换编辑)。" \
@@ -24,8 +30,18 @@ typedef struct { char user_msg[BUFSZ]; } AgentTask;
     "任务完成后,停止并简要总结你做了什么。" \
     "始终用中文回答。回答简洁。\"}"
 
-/* messages 缓冲水位线: 接近上限时整轮对话重置, 防止越界. */
+/* messages 缓冲水位线: 接近上限时触发压缩, 防止越界. */
 #define MESSAGES_WATERMARK  ((BUFSZ * 3) / 4)
+
+/* ===== 上下文压缩参数 ===== */
+/* token 估算: 中文约 3 字节/token, 英文约 4; 取 3 偏保守 (高估 token → 提早压缩, 安全)。 */
+#define BYTES_PER_TOKEN_EST        3
+/* 摘要硬上限 (字节); 提示词要求模型控制在 2000 字以内, 此处兜底截断。 */
+#define COMPACT_SUMMARY_MAX        8192
+/* 压缩时尾部原样保留的预算 (字节): 摘要 + 最近原文, 避免刚读过的内容全部丢失。 */
+#define COMPACT_TAIL_KEEP_BYTES    (32 * 1024)
+/* 400 上下文超限后"压缩并重试"的最大次数, 防止压缩不奏效时无限打转。 */
+#define CONTEXT_OVERFLOW_RETRIES   3
 
 static const char *ROLLBACK_HINT = "\r\n(本轮对话已回滚, 不影响后续对话; 已执行的文件改动不会自动撤销)\r\n";
 
@@ -44,31 +60,207 @@ static void chat_completions_url(char *out, size_t cap) {
              (nurl > 0 && g_api_url[nurl - 1] == '/') ? "" : "/");
 }
 
-/* 上下文压缩: 请模型把已有对话压成一份交接摘要, 用它替换原上下文后继续。
- * 成功返回 1 (messages 变为 system + 摘要), 失败返回 0 (调用方退化为另起会话)。 */
-static int compact_conversation(void) {
+/* ===== messages 遍历辅助 (压缩按"整条消息"操作, 避免拆散 assistant/tool 配对) =====
+ * messages 形如 SYSTEM_PROMPT + ",{...},{...}"; conv = messages + strlen(SYSTEM_PROMPT)。 */
+
+/* 前向声明: 定义在 session.h (聚合顺序在本文件之后), 同 exec.h 前向声明 utf8_trim_len */
+static size_t first_object_end(const char *s);
+
+/* conv 中的顶层消息对象个数 */
+static size_t msg_count(const char *conv) {
+    size_t n = 0, pos = 0;
+    for (;;) {
+        size_t e = first_object_end(conv + pos);
+        if (!e) break;
+        n++;
+        pos += e;
+    }
+    return n;
+}
+
+/* 第 idx 个消息对象的边界 [start,end) (相对 conv; start 指向 '{', end 在 '}' 之后)。
+ * 找不到返回 0。 */
+static int msg_bounds(const char *conv, size_t idx, size_t *start, size_t *end) {
+    size_t n = 0, pos = 0;
+    for (;;) {
+        size_t e = first_object_end(conv + pos);
+        if (!e) return 0;
+        if (n == idx) {
+            size_t b = pos;
+            while (conv[b] && conv[b] != '{') b++;   /* 跳过前导逗号, 指向对象真正的 '{' */
+            *start = b;
+            *end = pos + e;
+            return 1;
+        }
+        n++;
+        pos += e;
+    }
+}
+
+/* 消息对象内的 role 值。本程序序列化时 role 恒在最前 (无空白), 在对象前部查找即可;
+ * 识别不了返回空串 (调用方视为非 tool, 压缩时保守处理)。 */
+static void msg_role(const char *obj, size_t len, char *out, size_t cap) {
+    static const char key[] = "\"role\":\"";
+    const size_t keylen = sizeof(key) - 1;
+    out[0] = '\0';
+    if (len < keylen) return;
+    size_t scan = (len < 96) ? len - keylen : 96;   /* role 总在对象开头不远处 */
+    for (size_t i = 0; i <= scan; i++) {
+        if (memcmp(obj + i, key, keylen) == 0) {
+            const char *r = obj + i + keylen;
+            size_t j = 0;
+            while (r[j] && r[j] != '"' && j + 1 < cap && (size_t)(r - obj) + j < len) {
+                out[j] = r[j];
+                j++;
+            }
+            out[j] = '\0';
+            return;
+        }
+    }
+}
+
+/* ===== 超限识别 ===== */
+
+/* 大小写不敏感子串查找 (strcasestr 非标准, 自带一份); 找到返回命中位置, 否则 NULL */
+static const char *contains_ci(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0) return hay;
+    for (; *hay; hay++) {
+        size_t i = 0;
+        while (i < nl && hay[i] &&
+               tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return hay;
+    }
+    return NULL;
+}
+
+/* 服务端 400 是否为"上下文超限": 各家措辞不一, 宽松匹配常见写法 */
+static int is_context_overflow_error(const char *err) {
+    if (!err) return 0;
+    return contains_ci(err, "context length") != NULL
+        || contains_ci(err, "context_length") != NULL
+        || contains_ci(err, "maximum context") != NULL
+        || contains_ci(err, "too many tokens") != NULL
+        || contains_ci(err, "prompt is too long") != NULL
+        || contains_ci(err, "input length exceeds") != NULL
+        || contains_ci(err, "reduce the length") != NULL;
+}
+
+/* ===== 上下文水位 (token 优先, 字节兜底) ===== */
+
+/* 估算当前 messages 折合的 prompt token 数:
+ * 有服务端读数 (SSE usage) 时按"上次读数 + 新增字节折算", 否则整体按估算折算。 */
+static long estimate_prompt_tokens(void) {
+    size_t now = strlen(messages);
+    if (g_last_prompt_tokens > 0) {
+        long grown = (long)now - (long)g_last_prompt_bytes;
+        if (grown < 0) grown = 0;
+        return g_last_prompt_tokens + grown / BYTES_PER_TOKEN_EST;
+    }
+    return (long)now / BYTES_PER_TOKEN_EST;
+}
+
+/* 是否应当压缩: 配置了模型窗口 (ini 的 context_tokens) 则按 token 估算到 80% 触发;
+ * 未配置或服务端不发 usage 时退回字节水位 (75% BUFSZ)。 */
+static int context_pressure(void) {
+    if (g_context_tokens > 0 &&
+        estimate_prompt_tokens() > g_context_tokens * 4 / 5) return 1;
+    return strlen(messages) > MESSAGES_WATERMARK;
+}
+
+/* 压缩目标: 压完至少降到该字节数以下 (配置了窗口按窗口折算, 否则水位的一半) */
+static size_t compact_target_bytes(void) {
+    if (g_context_tokens > 0) {
+        size_t t = (size_t)g_context_tokens * BYTES_PER_TOKEN_EST / 2;
+        if (t > MESSAGES_WATERMARK) t = MESSAGES_WATERMARK;
+        if (t == 0) t = 1;
+        return t;
+    }
+    return MESSAGES_WATERMARK / 2;
+}
+
+/* 压缩前把当前会话文件归档为 <原名>.pre_compact: 完整原始记录不再只依赖单代 .bak */
+static void archive_session_before_compact(void) {
+    if (!g_history_file[0]) return;
+    wchar_t wsrc[MAX_PATH], wdst[MAX_PATH + 16];
+    char dst[MAX_PATH + 32];
+    if (!utf8_to_wide(g_history_file, wsrc, MAX_PATH)) return;
+    if (GetFileAttributesW(wsrc) == INVALID_FILE_ATTRIBUTES) return;
+    snprintf(dst, sizeof(dst), "%s.pre_compact", g_history_file);
+    if (!utf8_to_wide(dst, wdst, MAX_PATH + 16)) return;
+    CopyFileW(wsrc, wdst, FALSE);
+}
+
+/* ===== 压缩阶梯 =====
+ * ① 摘要旧段, 最近 COMPACT_TAIL_KEEP_BYTES 原文保留 (刚读过的内容不丢, 请求也更小);
+ * ② 请求仍失败: 只摘要更早的一半 (摘要请求再减半);
+ * ③ 保底: 不经模型, 从最旧开始按整条消息丢弃 (无网络依赖, 不拆散 tool 配对)。
+ * 全部失败返回 0, 由调用方收束: 轮首另起新会话, 轮中保留现场提前结束本轮。 */
+
+/* 摘要压缩。halve=0: 摘要 [0,k) 保留 [k,n) 原文; halve=1: 只摘要 [0,k) 的前一半。
+ * 成功返回 1 且已重写 messages; 失败返回 0 且 messages 保持原样。 */
+static int compact_via_summary(int halve) {
+    const char *conv = messages + strlen(SYSTEM_PROMPT);
+    size_t total = strlen(conv);
+    size_t n = msg_count(conv);
+    if (n == 0) return 0;
+
+    /* 1. 尾部保留: 从最后一条往前累计, 预算 COMPACT_TAIL_KEEP_BYTES */
+    size_t k = n, acc = 0;
+    while (k > 0) {
+        size_t s, e;
+        if (!msg_bounds(conv, k - 1, &s, &e)) break;
+        if (acc + (e - s) > COMPACT_TAIL_KEEP_BYTES) break;
+        acc += e - s;
+        k--;
+    }
+    /* 2. halve: 保留段再向前扩到 [0,k) 的中点, 摘要请求更小 */
+    if (halve && k > 1) {
+        size_t mid = k / 2;
+        if (mid >= 1 && mid < k) k = mid;
+    }
+    /* 3. 保留段起点不能是孤立的 tool 结果 (其 assistant 已进摘要), 否则请求必 400 */
+    while (k < n) {
+        size_t s, e;
+        if (!msg_bounds(conv, k, &s, &e)) return 0;
+        char role[16];
+        msg_role(conv + s, e - s, role, sizeof(role));
+        if (strcmp(role, "tool") != 0) break;
+        k++;
+    }
+    if (k == 0) return 0;
+    size_t ks = total;   /* 保留段第一条消息的起点 (k==n 时无保留段) */
+    if (k < n) {
+        size_t s, e;
+        if (!msg_bounds(conv, k, &s, &e)) return 0;
+        ks = s;
+    }
+
+    /* 4. 摘要请求: system + [0,ks) + ask (不带 tools, 避免模型改为调用工具) */
     static const char *ask =
         "上下文即将超出长度上限。请把以上对话压缩成一份交接摘要, 供后续继续工作。"
         "必须保留: 1) 用户的目标与约束; 2) 已完成的关键步骤与结论; 3) 创建或改动过的文件路径; "
-        "4) 仍未完成的事项与下一步。不要寒暄、不要复述原文, 直接输出摘要, 控制在 800 字以内。";
-
+        "4) 仍未完成的事项与下一步。不要寒暄、不要复述原文, 直接输出摘要, 控制在 2000 字以内。"
+        "(最近的几条消息会原样保留, 不必复述。)";
     char *esc_ask = json_escape_alloc(ask);
     if (!esc_ask) return 0;
-    size_t mlen = strlen(messages);
-    size_t rcap = mlen + strlen(esc_ask) + 96;
+    size_t rcap = strlen(SYSTEM_PROMPT) + ks + strlen(esc_ask) + 64;
     char *req_msgs = (char*)malloc(rcap);
     if (!req_msgs) { free(esc_ask); return 0; }
-    snprintf(req_msgs, rcap, "%s,{\"role\":\"user\",\"content\":\"%s\"}", messages, esc_ask);
+    int rn = snprintf(req_msgs, rcap, "%s%.*s%s{\"role\":\"user\",\"content\":\"%s\"}",
+                      SYSTEM_PROMPT, (int)ks, conv, (k < n) ? "" : ",", esc_ask);
     free(esc_ask);
+    if (rn <= 0 || (size_t)rn >= rcap) { free(req_msgs); return 0; }
 
-    size_t bcap = strlen(req_msgs) + strlen(g_model) + strlen(TOOLS_JSON) + 256;
+    size_t bcap = (size_t)rn + strlen(g_model) + 128;
     char *bodybuf = (char*)malloc(bcap);
     if (!bodybuf) { free(req_msgs); return 0; }
-    /* 不带 tools: 避免模型改为调用工具而不是给出摘要 */
-    snprintf(bodybuf, bcap, "{\"model\":\"%s\",\"messages\":[%s],\"stream\":true}", g_model, req_msgs);
+    snprintf(bodybuf, bcap, "{\"model\":\"%s\",\"messages\":[%s],\"stream\":true}",
+             g_model, req_msgs);
     free(req_msgs);
 
-    char url[1280]; chat_completions_url(url, sizeof(url));
+    char url[1280];
+    chat_completions_url(url, sizeof(url));
     StreamCtx *sctx = (StreamCtx*)calloc(1, sizeof(StreamCtx));
     if (!sctx) { free(bodybuf); return 0; }
     char err[512]; err[0] = '\0';
@@ -76,26 +268,101 @@ static int compact_conversation(void) {
     int status = http_post_stream(url, g_api_key, bodybuf, strlen(bodybuf), err, sizeof(err), sctx);
     free(bodybuf);
 
-    int ok = 0;
+    char *summary = NULL;
     if (status == 200 && sctx->content_len > 0) {
         size_t slen = sctx->content_len;
-        if (slen > 8192) slen = utf8_trim_len(sctx->content_buf, 8192);   /* 摘要本身也设上限 */
+        if (slen > COMPACT_SUMMARY_MAX)
+            slen = utf8_trim_len(sctx->content_buf, COMPACT_SUMMARY_MAX);   /* 摘要本身也设上限 */
         sctx->content_buf[slen] = '\0';
-        char *esc = json_escape_alloc(sctx->content_buf);
-        if (esc) {
-            reset_conversation();
-            size_t sp = strlen(messages);
-            int n = snprintf(messages + sp, BUFSZ - sp,
-                ",{\"role\":\"user\",\"content\":\"[上下文已压缩] 以下是此前对话的摘要, "
-                "请据此继续, 不要重复已完成的工作:\\n\\n%s\"}", esc);
-            if (n > 0 && (size_t)n < BUFSZ - sp) {
-                append_text("(上下文已压缩为摘要, 继续对话)\r\n");
-                ok = 1;
-            }
-            free(esc);
-        }
+        /* 摘要自身被输出上限截断: 明确标注, 不静默接受半截摘要 */
+        if (strcmp(sctx->finish, "length") == 0)
+            strncat(sctx->content_buf, "\n...(摘要因输出长度上限被截断)",
+                    sizeof(sctx->content_buf) - strlen(sctx->content_buf) - 1);
+        summary = strdup(sctx->content_buf);
     }
     free(sctx);
+    if (!summary) return 0;
+
+    /* 5. 拼装新 messages: SYSTEM + 摘要 user 消息 + 保留段原文。
+     *    先在堆上拼好并全部校验, 成功才提交; 失败时 messages 保持原样 (下一级阶梯接手)。 */
+    char *esc_sum = json_escape_alloc(summary);
+    free(summary);
+    if (!esc_sum) return 0;
+    size_t tail_len = total - ks;
+    size_t ncap = strlen(SYSTEM_PROMPT) + strlen(esc_sum) + tail_len + 256;
+    char *newbuf = (char*)malloc(ncap);
+    if (!newbuf) { free(esc_sum); return 0; }
+    int wn = snprintf(newbuf, ncap,
+        "%s,{\"role\":\"user\",\"content\":\"[上下文已压缩] 以下是此前对话的摘要, "
+        "请据此继续, 不要重复已完成的工作:\\n\\n%s\"}%s%.*s",
+        SYSTEM_PROMPT, esc_sum, (k < n) ? "," : "", (int)tail_len, conv + ks);
+    free(esc_sum);
+    if (wn <= 0 || (size_t)wn >= ncap || wn >= BUFSZ) { free(newbuf); return 0; }
+    memcpy(messages, newbuf, (size_t)wn + 1);
+    free(newbuf);
+    append_text("(上下文已压缩为摘要, 最近的消息保留原文, 继续对话)\r\n");
+    return 1;
+}
+
+/* 保底压缩: 不经模型, 从最旧开始按整条消息丢弃, 直到低于 compact_target_bytes。
+ * 成功返回 1; 没有可丢的 (全丢/本来就没超) 返回 0, 交由调用方收束。 */
+static int compact_drop_oldest(void) {
+    const char *conv = messages + strlen(SYSTEM_PROMPT);
+    size_t total = strlen(conv);
+    size_t target = compact_target_bytes();
+    if (total <= target) return 0;
+    size_t n = msg_count(conv);
+    if (n == 0) return 0;
+
+    size_t cut = 0, dropped = 0;
+    while (cut < n) {
+        size_t s, e;
+        if (!msg_bounds(conv, cut, &s, &e)) break;
+        dropped += e - s;
+        cut++;
+        if (total - dropped <= target) break;
+    }
+    size_t dropped_n = cut;
+    /* 保留起点避开孤立的 tool 结果 (其 assistant 已被丢弃) */
+    while (cut < n) {
+        size_t s, e;
+        if (!msg_bounds(conv, cut, &s, &e)) return 0;
+        char role[16];
+        msg_role(conv + s, e - s, role, sizeof(role));
+        if (strcmp(role, "tool") != 0) break;
+        cut++;
+    }
+    if (cut >= n) return 0;   /* 全部都要丢: 让调用方走重置路径 */
+    size_t ks, ke;
+    if (!msg_bounds(conv, cut, &ks, &ke)) return 0;
+
+    reset_conversation();
+    size_t sp = strlen(messages);
+    int wn = snprintf(messages + sp, BUFSZ - sp, ",%.*s", (int)(total - ks), conv + ks);
+    if (wn <= 0 || (size_t)wn >= BUFSZ - sp) {
+        reset_conversation();   /* 理论不可达 (只丢不加必能装下), 兜底回到安全空态 */
+        return 0;
+    }
+    char note[160];
+    snprintf(note, sizeof(note),
+             "(摘要压缩失败, 已按整条消息丢弃最早的 %d 条; 早期细节不再在上下文中)\r\n",
+             (int)dropped_n);
+    append_text(note);
+    return 1;
+}
+
+/* 上下文压缩总入口: 先归档当前会话文件, 再按阶梯尝试。
+ * 成功返回 1 (messages 已改写), 失败返回 0 (messages 保持原样)。 */
+static int compact_conversation(void) {
+    archive_session_before_compact();
+    int ok = compact_via_summary(0)      /* ① 摘要旧段 + 尾部保留 */
+          || compact_via_summary(1)      /* ② 只摘要更早一半, 请求更小 */
+          || compact_drop_oldest();      /* ③ 保底: 不经模型直接丢最旧 */
+    if (ok) {
+        /* 压缩改写了历史, 上次请求的 token 读数已失效 */
+        g_last_prompt_tokens = 0;
+        g_last_prompt_bytes = 0;
+    }
     return ok;
 }
 
@@ -105,8 +372,8 @@ static void agent_turn(const char *user_msg) {
     InterlockedExchange(&g_cancel, 0);          /* 清除取消标志 */
     g_touched_files[0] = '\0';                  /* 本轮改动记录重新计 (回滚提示要引用) */
 
-    /* 1. 若历史接近溢出: 先尝试压缩为摘要继续, 压缩失败才另起新会话(旧会话文件保留) */
-    if (strlen(messages) > MESSAGES_WATERMARK) {
+    /* 1. 上下文压力检查 (token 优先, 字节兜底): 先压缩, 再记录回滚基点 */
+    if (context_pressure()) {
         append_text("(上下文接近上限, 正在压缩为摘要...)\r\n");
         if (!compact_conversation()) {
             append_text("(压缩失败, 已自动另起新会话)\r\n");
@@ -121,6 +388,10 @@ static void agent_turn(const char *user_msg) {
     /* 3. 记录快照点: 出错时回滚到这里, 丢弃本轮 user message */
     size_t savepoint = strlen(messages);
     int rolled_back = 0;   /* 在 done 之前标记是否需要回滚 */
+    int iter = 0;              /* 迭代序号: 首轮的水位检查已在上面做过 */
+    int overflow_retries = 0;  /* 400 上下文超限后的"压缩重试"次数 */
+    AgentToolCall *calls = NULL;   /* 本轮工具调用表 (堆分配); done 处兜底释放 */
+    StreamCtx *ctx = NULL;         /* 本轮流式上下文 (堆分配); done 处兜底释放 */
 
     /* 4. 追加本轮 user message */
     char *escaped = json_escape_alloc(user_msg);
@@ -144,22 +415,42 @@ static void agent_turn(const char *user_msg) {
             rolled_back = 1;
             goto done;
         }
+        /* 上下文压力检查 (轮中同样生效): 长工具链任务单轮就能涨几十上百 KB,
+         * 迭代间隙消息序列完整, 是安全的压缩点。压缩失败时不回滚 —— 已完成的
+         * 工具调用与结论都保留, 本轮提前收束, 用户可继续下一条指令。 */
+        if (iter > 0 && context_pressure()) {
+            append_text("(上下文接近上限, 正在压缩为摘要...)\r\n");
+            if (!compact_conversation()) {
+                append_text("(压缩失败, 本轮到此暂停; 已完成的步骤都保留在对话中)\r\n");
+                goto done;
+            }
+            savepoint = strlen(messages);   /* 历史已改写, 回滚基点随之更新 */
+        }
+        iter++;
+
         snprintf(body, BUFSZ,
             "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true}",
             g_model, messages, TOOLS_JSON);
 
         append_text("(thinking...)\r\n");
 
-        /* 流式 SSE 请求 */
-        StreamCtx ctx;
-        memset(&ctx, 0, sizeof(ctx));
+        /* 流式 SSE 请求。ctx 内含 1MB content_buf: 放堆, 不占工作线程的 1MB 栈。
+         * 上一迭代已消费完毕的 ctx 在此释放 (每迭代一个, 不能等 done 才释放)。 */
+        free(ctx);
+        ctx = (StreamCtx*)calloc(1, sizeof(StreamCtx));
+        if (!ctx) {
+            append_text("(内存不足, 本轮回滚)\r\n");
+            append_text(ROLLBACK_HINT);
+            rolled_back = 1;
+            goto done;
+        }
 
         char full_url[1280];
         chat_completions_url(full_url, sizeof(full_url));
 
         if (cagent_stream_begin) cagent_stream_begin();   /* 标记新分段, 供重试时回删 */
         int status = http_post_stream(full_url, g_api_key, body, strlen(body),
-                                      resp, BUFSZ, &ctx);
+                                      resp, BUFSZ, ctx);
 
         /* 取消 */
         if (status == -2) {
@@ -169,44 +460,65 @@ static void agent_turn(const char *user_msg) {
         }
         /* 失败 (网络错误或非 200) */
         if (status != 200) {
+            /* 服务端报告上下文超限 (400): 压缩后原地重试, 而不是回滚丢掉整轮。
+             * 重试有次数上限; 压缩失败则照常回滚。 */
+            if (status == 400 && overflow_retries < CONTEXT_OVERFLOW_RETRIES &&
+                is_context_overflow_error(resp)) {
+                overflow_retries++;
+                append_text("(服务端报告上下文超限, 正在压缩后重试...)\r\n");
+                free(ctx);
+                ctx = NULL;
+                if (compact_conversation()) {
+                    savepoint = strlen(messages);   /* 历史已改写, 回滚基点随之更新 */
+                    continue;
+                }
+                append_text("(压缩失败)\r\n");
+            }
             append_text(resp);
             append_text(ROLLBACK_HINT);
             rolled_back = 1;
             goto done;
         }
 
+        /* 记录服务端报告的 prompt_tokens (与请求时的 messages 长度配对, 供水位估算) */
+        if (ctx->prompt_tokens > 0) {
+            g_last_prompt_tokens = ctx->prompt_tokens;
+            g_last_prompt_bytes = strlen(messages);
+        }
+
         /* 结束原因: 除正常 stop/tool_calls 外, 其余情况明确提示用户 */
-        if (strcmp(ctx.finish, "length") == 0)
+        if (strcmp(ctx->finish, "length") == 0)
             append_text("(达到长度上限被截断; 可让模型继续补全)\r\n");
-        else if (strcmp(ctx.finish, "content_filter") == 0)
+        else if (strcmp(ctx->finish, "content_filter") == 0)
             append_text("(内容被服务端的过滤策略拦截)\r\n");
 
         /* content 装不下时: 给记录里的内容补一条截断标记 (界面已完整显示),
          * 否则模型下一轮看不到自己说过什么, 却以为说完了。 */
-        if (ctx.truncated) {
-            strncat(ctx.content_buf,
+        if (ctx->truncated) {
+            strncat(ctx->content_buf,
                     "\n...(回复过长, 超出缓冲上限, 上文只记录了前半部分)",
                     CONTENT_TAIL_RESERVE - 1);
             append_text("(模型回复过长, 上文只记录了前半部分)\r\n");
         }
 
-        if (ctx.n_calls > 0 || ctx.n_dropped > 0) {
-            /* 有 tool_calls: 从 ctx.calls 转 ToolCall 并执行 */
-            typedef struct {
-                char id[256]; char name[64]; char args[ARGS_MAX]; char *output;
-            } ToolCall;
-            ToolCall calls[STREAM_CALLS_MAX];
-            int n_calls = 0;
-            for (int i = 0; i < ctx.n_calls && n_calls < STREAM_CALLS_MAX; i++) {
-                if (!ctx.calls[i].name[0]) continue;
-                ToolCall *c = &calls[n_calls++];
-                c->id[0] = c->name[0] = c->args[0] = '\0';
-                c->output = NULL;
-                snprintf(c->id, sizeof(c->id), "%s", ctx.calls[i].id);
-                snprintf(c->name, sizeof(c->name), "%s", ctx.calls[i].name);
-                snprintf(c->args, sizeof(c->args), "%s", ctx.calls[i].args);
+        if (ctx->n_calls > 0 || ctx->n_dropped > 0) {
+            /* 有 tool_calls: 从 ctx.calls 转 AgentToolCall 并执行。
+             * 调用表 (8 项 ≈ 68KB) 放堆: 放栈会和工作线程默认 1MB 栈争空间。 */
+            calls = (AgentToolCall*)calloc(STREAM_CALLS_MAX, sizeof(AgentToolCall));
+            if (!calls) {
+                append_text("(内存不足, 本轮回滚)\r\n");
+                rolled_back = 1;
+                goto done;
             }
-            if (n_calls == 0 && ctx.n_dropped == 0) {
+            int n_calls = 0;
+            for (int i = 0; i < ctx->n_calls && n_calls < STREAM_CALLS_MAX; i++) {
+                if (!ctx->calls[i].name[0]) continue;
+                AgentToolCall *c = &calls[n_calls++];
+                snprintf(c->id,   sizeof(c->id),   "%s", ctx->calls[i].id);
+                snprintf(c->name, sizeof(c->name), "%s", ctx->calls[i].name);
+                snprintf(c->args, sizeof(c->args), "%s", ctx->calls[i].args);
+            }
+            if (n_calls == 0 && ctx->n_dropped == 0) {
                 append_text("(tool_calls 解析失败)\r\n");
                 append_text(ROLLBACK_HINT);
                 rolled_back = 1;
@@ -219,35 +531,41 @@ static void agent_turn(const char *user_msg) {
             if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
                 append_text("(已取消)\r\n");
                 rolled_back = 1;
-                for (int j = 0; j < n_calls; j++) free(calls[j].output);
                 goto done;
             }
-            ToolCall *c = &calls[i];
+            AgentToolCall *c = &calls[i];
             {
-                char line[8192];
-                snprintf(line, sizeof(line), "[Tool] %s(%s)\r\n", c->name, c->args);
-                append_text(line);
+                /* 单条 [Tool] 提示行的缓冲按参数上限给, 不再占 8KB 栈 */
+                char *line = (char*)malloc(ARGS_MAX + 128);
+                if (line) {
+                    snprintf(line, ARGS_MAX + 128, "[Tool] %s(%s)\r\n", c->name, c->args);
+                    append_text(line);
+                    free(line);
+                }
             }
             /* 分发 (含参数校验): 错误原因会写进 tool_out 交回模型 */
-            dispatch_tool(c->name, c->args, ctx.finish);
+            dispatch_tool(c->name, c->args, ctx->finish);
             c->output = strdup(tool_out);
             {
+                /* [Output] 提示行 = 16KB 输出上限 + 提示语, 不用 256KB 栈缓冲 */
                 size_t tl = strlen(tool_out);
-                char line[BUFSZ + 32];
-                if (tl > 0 && (tool_out[tl-1] == '\n' || tool_out[tl-1] == '\r'))
-                    snprintf(line, sizeof(line), "[Output]\r\n%s", tool_out);
-                else
-                    snprintf(line, sizeof(line), "[Output]\r\n%s\r\n", tool_out);
-                append_text(line);
+                size_t need = tl + 64;
+                char *line = (char*)malloc(need);
+                if (line) {
+                    int eol = (tl > 0 && (tool_out[tl-1] == '\n' || tool_out[tl-1] == '\r'));
+                    snprintf(line, need, eol ? "[Output]\r\n%s" : "[Output]\r\n%s\r\n", tool_out);
+                    append_text(line);
+                    free(line);
+                }
             }
         }
 
         /* 超上限被丢弃的调用: 界面如实说明"没执行", 与下面回填的 tool 结果一致 */
-        for (int i = 0; i < ctx.n_dropped; i++) {
+        for (int i = 0; i < ctx->n_dropped; i++) {
             char line[512];
             snprintf(line, sizeof(line),
                      "[Tool] %s -> 未执行 (超出单轮 %d 个并行调用上限, 请分批调用)\r\n",
-                     ctx.dropped[i].name[0] ? ctx.dropped[i].name : "?", STREAM_CALLS_MAX);
+                     ctx->dropped[i].name[0] ? ctx->dropped[i].name : "?", STREAM_CALLS_MAX);
             append_text(line);
         }
 
@@ -255,7 +573,7 @@ static void agent_turn(const char *user_msg) {
          * content 保留模型本轮的自然语言说明: 否则下一轮它看不到自己说过什么。
          * 说明文字过大放不下时退化为空串 (不影响工具调用本身)。 */
         size_t mstart = strlen(messages);
-        char *esc_narr = (ctx.content_len > 0) ? json_escape_alloc(ctx.content_buf) : NULL;
+        char *esc_narr = (ctx->content_len > 0) ? json_escape_alloc(ctx->content_buf) : NULL;
         int an = snprintf(messages + mstart, BUFSZ - mstart,
             ",{\"role\":\"assistant\",\"content\":\"%s\",\"tool_calls\":[",
             esc_narr ? esc_narr : "");
@@ -269,7 +587,7 @@ static void agent_turn(const char *user_msg) {
         }
 
         for (int i = 0; i < n_calls && ok; i++) {
-            ToolCall *c = &calls[i];
+            AgentToolCall *c = &calls[i];
             char *esc_id   = json_escape_alloc(c->id);
             char *esc_name = json_escape_alloc(c->name);
             char *esc_args = json_escape_alloc(c->args);
@@ -284,9 +602,9 @@ static void agent_turn(const char *user_msg) {
         }
 
         /* 超上限被丢弃的调用也回填占位 tool_call: 否则模型以为它们已经执行过了 */
-        for (int i = 0; ok && i < ctx.n_dropped; i++) {
-            char *esc_id   = json_escape_alloc(ctx.dropped[i].id);
-            char *esc_name = json_escape_alloc(ctx.dropped[i].name[0] ? ctx.dropped[i].name : "unknown");
+        for (int i = 0; ok && i < ctx->n_dropped; i++) {
+            char *esc_id   = json_escape_alloc(ctx->dropped[i].id);
+            char *esc_name = json_escape_alloc(ctx->dropped[i].name[0] ? ctx->dropped[i].name : "unknown");
             if (!esc_id || !esc_name) { ok = 0; free(esc_id); free(esc_name); break; }
             size_t len = strlen(messages);
             int n2 = snprintf(messages + len, BUFSZ - len,
@@ -305,7 +623,7 @@ static void agent_turn(const char *user_msg) {
 
         /* 第三遍: 为每个 tool_call 写 tool 消息 */
         for (int i = 0; i < n_calls && ok; i++) {
-            ToolCall *c = &calls[i];
+            AgentToolCall *c = &calls[i];
             char *esc_id  = json_escape_alloc(c->id);
             char *esc_out = json_escape_alloc(c->output ? c->output : "");
             if (!esc_id || !esc_out) { ok = 0; free(esc_id); free(esc_out); break; }
@@ -318,8 +636,8 @@ static void agent_turn(const char *user_msg) {
         }
 
         /* 丢弃的调用: 回一条"未执行"的 tool 结果, 模型才知道要分批重来 */
-        for (int i = 0; ok && i < ctx.n_dropped; i++) {
-            char *esc_id = json_escape_alloc(ctx.dropped[i].id);
+        for (int i = 0; ok && i < ctx->n_dropped; i++) {
+            char *esc_id = json_escape_alloc(ctx->dropped[i].id);
             if (!esc_id) { ok = 0; break; }
             size_t len = strlen(messages);
             int n2 = snprintf(messages + len, BUFSZ - len,
@@ -333,6 +651,7 @@ static void agent_turn(const char *user_msg) {
 
         /* 释放工具输出 */
         for (int i = 0; i < n_calls; i++) free(calls[i].output);
+        free(calls); calls = NULL;
 
         if (!ok) {
             /* 任一步失败: 把本次拼接的 assistant+tool 段全部截掉, 回滚整轮 */
@@ -343,12 +662,12 @@ static void agent_turn(const char *user_msg) {
         }
         } else {
             /* 无 tool_calls: content 收尾。流式已逐字显示, 这里只追加换行 + messages。 */
-            if (ctx.content_len > 0) {
+            if (ctx->content_len > 0) {
                 /* 内容末尾已带换行则不再补, 避免双倍空行 */
-                if (ctx.content_buf[ctx.content_len - 1] != '\n' &&
-                    ctx.content_buf[ctx.content_len - 1] != '\r')
+                if (ctx->content_buf[ctx->content_len - 1] != '\n' &&
+                    ctx->content_buf[ctx->content_len - 1] != '\r')
                     append_text("\r\n");
-                char *esc = json_escape_alloc(ctx.content_buf);
+                char *esc = json_escape_alloc(ctx->content_buf);
                 if (esc) {
                     size_t len = strlen(messages);
                     int an = snprintf(messages + len, BUFSZ - len,
@@ -360,7 +679,7 @@ static void agent_turn(const char *user_msg) {
                     }
                 }
             } else {
-                if (strcmp(ctx.finish, "length") == 0)
+                if (strcmp(ctx->finish, "length") == 0)
                     append_text("(响应为空且已达长度上限, 本轮回滚)\r\n");
                 else
                     append_text("(响应解析失败)\r\n");
@@ -371,6 +690,14 @@ static void agent_turn(const char *user_msg) {
         }
     }
 done:
+    /* 兜底释放: 取消/中途出错时这些堆缓冲可能还没释放 */
+    free(ctx);
+    ctx = NULL;
+    if (calls) {
+        for (int i = 0; i < STREAM_CALLS_MAX; i++) free(calls[i].output);
+        free(calls);
+        calls = NULL;
+    }
     if (rolled_back) {
         messages[savepoint] = '\0';
         /* 对话回滚了, 但文件已经改了 —— 说清楚并列出改了哪些, 免得用户以为也还原了 */

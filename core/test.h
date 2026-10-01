@@ -72,7 +72,7 @@ static int run_all_tests(void) {
         CHK(strstr(tool_out, "已完成定点替换") != NULL);
 
         /* 读回确认替换生效且其余内容完好 */
-        tool_read_file("e.txt");
+        tool_read_file("e.txt", 0);
         CHK(strstr(tool_out, "BETA") != NULL);
         CHK(strstr(tool_out, "alpha") != NULL);
         CHK(strstr(tool_out, "gamma") != NULL);
@@ -146,7 +146,7 @@ static int run_all_tests(void) {
             char delta[4096];
             memset(delta, 'x', sizeof(delta) - 1);
             delta[sizeof(delta) - 1] = '\0';
-            for (int i = 0; i < 100 && !c->truncated; i++)
+            for (int i = 0; i < 400 && !c->truncated; i++)   /* 400*4KB > 1MB 必然触发 */
                 on_content_delta(c, delta);
             CHK(c->truncated == 1);                                    /* 不再静默丢尾 */
             CHK(c->content_len + CONTENT_TAIL_RESERVE <= sizeof(c->content_buf));
@@ -194,6 +194,192 @@ static int run_all_tests(void) {
             CHK(_strnicmp(sp, sdir, strlen(sdir)) == 0);            /* 新会话在该目录内 */
             CHK(strstr(sp, ".json") != NULL);
         }
+    }
+
+    /* ---- 沙箱: 路径穿越 / 越界必须被拒 (item 8) ---- */
+    {
+        CreateDirectoryA("cagent_test_ws", NULL);
+        strcpy(g_workspace, "cagent_test_ws");
+        /* 相对路径穿越到工作目录外 */
+        CHK(path_in_workspace("../escape.txt") == 0);
+        CHK(path_in_workspace("..\\escape.txt") == 0);
+        /* 绝对路径指向系统目录 */
+        CHK(path_in_workspace("C:\\windows\\system32\\x.txt") == 0);
+        /* 工作目录内的合法路径放行 */
+        CHK(path_in_workspace("ok.txt") == 1);
+        CHK(path_in_workspace("sub\\ok.txt") == 1);
+        /* write_file / edit_file 越界被拒 */
+        tool_write_file("C:\\windows\\system32\\x.txt", "pwn");
+        CHK(strstr(tool_out, "路径在工作目录外") != NULL);
+        tool_edit_file("C:\\windows\\system32\\x.txt", "a", "b");
+        CHK(strstr(tool_out, "路径在工作目录外") != NULL);
+        RemoveDirectoryA("cagent_test_ws");
+        g_workspace[0] = '\0';
+    }
+
+    /* ---- 会话命名: 同秒冲突要能避开 (item 8) ---- */
+    {
+        char sp1[MAX_PATH], sp2[MAX_PATH];
+        build_new_session_path(sp1, sizeof(sp1));
+        FILE *tf = fopen_utf8(sp1, "wb");     /* 模拟该路径已存在 */
+        if (tf) { fputc('x', tf); fclose(tf); }
+        build_new_session_path(sp2, sizeof(sp2));
+        CHK(strcmp(sp1, sp2) != 0);           /* 冲突时应换名, 而非覆盖 */
+        remove(sp1);
+    }
+
+    /* ---- 上下文压缩: 消息遍历辅助 ---- */
+    {
+        reset_conversation();
+        strcat(messages, ",{\"role\":\"user\",\"content\":\"u1\"}");
+        strcat(messages, ",{\"role\":\"assistant\",\"content\":\"\","
+                         "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+                         "\"function\":{\"name\":\"execute_bash\",\"arguments\":\"{}\"}}]}");
+        strcat(messages, ",{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"out\"}");
+        strcat(messages, ",{\"role\":\"user\",\"content\":\"u2\"}");
+        strcat(messages, ",{\"role\":\"assistant\",\"content\":\"done\"}");
+
+        const char *conv = messages + strlen(SYSTEM_PROMPT);
+        CHK(msg_count(conv) == 5);
+        size_t s, e;
+        CHK(msg_bounds(conv, 0, &s, &e) == 1 && conv[s] == '{');
+        CHK(msg_bounds(conv, 4, &s, &e) == 1 && strstr(conv + s, "done") != NULL);
+        CHK(msg_bounds(conv, 5, &s, &e) == 0);            /* 越界: 找不到 */
+        char role[16];
+        msg_bounds(conv, 2, &s, &e);
+        msg_role(conv + s, e - s, role, sizeof(role));
+        CHK(strcmp(role, "tool") == 0);
+        msg_bounds(conv, 0, &s, &e);
+        msg_role(conv + s, e - s, role, sizeof(role));
+        CHK(strcmp(role, "user") == 0);
+    }
+
+    /* ---- 上下文压缩: 超限识别 ---- */
+    CHK(is_context_overflow_error("...This model's maximum context length is 8192 tokens...") == 1);
+    CHK(is_context_overflow_error("{\"error\":{\"code\":\"context_length_exceeded\"}}") == 1);
+    CHK(is_context_overflow_error("prompt is too long: 200 tokens > 100 maximum") == 1);
+    CHK(is_context_overflow_error("[HTTP 400] Invalid API key") == 0);
+    CHK(is_context_overflow_error("") == 0);
+    CHK(is_context_overflow_error(NULL) == 0);
+
+    /* ---- 上下文压缩: 水位判定 (token 优先, 字节兜底) ---- */
+    {
+        g_context_tokens = 0;
+        g_last_prompt_tokens = 0;
+        g_last_prompt_bytes = 0;
+        reset_conversation();                             /* 只有系统提示词, 远小于水位 */
+        CHK(context_pressure() == 0);                     /* 字节兜底: 未超 */
+
+        g_context_tokens = 100;                           /* 窗口极小: est=strlen/3 必然超 */
+        CHK(context_pressure() == 1);
+
+        /* 有服务端读数: 上次 1000 token + 新增 900 字节 (~300 token) = 1300 */
+        g_last_prompt_tokens = 1000;
+        g_last_prompt_bytes = strlen(messages) - 900;
+        g_context_tokens = 1500;                          /* 1500*4/5=1200 < 1300 -> 压 */
+        CHK(context_pressure() == 1);
+        g_context_tokens = 2000;                          /* 1600 >= 1300 -> 不压 */
+        CHK(context_pressure() == 0);
+
+        g_context_tokens = 0;
+        g_last_prompt_tokens = 0;
+        g_last_prompt_bytes = 0;
+    }
+
+    /* ---- 上下文压缩: 保底丢弃 (不经模型), 必须保持消息配对完整 ---- */
+    {
+        reset_conversation();
+        strcat(messages, ",{\"role\":\"user\",\"content\":\"u1\"}");
+        strcat(messages, ",{\"role\":\"assistant\",\"content\":\"\","
+                         "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+                         "\"function\":{\"name\":\"execute_bash\",\"arguments\":\"{}\"}}]}");
+        strcat(messages, ",{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"out\"}");
+        strcat(messages, ",{\"role\":\"user\",\"content\":\"u2\"}");
+        strcat(messages, ",{\"role\":\"assistant\",\"content\":\"done\"}");
+        size_t before = strlen(messages);
+
+        /* 目标极小 -> 全部要丢 -> 返回 0 且 messages 原样 (交调用方重置) */
+        g_context_tokens = 8;
+        CHK(compact_drop_oldest() == 0);
+        CHK(strlen(messages) == before);
+
+        /* 目标约一半 -> 丢最旧若干条, 但保留段起点绝不能是孤立 tool 结果 */
+        const char *conv0 = messages + strlen(SYSTEM_PROMPT);
+        g_context_tokens = (long)(strlen(conv0) / 3);     /* target ≈ conv 长度的一半 */
+        int ok3 = compact_drop_oldest();
+        CHK(ok3 == 1);
+        CHK(strlen(messages) < before);
+        {
+            const char *conv = messages + strlen(SYSTEM_PROMPT);
+            if (conv[0] == ',') conv++;
+            char *arr = (char*)malloc(strlen(conv) + 3);
+            CHK(arr != NULL);
+            if (arr) {
+                sprintf(arr, "[%s]", conv);
+                JValue *root = json_parse(arr);
+                CHK(root != NULL && root->type == J_ARR && root->arr.n >= 1);
+                if (root && root->type == J_ARR && root->arr.n >= 1) {
+                    const JValue *m0 = root->arr.items[0];
+                    const JValue *r = json_obj_get(m0, "role");
+                    CHK(r && r->type == J_STR && strcmp(r->str, "tool") != 0);  /* 无孤立 tool */
+                    const JValue *ml = root->arr.items[root->arr.n - 1];
+                    const JValue *c = json_obj_get(ml, "content");
+                    CHK(c && c->type == J_STR && strcmp(c->str, "done") == 0);  /* 最新消息保留 */
+                }
+                json_free(root);
+                free(arr);
+            }
+        }
+        g_context_tokens = 0;
+    }
+
+    /* ---- 工具: read_file 的 offset 分块续读 ---- */
+    {
+        CreateDirectoryA("cagent_test_ws", NULL);
+        strcpy(g_workspace, "cagent_test_ws");
+
+        /* 20KB 文件: 默认 16KB 上限必须截断并给出续读 offset */
+        {
+            char *big = (char*)malloc(20004);
+            if (big) {
+                memset(big, 'a', 20000);
+                big[20000] = '\0';
+                strcat(big, "END");
+                tool_write_file("big.txt", big);
+                free(big);
+            }
+            size_t cap = tool_output_cap();
+            tool_read_file("big.txt", 0);
+            CHK(strstr(tool_out, "已截断") != NULL);
+            {
+                char hint[64];
+                snprintf(hint, sizeof(hint), "offset=%zu", cap);
+                CHK(strstr(tool_out, hint) != NULL);      /* 提示里给下一次的 offset */
+            }
+            /* 续读: 从上次的 offset 拿到剩余部分 (含 END, 无截断提示) */
+            tool_read_file("big.txt", (long long)tool_output_cap());
+            CHK(strstr(tool_out, "END") != NULL);
+            CHK(strstr(tool_out, "已截断") == NULL);
+
+            /* 超出文件末尾: 明确说明, 不报错 */
+            tool_read_file("big.txt", 999999);
+            CHK(strstr(tool_out, "已无内容") != NULL);
+
+            remove("cagent_test_ws/big.txt");
+        }
+
+        /* offset 落在多字节字符中间: 前移到字符边界, 不出乱码
+         * "aaaa"(4 字节) + "你你你"(9 字节); offset=5 切在第一个'你'中间,
+         * 跳过 2 个续字节后从第二个'你'开头 -> 结果是"你你" */
+        {
+            tool_write_file("u8.txt", "aaaa\xe4\xbd\xa0\xe4\xbd\xa0\xe4\xbd\xa0");
+            tool_read_file("u8.txt", 5);
+            CHK(strcmp(tool_out, "你你") == 0);
+            remove("cagent_test_ws/u8.txt");
+        }
+
+        RemoveDirectoryA("cagent_test_ws");
+        g_workspace[0] = '\0';
     }
 
     #undef CHK

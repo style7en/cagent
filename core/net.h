@@ -88,6 +88,7 @@ typedef struct {
     StreamToolCall calls[STREAM_CALLS_MAX];
     int n_calls;
     char finish[24];           /* stop / length / tool_calls / content_filter 等 */
+    long prompt_tokens;        /* 服务端报告的 prompt_tokens (SSE usage; 不发则 0) */
     /* 本次 HTTP 分段的状态 (每次尝试前 memset 清零) */
     int emitted;               /* 已向前端上屏过 AI 内容 (重试前据此回删) */
     int truncated;             /* content 超出缓冲上限, 尾部被丢弃 */
@@ -241,17 +242,19 @@ static int http_post_stream_once(const char *url, const char *api_key,
         return status;
     }
 
-    /* 流式读取 + SSE 解析 */
-    char linebuf[8192];
+    /* 流式读取 + SSE 解析 (linebuf 按需增长, 避免超长 SSE 行被截断丢弃, item 7) */
+    size_t lbcap = 8192;
+    char *linebuf = (char*)malloc(lbcap);
+    int cancelled = 0;
+    if (!linebuf) { status = -1; goto stream_done; }
     size_t lpos = 0;
     char tmp[8192];
     DWORD nread;
-    int cancelled = 0;
     while (WinHttpReadData(hReq, tmp, sizeof(tmp), &nread) && nread > 0) {
         if (InterlockedCompareExchange(&g_cancel, 0, 0)) { cancelled = 1; break; }
         for (DWORD i = 0; i < nread; i++) {
             char c = tmp[i];
-            if (c == '\n' || lpos >= sizeof(linebuf) - 1) {
+            if (c == '\n') {
                 linebuf[lpos] = '\0';
                 size_t lbLen = strlen(linebuf);
                 while (lbLen > 0 && linebuf[lbLen-1] == '\r') linebuf[--lbLen] = '\0';
@@ -269,16 +272,30 @@ static int http_post_stream_once(const char *url, const char *api_key,
                         if (content) on_content_delta(ctx, content);
                         const JValue *tcs = json_obj_get(delta, "tool_calls");
                         stream_apply_tool_calls(ctx, tcs);
+                        /* usage (常在末片): 记下 prompt_tokens 供水位估算, 没有则保持 0 */
+                        const JValue *usage = json_obj_get(root, "usage");
+                        const JValue *pt = usage ? json_obj_get(usage, "prompt_tokens") : NULL;
+                        if (pt && pt->type == J_NUM && pt->num > 0)
+                            ctx->prompt_tokens = (long)pt->num;
                         json_free(root);
                     }
                 }
                 lpos = 0;
             } else {
+                if (lpos + 1 >= lbcap) {
+                    /* 单行过长: 扩容 (设 16MB 上限, 防异常输入撑爆内存) */
+                    if (lbcap >= 16u * 1024u * 1024u) { lpos = 0; continue; }
+                    size_t ncap = lbcap * 2;
+                    char *nb = (char*)realloc(linebuf, ncap);
+                    if (!nb) { lpos = 0; continue; }
+                    linebuf = nb; lbcap = ncap;
+                }
                 linebuf[lpos++] = c;
             }
         }
     }
 stream_done:
+    free(linebuf);
     WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
     if (cancelled) return -2;
     return status;
