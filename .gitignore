@@ -26,3 +26,6 @@ sessions/
 
 # 外置系统提示词 (运行时本地文件, 同 cagent.ini)
 SYSTEM_PROMPT
+
+# 计划/设计文档 (superpowers 流程产物, 不入库)
+docs/
