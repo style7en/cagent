@@ -29,7 +29,6 @@ const JValue *json_obj_get(const JValue *obj, const char *key);
 const JValue *json_arr_at(const JValue *arr, size_t i);
 const char   *json_as_str(const JValue *v);
 
-
 static int json_selftest(void) {
     int fails = 0;
     #define CHK(cond) do { if(!(cond)) { printf("FAIL: %s\n", #cond); fails++; } } while(0)
@@ -354,7 +353,6 @@ void json_free(JValue *v) {
     }
     free(v);
 }
-
 
 /* ===== JSON 转义 ===== */
 

@@ -4,6 +4,7 @@
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
+static size_t utf8_trim_len(const char *s, size_t len);   /* 前向声明 (定义在 workspace.h) */
 
 /* 命令执行超时 (毫秒): 默认 60s, 可用环境变量 CAGENT_CMD_TIMEOUT (秒) 覆盖。 */
 static int cmd_timeout_ms(void) {
@@ -11,12 +12,6 @@ static int cmd_timeout_ms(void) {
     if (e && atoi(e) > 0) return atoi(e) * 1000;
     return 60000;
 }
-
-/* 用 CreateProcess + 匿名管道静默运行命令(仅本地工具用),纯内存收发数据。
- * 子进程的 stdout+stderr 合并写入 output (含 \0), 末尾附一行 [exit=N] 退出码,
- * 便于调用方判断命令成败 (超时场景不附, 已有"已终止"提示)。
- * 返回实际读到的字节数,启动进程失败返回 -1。超过 timeout 则终止整个进程树。 */
-static size_t utf8_trim_len(const char *s, size_t len);   /* 前向声明 */
 
 /* 追加一段提示到输出尾部: 空间不足时先回退内容(对齐字符边界), 保证提示一定可见。
  * out_cap 为 0 直接忽略; note 本身放不下时截短 note —— 绝不越界写。 */
@@ -33,6 +28,9 @@ static void append_note(char *output, size_t *pos, size_t out_cap, const char *n
     output[*pos] = '\0';
 }
 
+/* CreateProcess + 匿名管道静默运行命令 (仅本地工具用), 纯内存收发。
+ * stdout+stderr 合并进 output, 末尾附 [exit=N] 退出码 (超时不附, 已有"已终止"提示)。
+ * 返回读到的字节数; 启动失败 -1; 超过 timeout 终止整个进程树。 */
 static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     if (!output || out_cap == 0) return -1;   /* 无缓冲可写: 直接拒绝 (防御, 当前调用方恒传 16KB+) */
     memset(output, 0, out_cap);   /* 清空, 避免上一轮残留泄漏 */
@@ -59,7 +57,7 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     char buf[16384];
     int need = snprintf(buf, sizeof(buf), "cmd /c %s", cmdline);
     if (need < 0 || (size_t)need >= sizeof(buf)) {
-        /* 命令超过缓冲上限: 拒绝执行, 而非静默跑一段被截断的危险命令 (item 7) */
+        /* 命令超过缓冲上限: 拒绝执行, 而非静默跑一段被截断的危险命令 */
         if (hStdIn != INVALID_HANDLE_VALUE) CloseHandle(hStdIn);
         CloseHandle(outR); CloseHandle(outW);
         if (out_cap) snprintf(output, out_cap,
@@ -157,5 +155,3 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     CloseHandle(pi.hThread);
     return (int)pos;
 }
-
-/* 把 WinHTTP/系统错误码翻译为中文可读文本。 */

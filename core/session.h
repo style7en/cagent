@@ -68,11 +68,6 @@ static CAGENT_MAYBE_UNUSED void migrate_legacy_sessions(void) {
     FindClose(h);
 }
 
-/* 记录最近使用的会话文件路径 (存内存全局, 随 config_save 持久化到 ini)。 */
-static void record_last_session(const char *path) {
-    snprintf(g_last_session, sizeof(g_last_session), "%s", path);
-}
-
 /* djb2 字符串哈希, 用于工作目录的稳定摘要 (防文件名超长/冲突) */
 static unsigned int djb2_hash(const char *s) {
     unsigned int h = 5381; int c;
@@ -127,7 +122,6 @@ static CAGENT_MAYBE_UNUSED void history_start_new(void) {
     g_history_file[0] = '\0';                  /* 下次保存时生成新文件 */
 }
 
-/* 把 messages 写入历史文件 (失败静默) */
 /* 返回首个顶层 JSON 对象的结束下标 (指向其闭合 '}' 之后)。
  * 正确处理字符串内的括号与转义。找不到返回 0。 */
 static size_t first_object_end(const char *s) {
@@ -175,11 +169,8 @@ static long find_messages_inner(const char *t, long *out_start, long *out_end) {
 /* 把文件文本重建进 messages: 始终以最新系统提示词开场, 再追加对话。
  * 支持两种格式: 自描述 {"workspace":...,"messages":[...]} 与旧版纯对话。
  * 返回 1 成功; 若含 workspace 则同步写回 g_workspace / g_active_ws。 */
-static int load_messages_from_text(const char *text, size_t len) {
-    /* 直接解析调用方传入的文本 (调用方已读全文件到堆缓冲), 不再用 256KB 栈副本、
-     * 也不做长度截断, 避免长会话历史被静默丢弃 (item A / P0)。
-     * messages 仍受 BUFSZ 容量限制, 这是架构上限而非此处引入。 */
-    (void)len;
+static int load_messages_from_text(const char *text) {
+    /* 解析调用方读入堆缓冲的完整文本, 不截断; messages 仍受 BUFSZ 容量上限约束。 */
     JValue *root = json_parse(text);
     if (root && root->type == J_OBJ) {
         const JValue *ws = json_obj_get(root, "workspace");
@@ -235,7 +226,7 @@ static void history_save(void) {
     if (g_history_file[0] == '\0')
         build_new_session_path(g_history_file, sizeof(g_history_file));
     const char *path = g_history_file;
-    /* 覆盖前先备份上次内容, 防止压缩摘要/异常写入导致原历史不可恢复 (item 6 / P0) */
+    /* 覆盖前先备份上次内容, 防止压缩摘要/异常写入导致原历史不可恢复 */
     {
         wchar_t wsrc[MAX_PATH], wbak[MAX_PATH];
         if (utf8_to_wide(path, wsrc, MAX_PATH) &&
@@ -255,14 +246,14 @@ static void history_save(void) {
     fputs("]}", f);
     free(wse);
     fclose(f);
-    record_last_session(path);
+    snprintf(g_last_session, sizeof(g_last_session), "%s", path);
 }
 
 /* 读取单个历史文件并重建 messages + 工作目录。返回 1 成功。 */
 static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
     FILE *f = fopen_utf8(path, "rb");
     if (!f) return 0;
-    /* 读全文件到堆缓冲: 会话可能超过 256KB, 栈缓冲截断会导致历史永久丢失 (item A / P0) */
+    /* 读全文件到堆缓冲: 会话可能超过 256KB, 栈缓冲截断会导致历史永久丢失 */
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
     long fsz = ftell(f);
     if (fsz < 0) { fclose(f); return 0; }
@@ -273,11 +264,11 @@ static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
     fclose(f);
     if (n == 0) { free(buf); return 0; }
     buf[n] = '\0';
-    int ok = load_messages_from_text(buf, n);
+    int ok = load_messages_from_text(buf);
     free(buf);
     if (ok) {
         snprintf(g_history_file, sizeof(g_history_file), "%s", path); /* 绑定本对话到该文件 */
-        record_last_session(path);
+        snprintf(g_last_session, sizeof(g_last_session), "%s", path);
     }
     return ok;
 }
@@ -330,8 +321,6 @@ static CAGENT_MAYBE_UNUSED void history_replay(void) {
     json_free(root);
 }
 
-/* 读取历史文件的元信息: 工作目录 + 首条 user 消息预览, 供 GUI 列表展示。
- * 成功返回 1; ws_out / prev_out 始终以 '\0' 结尾 (无则空字符串)。 */
 /* 旧格式文件提取首条 user 消息预览 (纯文本扫描, 不建 JSON 树)。 */
 static void extract_old_preview(const char *text, char *out, size_t cap) {
     out[0] = '\0';

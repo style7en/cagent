@@ -29,7 +29,7 @@ static int run_all_tests(void) {
     }
     CHK(utf8_trim_len("\xc4\xe3", 2) == 2);   /* 非 UTF-8 原样返回, 绝不能判死 */
 
-    /* ---- HTTP 重试判定 (缺口 ③) ---- */
+    /* ---- HTTP 重试判定 ---- */
     CHK(http_should_retry(-1) == 1);     /* 网络层错误 */
     CHK(http_should_retry(-2) == 0);     /* 取消 */
     CHK(http_should_retry(200) == 0);    /* 成功 */
@@ -65,7 +65,7 @@ static int run_all_tests(void) {
         /* 写一个测试文件 (ASCII, 合法 UTF-8) */
         tool_write_file("e.txt", "alpha\nbeta\ngamma\n");
         CHK(strstr(tool_out, "已写入") != NULL);
-        CHK(strstr(g_touched_files, "e.txt") != NULL);   /* 改过的文件要记账 (A6) */
+        CHK(strstr(g_touched_files, "e.txt") != NULL);   /* 改过的文件要记账 */
 
         /* 唯一匹配 -> 成功替换 */
         tool_edit_file("e.txt", "beta", "BETA");
@@ -106,7 +106,7 @@ static int run_all_tests(void) {
         g_workspace[0] = '\0';
     }
 
-    /* ---- 命令执行: 退出码 (A2) ---- */
+    /* ---- 命令执行: 退出码 ---- */
     {
         /* 无输出的命令也要能看到退出码, 否则模型只能靠猜命令是否成功 */
         dispatch_tool("execute_bash", "{\"command\":\"exit 3\"}", "");
@@ -116,7 +116,7 @@ static int run_all_tests(void) {
         CHK(strstr(tool_out, "[exit=0]") != NULL);
     }
 
-    /* ---- SSE: 超上限的 tool_calls 要记下 id/name (A3) ---- */
+    /* ---- SSE: 超上限的 tool_calls 要记下 id/name ---- */
     {
         StreamCtx *c = (StreamCtx*)calloc(1, sizeof(StreamCtx));
         CHK(c != NULL);
@@ -138,7 +138,7 @@ static int run_all_tests(void) {
         }
     }
 
-    /* ---- SSE: content 装不下要置截断标志并留出标记空间 (A4) ---- */
+    /* ---- SSE: content 装不下要置截断标志并留出标记空间 ---- */
     {
         StreamCtx *c = (StreamCtx*)calloc(1, sizeof(StreamCtx));
         CHK(c != NULL);
@@ -155,7 +155,7 @@ static int run_all_tests(void) {
         }
     }
 
-    /* ---- JSON: 递归深度上限, 不可让不可信输入栈溢出 (A5) ---- */
+    /* ---- JSON: 递归深度上限, 不可让不可信输入栈溢出 ---- */
     {
         char deep[512];
         int k = 0;
@@ -196,7 +196,7 @@ static int run_all_tests(void) {
         }
     }
 
-    /* ---- 沙箱: 路径穿越 / 越界必须被拒 (item 8) ---- */
+    /* ---- 沙箱: 路径穿越 / 越界必须被拒 ---- */
     {
         CreateDirectoryA("cagent_test_ws", NULL);
         strcpy(g_workspace, "cagent_test_ws");
@@ -217,7 +217,7 @@ static int run_all_tests(void) {
         g_workspace[0] = '\0';
     }
 
-    /* ---- 会话命名: 同秒冲突要能避开 (item 8) ---- */
+    /* ---- 会话命名: 同秒冲突要能避开 ---- */
     {
         char sp1[MAX_PATH], sp2[MAX_PATH];
         build_new_session_path(sp1, sizeof(sp1));

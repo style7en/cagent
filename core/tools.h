@@ -32,8 +32,6 @@ static void execute_bash(const char *command) {
         oem_to_utf8(tool_out, BUFSZ);
 }
 
-
-
 static void tool_read_file(const char *path, long long offset) {
     if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
     wchar_t wpath[MAX_PATH];
@@ -180,7 +178,6 @@ static void tool_write_file(const char *path, const char *content) {
     touch_file(path);
     snprintf(tool_out, BUFSZ, "(已写入 %zu 字节)", len);
 }
-
 
 /* 按名称分发一次工具调用: arguments 是字符串化 JSON。
  * 出错时把"可读的原因"写进 tool_out 交回模型 (缺失参数/非法 JSON/未知工具),

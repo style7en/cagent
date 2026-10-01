@@ -91,7 +91,7 @@ static int path_in_workspace(const char *path) {
     n = GetFullPathNameW(wws, MAX_PATH, wwsfull, NULL);
     if (n == 0 || n >= MAX_PATH) return 0;
     size_t wl = wcslen(wwsfull);
-    if (_wcsnicmp(wabs, wwsfull, wl) != 0) return 0;   /* 大小写不敏感, 避免盘符大小写不同被误拒 (item 5) */
+    if (_wcsnicmp(wabs, wwsfull, wl) != 0) return 0;   /* 大小写不敏感, 避免盘符大小写不同被误拒 */
     if (wabs[wl] != L'\\' && wabs[wl] != L'\0') return 0;
     return 1;
 }

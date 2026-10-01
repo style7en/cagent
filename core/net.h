@@ -25,7 +25,7 @@ static void http_set_err(char *out, size_t cap) {
     else snprintf(out, cap, "[网络错误] WinHTTP 错误 %lu", e);
 }
 
-/* ===== HTTP 重试/退避 (缺口 ③) =====
+/* ===== HTTP 重试/退避 =====
  * 网络抖动 (DNS/连接重置/超时/限流/5xx) 不应让整轮对话回滚。
  * 仅对"瞬时可恢复"的错误重试; 取消、成功、以及 4xx 客户端错误 (参数/鉴权问题,
  * 重试无益) 一律不重试。退避采用指数增长, 可用环境变量覆盖默认。 */
@@ -254,7 +254,7 @@ static int http_post_stream_once(const char *url, const char *api_key,
         return status;
     }
 
-    /* 流式读取 + SSE 解析 (linebuf 按需增长, 避免超长 SSE 行被截断丢弃, item 7) */
+    /* 流式读取 + SSE 解析 (linebuf 按需增长, 避免超长 SSE 行被截断丢弃) */
     size_t lbcap = 8192;
     char *linebuf = (char*)malloc(lbcap);
     int cancelled = 0;

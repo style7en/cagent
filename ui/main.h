@@ -60,10 +60,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
 
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
-    /* 不在此处 SetFocus: 启动时前台可能是其他程序, 此时给输入框焦点会导致光标
-     * 创建但不显示 (光标只在前台窗口显示), 且点击输入框不触发 WM_SETFOCUS
-     * (已有焦点), 光标永不出现。改为: 用户点击输入框时窗口被激活为前台,
-     * 焦点和光标同时正确创建。 */
+    /* 不在此 SetFocus(输入框): 启动时窗口未必是前台, 焦点会先于光标进入半初始化
+     * 状态且后续点击不触发 WM_SETFOCUS。详见 WndProc 的 WM_CREATE 注释。 */
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0)) {

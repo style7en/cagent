@@ -172,11 +172,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_key_decrypt_failed = 0;
         }
 
-        /* 不要在这里 SetFocus(g_hInput) —— 此时窗口尚未显示, 输入框会在
-         * "半初始化"状态下收到 WM_SETFOCUS: 光标创建但不可见, 且之后点击
-         * 输入框不会触发新的 WM_SETFOCUS (已有焦点), 光标永不出现。
-         * 保持不设焦点: 用户点击输入框时窗口已被激活为前台, 焦点和光标
-         * 同时正确创建。 */
+        /* 不要在这里 SetFocus(g_hInput): 窗口尚未显示, 输入框会在"光标创建但
+         * 不可见"的半初始化状态下拿到焦点, 且之后点击不再触发 WM_SETFOCUS
+         * (已有焦点), 光标永不出现。保持不设焦点, 由用户点击时自然建立。 */
         return 0;
     }
 
