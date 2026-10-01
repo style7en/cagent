@@ -56,18 +56,19 @@ static void do_append(const char *utf8, int role) {
     base.cbSize = sizeof(base);
     SendMessageW(g_hHistory, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&base);
 
-    /* 按角色叠加颜色: 用户=蓝加粗, 系统提示=灰斜体, AI=默认黑 */
+    /* 按角色叠加颜色: 用户=蓝加粗, 系统/思考提示=灰, AI=默认黑; 不斜体, 字号随基底。
+     * 注意必须显式清掉 CFE_AUTOCOLOR —— 它随插入点基底带来, 置位时 RichEdit 会忽略
+     * crTextColor, 颜色设置将完全无效 (症状: 所有文字都是系统黑)。同时压掉 ITALIC,
+     * 避免插入点周围残留的斜体格式传染给新文本。 */
     CHARFORMAT2W role_cf = base;
-    role_cf.dwMask |= CFM_COLOR;
+    role_cf.dwMask    |= CFM_COLOR | CFM_BOLD | CFM_ITALIC;
+    role_cf.dwEffects &= ~(CFE_AUTOCOLOR | CFE_BOLD | CFE_ITALIC);
     role_cf.crTextColor = RGB(0, 0, 0);            /* AI: 默认黑 */
     if (role == CAGENT_ROLE_USER) {
         role_cf.crTextColor = RGB(0, 90, 200);     /* 用户: 蓝 */
-        role_cf.dwMask   |= CFM_BOLD;
-        role_cf.dwEffects |= CFE_BOLD;
+        role_cf.dwEffects |= CFE_BOLD;             /* 用户: 加粗 */
     } else if (role == CAGENT_ROLE_SYS) {
-        role_cf.crTextColor = RGB(110, 110, 110);  /* 系统: 灰 */
-        role_cf.dwMask   |= CFM_ITALIC;
-        role_cf.dwEffects |= CFE_ITALIC;
+        role_cf.crTextColor = RGB(110, 110, 110);  /* 系统/思考: 灰 */
     }
 
     /* 按 run 插入: 连续 emoji 代理对为一段(用 Segoe UI Emoji), 其余为普通段 */
