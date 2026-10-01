@@ -115,6 +115,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_HISTORY, NULL, NULL);
         SendMessageW(g_hHistory, WM_SETFONT, (WPARAM)g_hFontHist, TRUE);
 
+        /* 收紧历史框行距: 用 PARAFORMAT2 设"精确"行距为字体字身高度(physical twips),
+           去除 RichEdit 默认额外行距; 按 LOGPIXELSY 换算以兼顾高 DPI。glyph 不会裁切。 */
+        {
+            PARAFORMAT2 pf;
+            memset(&pf, 0, sizeof(pf));
+            pf.cbSize = sizeof(pf);
+            pf.dwMask = PFM_LINESPACING;
+            pf.bLineSpacingRule = 4;          /* 精确行距 */
+            HDC hdc = GetDC(g_hHistory);
+            HFONT oldf = (HFONT)SelectObject(hdc, g_hFontHist);
+            TEXTMETRICW tm;
+            if (GetTextMetricsW(hdc, &tm)) {
+                int lpy = GetDeviceCaps(hdc, LOGPIXELSY);
+                pf.dyLineSpacing = (LONG)((LONGLONG)tm.tmHeight * 1440 / (lpy ? lpy : 96));
+            } else {
+                pf.dyLineSpacing = 18 * 15;   /* 兜底: 18px @96DPI */
+            }
+            if (oldf) SelectObject(hdc, oldf);
+            ReleaseDC(g_hHistory, hdc);
+            SendMessageW(g_hHistory, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+        }
+
         g_hInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL |
             ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
