@@ -53,9 +53,19 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
 
     /* 命令行必须转宽字符交给 CreateProcessW, 否则中文参数会被按 ANSI 解释 */
     char buf[16384];
-    snprintf(buf, sizeof(buf), "cmd /c %s", cmdline);
+    int need = snprintf(buf, sizeof(buf), "cmd /c %s", cmdline);
+    if (need < 0 || (size_t)need >= sizeof(buf)) {
+        /* 命令超过缓冲上限: 拒绝执行, 而非静默跑一段被截断的危险命令 (item 7) */
+        if (hStdIn != INVALID_HANDLE_VALUE) CloseHandle(hStdIn);
+        CloseHandle(outR); CloseHandle(outW);
+        if (out_cap) snprintf(output, out_cap,
+            "(命令过长, 已拒绝执行; 上限 %d 字节, 请拆分命令或写入脚本后运行)",
+            (int)sizeof(buf) - 1);
+        return -1;
+    }
     wchar_t wbuf[16384];
     if (MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf, 16384) <= 0) {
+        if (hStdIn != INVALID_HANDLE_VALUE) CloseHandle(hStdIn);
         CloseHandle(outR); CloseHandle(outW);
         return -1;
     }

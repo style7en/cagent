@@ -13,7 +13,7 @@
  *   net       WinHTTP 与 SSE 流式响应解析
  *   encoding  编码转换: UTF-8/OEM 检测与转换、字符边界
  *   workspace 工作目录解析、越界限制、UTF-8 文件/路径
- *   tools     结构化工具: execute_bash / read_file / write_file
+ *   tools     结构化工具: execute_bash / read_file / write_file / edit_file
  *   agent     Agent 循环: LLM <-> 工具调用、取消与回滚
  *   session   会话持久化: 存取 / 回放 / 多会话命名
  *   config    ini 配置读写 (含 DPAPI Key)
@@ -21,7 +21,7 @@
  * 与界面解耦: 通过一组宿主钩子 (cagent_emit / cagent_on_done / cagent_read_config_ui)
  * 与前端交互, 因此 Win32 GUI 复用同一段 Agent 循环。
  *
- * 设计取向 (对齐 pi.dev 的极简理念): 仅 3 个工具 (bash/read/write), 无权限弹窗,
+ * 设计取向 (对齐 pi.dev 的极简理念): 仅 4 个工具 (bash/read/write/edit_file), 无权限弹窗,
  * 无轮次上限, 由模型自行决定何时停止, 用户随时可用停止按钮取消。
  *
  * 使用方式: 前端 .c 文件 #include 本头文件, 并在调用 agent_thread / agent_turn
