@@ -375,11 +375,47 @@ static int run_all_tests(void) {
             tool_write_file("u8.txt", "aaaa\xe4\xbd\xa0\xe4\xbd\xa0\xe4\xbd\xa0");
             tool_read_file("u8.txt", 5);
             CHK(strcmp(tool_out, "你你") == 0);
+
+            /* offset 也接受数字字符串: "2" -> 从第 3 字节起 = "aa你你你" */
+            dispatch_tool("read_file", "{\"path\":\"u8.txt\",\"offset\":\"2\"}", "");
+            CHK(strcmp(tool_out, "aa你你你") == 0);
+
+            /* 非法字符串: 回退从头读 */
+            dispatch_tool("read_file", "{\"path\":\"u8.txt\",\"offset\":\"abc\"}", "");
+            CHK(strcmp(tool_out, "aaaa你你你") == 0);
+
             remove("cagent_test_ws/u8.txt");
         }
 
         RemoveDirectoryA("cagent_test_ws");
         g_workspace[0] = '\0';
+    }
+
+    /* ---- run_pipe / append_note 边界: 空/过小缓冲绝不越界写 ---- */
+    {
+        char sb[16];
+        size_t pos = 0;
+
+        /* out_cap=0: run_pipe 拒绝, append_note 直接忽略 */
+        CHK(run_pipe("echo x", NULL, 0) == -1);
+        strcpy(sb, "KEEP");
+        pos = 4;
+        append_note(sb, &pos, 0, "zz");
+        CHK(pos == 4 && strcmp(sb, "KEEP") == 0);
+
+        /* 放得下: 正常追加 */
+        snprintf(sb, sizeof(sb), "0123456789abc");      /* 13 字节 */
+        pos = 13;
+        append_note(sb, &pos, sizeof(sb), "xy");
+        CHK(pos == 15 && strcmp(sb, "0123456789abcxy") == 0);
+
+        /* 放不下: 回退旧内容, 保 note 完整 */
+        append_note(sb, &pos, sizeof(sb), "abcde");
+        CHK(pos == 15 && strcmp(sb, "0123456789abcde") == 0);
+
+        /* note 比整个缓冲还长: 截 note 而不是越界写 */
+        append_note(sb, &pos, sizeof(sb), "LONG-NOTE-1234567890");   /* 20 字节 */
+        CHK(pos == 15 && strcmp(sb, "LONG-NOTE-12345") == 0);
     }
 
     #undef CHK

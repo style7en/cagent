@@ -368,10 +368,16 @@ static CAGENT_MAYBE_UNUSED int session_read_meta(const char *path, char *ws_out,
     if (cnt_out) *cnt_out = 0;
     FILE *f = fopen_utf8(path, "rb");
     if (!f) return 0;
-    static char buf[BUFSZ];   /* 元信息读取缓冲: 改 static, 避免占 512KB 调用栈 (item 3) */
-    size_t n = fread(buf, 1, BUFSZ - 1, f);
+    /* 读全文件到堆: 会话可达 1MB+, 截断读取会让消息条数偏小 */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long fsz = ftell(f);
+    if (fsz <= 0) { fclose(f); return 0; }
+    rewind(f);
+    char *buf = (char*)malloc((size_t)fsz + 1);
+    if (!buf) { fclose(f); return 0; }
+    size_t n = fread(buf, 1, (size_t)fsz, f);
     fclose(f);
-    if (n == 0) return 0;
+    if (n == 0) { free(buf); return 0; }
     buf[n] = '\0';
 
     JValue *root = json_parse(buf);
@@ -394,6 +400,7 @@ static CAGENT_MAYBE_UNUSED int session_read_meta(const char *path, char *ws_out,
             }
         }
         json_free(root);
+        free(buf);
         return 1;
     }
     /* 旧格式 (纯对话文本): 逐字扫描统计 + 提取预览 */
@@ -407,6 +414,7 @@ static CAGENT_MAYBE_UNUSED int session_read_meta(const char *path, char *ws_out,
         for (const char *q = p; (q = strstr(q, "\"role\":")) != NULL; q += 7)
             (*cnt_out)++;
     extract_old_preview(p, prev_out, prev_cap);
+    free(buf);
     return 1;
 }
 

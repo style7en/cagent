@@ -128,7 +128,9 @@ static void tool_edit_file(const char *path, const char *old_text, const char *n
         return;
     }
 
-    /* 统计出现次数: 必须唯一, 避免改错位置 */
+    /* 统计出现次数: 必须唯一, 避免改错位置。
+     * 注: 按"非重叠"出现计数 (每次匹配后步进 strlen(old_text)),
+     * 如 old_text="aa" 在 "aaa" 中记 1 处而非 2 处。 */
     const char *hit = NULL; int count = 0;
     for (const char *p2 = buf; (p2 = strstr(p2, old_text)) != NULL; p2 += strlen(old_text)) {
         if (++count == 1) hit = p2;
@@ -195,10 +197,17 @@ static void dispatch_tool(const char *name, const char *args_json, const char *f
         } else if (strcmp(nm, "read_file") == 0) {
             const char *p = json_as_str(json_obj_get(argsj, "path"));
             if (p) {
-                /* offset 可选: 数字或数字字符串都接受, 缺省/非法一律从头读 */
+                /* offset 可选: 数字或数字字符串都接受 (模型偶发传 "4096" 而非 4096),
+                 * 缺省/非法一律从头读 */
                 const JValue *ov = json_obj_get(argsj, "offset");
                 long long off = 0;
-                if (ov && ov->type == J_NUM && ov->num > 0) off = (long long)ov->num;
+                if (ov && ov->type == J_NUM && ov->num > 0) {
+                    off = (long long)ov->num;
+                } else if (ov && ov->type == J_STR && ov->str && ov->str[0]) {
+                    char *end = NULL;
+                    long long v = strtoll(ov->str, &end, 10);
+                    if (v > 0 && end && *end == '\0') off = v;
+                }
                 tool_read_file(p, off);
             }
             else   snprintf(tool_out, BUFSZ, "(参数缺失: %s 需要字符串参数 \"path\")", nm);

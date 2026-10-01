@@ -241,6 +241,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
 
     case WM_DESTROY:
+        /* Agent 线程若仍在运行: 先请求取消并等它收尾 (history_save 在线程里执行,
+         * 直接退出可能把会话文件写一半)。有界等待 —— 服务端僵死时最多多等 5s,
+         * 不让关闭动作无限卡住; 超时则照常退出 (.bak 兜底)。 */
+        if (g_hThread) {
+            InterlockedExchange(&g_cancel, 1);
+            WaitForSingleObject(g_hThread, 5000);
+            CloseHandle(g_hThread);
+            g_hThread = NULL;
+        }
+        InterlockedExchange(&g_running, 0);
         config_save();
         if (g_hFont) DeleteObject(g_hFont);
         if (g_hFontHist) DeleteObject(g_hFontHist);

@@ -18,20 +18,24 @@ static int cmd_timeout_ms(void) {
  * 返回实际读到的字节数,启动进程失败返回 -1。超过 timeout 则终止整个进程树。 */
 static size_t utf8_trim_len(const char *s, size_t len);   /* 前向声明 */
 
-/* 追加一段提示到输出尾部: 空间不足时先回退内容(对齐字符边界), 保证提示一定可见 */
+/* 追加一段提示到输出尾部: 空间不足时先回退内容(对齐字符边界), 保证提示一定可见。
+ * out_cap 为 0 直接忽略; note 本身放不下时截短 note —— 绝不越界写。 */
 static void append_note(char *output, size_t *pos, size_t out_cap, const char *note) {
+    if (out_cap == 0) return;
     size_t nl = strlen(note);
     if (*pos + nl + 1 > out_cap) {
         size_t cut = (out_cap > nl + 1) ? (out_cap - nl - 1) : 0;
         *pos = utf8_trim_len(output, cut);
+        if (*pos + nl + 1 > out_cap)
+            nl = (*pos + 1 < out_cap) ? out_cap - *pos - 1 : 0;   /* note 也放不下: 截 note */
     }
-    memcpy(output + *pos, note, nl);
-    *pos += nl;
+    if (nl) { memcpy(output + *pos, note, nl); *pos += nl; }
     output[*pos] = '\0';
 }
 
 static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
-    if (out_cap) memset(output, 0, out_cap);   /* 清空, 避免上一轮残留泄漏 */
+    if (!output || out_cap == 0) return -1;   /* 无缓冲可写: 直接拒绝 (防御, 当前调用方恒传 16KB+) */
+    memset(output, 0, out_cap);   /* 清空, 避免上一轮残留泄漏 */
     HANDLE outR = NULL, outW = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
 

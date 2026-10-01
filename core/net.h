@@ -169,24 +169,36 @@ static int http_post_stream_once(const char *url, const char *api_key,
     else if (strncmp(p, "http://", 7) == 0) { p += 7; }
     else { snprintf(err_out, err_cap, "[网络错误] URL 非法"); return -1; }
 
-    const char *host_start = p;
-    const char *path_start = strchr(p, '/');
-    const char *port_start = strchr(p, ':');
-    const char *host_end;
+    const char *host_start, *host_end;
     INTERNET_PORT port = https ? 443 : 80;
-    if (port_start && (!path_start || port_start < path_start)) {
-        host_end = port_start;
-        port = (INTERNET_PORT)atoi(port_start + 1);
-    } else if (path_start) {
-        host_end = path_start;
+    const char *path_start = strchr(p, '/');
+    if (*p == '[') {
+        /* IPv6 字面量: http://[::1]/v1 或 http://[::1]:8080/v1
+         * 方括号内的 ':' 是地址组成, 不是端口分隔符。传给 WinHttpConnect 时
+         * 去掉方括号 (裸 IPv6 字面量可正常解析)。 */
+        const char *close = strchr(p, ']');
+        if (!close) { snprintf(err_out, err_cap, "[网络错误] URL 非法 (IPv6 方括号未闭合)"); return -1; }
+        host_start = p + 1;
+        host_end = close;
+        if (close[1] == ':') port = (INTERNET_PORT)atoi(close + 2);
     } else {
-        host_end = host_start + strlen(host_start);
+        const char *port_start = strchr(p, ':');
+        host_start = p;
+        if (port_start && (!path_start || port_start < path_start)) {
+            host_end = port_start;
+            port = (INTERNET_PORT)atoi(port_start + 1);
+        } else if (path_start) {
+            host_end = path_start;
+        } else {
+            host_end = host_start + strlen(host_start);
+        }
     }
     char host[256] = {0};
     size_t host_len = (size_t)(host_end - host_start);
     if (host_len >= sizeof(host)) { snprintf(err_out, err_cap, "[网络错误] 主机名过长"); return -1; }
     memcpy(host, host_start, host_len);
-    const char *path = path_start ? path_start : "/";
+    const char *slash = strchr(host_end, '/');
+    const char *path = slash ? slash : "/";
 
     WCHAR whost[256], wpath[1024];
     MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 256);
