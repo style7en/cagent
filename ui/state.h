@@ -24,6 +24,8 @@
 #define ID_SESS_CAN 2003   /* 取消 */
 
 #define WM_APP_APPEND  (WM_APP + 1)   /* wParam = role(int), lParam = UTF-8 char* (须 free) */
+#define WM_APP_STREAM  (WM_APP + 2)   /* wParam = 1: 新分段开始(清零计数); 0: 回删本分段 AI 文本
+                                       * 必须与 APP_APPEND 一样按 FIFO 投递, 不能跨线程 SendMessage */
 
 #define CFG_URL 0
 #define CFG_KEY 1
@@ -40,6 +42,7 @@ static HWND g_hCfg[3];                 /* [url, key, model] */
 static HWND g_hWorkspace, g_hWsBrowse; /* 工作目录 Edit + 浏览按钮 */
 static HFONT g_hFont;
 static HFONT g_hFontHist;
+static long g_stream_chars;      /* 当前分段已上屏的 AI 文本字符数(UTF-16), 供重试时回删 */
 static HANDLE g_hThread = NULL;
 static WNDPROC g_oldInputProc;
 static WNDPROC g_oldHistoryProc;

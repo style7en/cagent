@@ -13,9 +13,19 @@ static size_t tool_output_cap(void) {
     return (size_t)v;
 }
 
+/* 记录本轮改动过的文件: 对话可以回滚, 已落盘的改动不能, 回滚提示里要列清楚。 */
+static void touch_file(const char *path) {
+    size_t used = strlen(g_touched_files);
+    size_t need = strlen(path) + 2;
+    if (used + need >= sizeof(g_touched_files)) return;   /* 放不下就不再记, 不覆盖已有 */
+    snprintf(g_touched_files + used, sizeof(g_touched_files) - used, "%s, ", path);
+}
+
 static void execute_bash(const char *command) {
-    /* 极简理念: 不拦截命令, 由用户自己承担运行环境的风险 (建议跑在容器中)。 */
+    /* 极简理念: 不拦截命令, 由用户自己承担运行环境的风险 (建议跑在容器中)。
+     * run_pipe 会在输出末尾附 [exit=N], 模型据此判断命令成败。 */
     int n = run_pipe(command, tool_out, tool_output_cap());
+    if (n < 0) { strcpy(tool_out, "(命令启动失败: 无法创建进程)"); return; }
     if (n <= 0) { strcpy(tool_out, "(no output)"); return; }
     /* 输出已是合法 UTF-8 则原样保留, 否则才做 OEM(GBK) -> UTF-8 转换 */
     if (!is_valid_utf8((const unsigned char *)tool_out, (size_t)n))
@@ -132,6 +142,7 @@ static void tool_edit_file(const char *path, const char *old_text, const char *n
     fwrite(nw, 1, nsz, w);
     fclose(w);
     free(nw);
+    touch_file(path);
     snprintf(tool_out, BUFSZ, "(已完成定点替换: %s, %lld 字节 -> %zu 字节)", path, fsz, nsz);
 }
 
@@ -144,6 +155,7 @@ static void tool_write_file(const char *path, const char *content) {
     size_t len = strlen(content);
     fwrite(content, 1, len, f);
     fclose(f);
+    touch_file(path);
     snprintf(tool_out, BUFSZ, "(已写入 %zu 字节)", len);
 }
 

@@ -100,5 +100,6 @@ static void do_append(const char *utf8, int role) {
     }
     SendMessageW(g_hHistory, EM_SCROLLCARET, 0, 0);
     SendMessageW(g_hHistory, WM_VSCROLL, SB_BOTTOM, 0);   /* 强制滚到末尾 */
+    if (role == CAGENT_ROLE_AI) g_stream_chars += total;  /* 供重试时回删本分段 */
     free(wbuf);
 }

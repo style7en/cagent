@@ -20,6 +20,9 @@ static char g_active_ws[MAX_PATH] = "";/* 当前已加载历史所对应的工�
 static char g_last_session[MAX_PATH] = ""; /* 最近使用的会话文件 (持久化到 ini) */
 static char g_history_file[MAX_PATH] = ""; /* 当前对话绑定的会话文件 (懒生成) */
 
+/* 本轮改动过的文件路径 (work线程用, 回滚时列给用户看: 对话能回滚, 文件不能) */
+static char g_touched_files[1024] = "";
+
 /* Agent 工作缓冲(只在工作线程使用,主线程不碰) */
 static char messages[BUFSZ];
 static char body[BUFSZ];

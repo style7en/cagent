@@ -13,6 +13,7 @@ selftest.txt
 # 对话历史 (运行时生成, 按工作目录分文件)
 cagent_history.json
 history_*.json
+sessions/
 
 # 工作区数据 (记忆/日志, 非源码)
 .workbuddy/

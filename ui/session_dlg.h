@@ -38,11 +38,12 @@ static void ws_from_filename(const char *path, char *out, size_t cap) {
     out[o] = '\0';
 }
 
-/* 枚举 exe 目录下所有 history_*.json, 记录路径与元信息 (目录/条数/时间/预览)。 */
-static int sess_enumerate(const char *exedir) {
+/* 枚举会话目录 (sessions\) 下所有 history_*.json, 记录路径与元信息 (目录/条数/时间/预览)。
+ * dir 需以 \ 结尾。 */
+static int sess_enumerate(const char *dir) {
     g_sess_n = 0;
     char pat[MAX_PATH];
-    snprintf(pat, sizeof(pat), "%shistory_*.json", exedir);
+    snprintf(pat, sizeof(pat), "%shistory_*.json", dir);
     wchar_t wpat[MAX_PATH];
     if (!utf8_to_wide(pat, wpat, MAX_PATH)) return 0;
     WIN32_FIND_DATAW fd;
@@ -52,7 +53,7 @@ static int sess_enumerate(const char *exedir) {
         if (g_sess_n >= 64) break;
         char name[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof(name), NULL, NULL);
-        snprintf(g_sess_paths[g_sess_n], MAX_PATH, "%s%s", exedir, name);
+        snprintf(g_sess_paths[g_sess_n], MAX_PATH, "%s%s", dir, name);
 
         char ws[160], prev[200];
         int cnt = 0;
@@ -200,9 +201,9 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 /* 弹出历史会话选择窗口 (非模态), 立即返回; 载入动作由对话框自身完成。 */
 static void show_session_dialog(HWND owner) {
     if (g_sess_dlg) { SetForegroundWindow(g_sess_dlg); return; }  /* 已打开 */
-    char exedir[MAX_PATH];
-    get_app_path(exedir, sizeof(exedir), "");   /* exe 目录 (含结尾 \) */
-    if (sess_enumerate(exedir) == 0) {
+    char sessdir[MAX_PATH];
+    sessions_dir(sessdir, sizeof(sessdir));    /* sessions\ (含结尾 \), 不存在时已自动创建 */
+    if (sess_enumerate(sessdir) == 0) {
         MessageBoxW(owner, L"没有已保存的历史会话。", L"历史会话", MB_OK | MB_ICONINFORMATION);
         return;
     }

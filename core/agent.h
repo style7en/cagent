@@ -27,7 +27,7 @@ typedef struct { char user_msg[BUFSZ]; } AgentTask;
 /* messages 缓冲水位线: 接近上限时整轮对话重置, 防止越界. */
 #define MESSAGES_WATERMARK  ((BUFSZ * 3) / 4)
 
-static const char *ROLLBACK_HINT = "\r\n(本轮已回滚, 不影响后续对话)\r\n";
+static const char *ROLLBACK_HINT = "\r\n(本轮对话已回滚, 不影响后续对话; 已执行的文件改动不会自动撤销)\r\n";
 
 /* 初始化 messages 为只含 system prompt 的状态。 */
 static void reset_conversation(void) {
@@ -72,6 +72,7 @@ static int compact_conversation(void) {
     StreamCtx *sctx = (StreamCtx*)calloc(1, sizeof(StreamCtx));
     if (!sctx) { free(bodybuf); return 0; }
     char err[512]; err[0] = '\0';
+    if (cagent_stream_begin) cagent_stream_begin();
     int status = http_post_stream(url, g_api_key, bodybuf, strlen(bodybuf), err, sizeof(err), sctx);
     free(bodybuf);
 
@@ -102,6 +103,7 @@ static int compact_conversation(void) {
  * 用户消息的界面回显由前端负责 (核心不管渲染)。 */
 static void agent_turn(const char *user_msg) {
     InterlockedExchange(&g_cancel, 0);          /* 清除取消标志 */
+    g_touched_files[0] = '\0';                  /* 本轮改动记录重新计 (回滚提示要引用) */
 
     /* 1. 若历史接近溢出: 先尝试压缩为摘要继续, 压缩失败才另起新会话(旧会话文件保留) */
     if (strlen(messages) > MESSAGES_WATERMARK) {
@@ -155,6 +157,7 @@ static void agent_turn(const char *user_msg) {
         char full_url[1280];
         chat_completions_url(full_url, sizeof(full_url));
 
+        if (cagent_stream_begin) cagent_stream_begin();   /* 标记新分段, 供重试时回删 */
         int status = http_post_stream(full_url, g_api_key, body, strlen(body),
                                       resp, BUFSZ, &ctx);
 
@@ -178,14 +181,23 @@ static void agent_turn(const char *user_msg) {
         else if (strcmp(ctx.finish, "content_filter") == 0)
             append_text("(内容被服务端的过滤策略拦截)\r\n");
 
-        if (ctx.n_calls > 0) {
+        /* content 装不下时: 给记录里的内容补一条截断标记 (界面已完整显示),
+         * 否则模型下一轮看不到自己说过什么, 却以为说完了。 */
+        if (ctx.truncated) {
+            strncat(ctx.content_buf,
+                    "\n...(回复过长, 超出缓冲上限, 上文只记录了前半部分)",
+                    CONTENT_TAIL_RESERVE - 1);
+            append_text("(模型回复过长, 上文只记录了前半部分)\r\n");
+        }
+
+        if (ctx.n_calls > 0 || ctx.n_dropped > 0) {
             /* 有 tool_calls: 从 ctx.calls 转 ToolCall 并执行 */
             typedef struct {
                 char id[256]; char name[64]; char args[ARGS_MAX]; char *output;
             } ToolCall;
-            ToolCall calls[8];
+            ToolCall calls[STREAM_CALLS_MAX];
             int n_calls = 0;
-            for (int i = 0; i < ctx.n_calls && n_calls < 8; i++) {
+            for (int i = 0; i < ctx.n_calls && n_calls < STREAM_CALLS_MAX; i++) {
                 if (!ctx.calls[i].name[0]) continue;
                 ToolCall *c = &calls[n_calls++];
                 c->id[0] = c->name[0] = c->args[0] = '\0';
@@ -194,7 +206,7 @@ static void agent_turn(const char *user_msg) {
                 snprintf(c->name, sizeof(c->name), "%s", ctx.calls[i].name);
                 snprintf(c->args, sizeof(c->args), "%s", ctx.calls[i].args);
             }
-            if (n_calls == 0) {
+            if (n_calls == 0 && ctx.n_dropped == 0) {
                 append_text("(tool_calls 解析失败)\r\n");
                 append_text(ROLLBACK_HINT);
                 rolled_back = 1;
@@ -230,6 +242,15 @@ static void agent_turn(const char *user_msg) {
             }
         }
 
+        /* 超上限被丢弃的调用: 界面如实说明"没执行", 与下面回填的 tool 结果一致 */
+        for (int i = 0; i < ctx.n_dropped; i++) {
+            char line[512];
+            snprintf(line, sizeof(line),
+                     "[Tool] %s -> 未执行 (超出单轮 %d 个并行调用上限, 请分批调用)\r\n",
+                     ctx.dropped[i].name[0] ? ctx.dropped[i].name : "?", STREAM_CALLS_MAX);
+            append_text(line);
+        }
+
         /* 第二遍: 写 assistant 消息 (含所有 tool_calls 数组)。
          * content 保留模型本轮的自然语言说明: 否则下一轮它看不到自己说过什么。
          * 说明文字过大放不下时退化为空串 (不影响工具调用本身)。 */
@@ -262,6 +283,20 @@ static void agent_turn(const char *user_msg) {
             if (n2 <= 0 || (size_t)n2 >= BUFSZ - len) { ok = 0; }
         }
 
+        /* 超上限被丢弃的调用也回填占位 tool_call: 否则模型以为它们已经执行过了 */
+        for (int i = 0; ok && i < ctx.n_dropped; i++) {
+            char *esc_id   = json_escape_alloc(ctx.dropped[i].id);
+            char *esc_name = json_escape_alloc(ctx.dropped[i].name[0] ? ctx.dropped[i].name : "unknown");
+            if (!esc_id || !esc_name) { ok = 0; free(esc_id); free(esc_name); break; }
+            size_t len = strlen(messages);
+            int n2 = snprintf(messages + len, BUFSZ - len,
+                "%s{\"id\":\"%s\",\"type\":\"function\","
+                "\"function\":{\"name\":\"%s\",\"arguments\":\"{}\"}}",
+                (i > 0 || n_calls > 0) ? "," : "", esc_id, esc_name);
+            free(esc_id); free(esc_name);
+            if (n2 <= 0 || (size_t)n2 >= BUFSZ - len) { ok = 0; }
+        }
+
         if (ok) {
             size_t len = strlen(messages);
             int n2 = snprintf(messages + len, BUFSZ - len, "]}");
@@ -279,6 +314,20 @@ static void agent_turn(const char *user_msg) {
                 ",{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"%s\"}",
                 esc_id, esc_out);
             free(esc_id); free(esc_out);
+            if (n2 <= 0 || (size_t)n2 >= BUFSZ - len) ok = 0;
+        }
+
+        /* 丢弃的调用: 回一条"未执行"的 tool 结果, 模型才知道要分批重来 */
+        for (int i = 0; ok && i < ctx.n_dropped; i++) {
+            char *esc_id = json_escape_alloc(ctx.dropped[i].id);
+            if (!esc_id) { ok = 0; break; }
+            size_t len = strlen(messages);
+            int n2 = snprintf(messages + len, BUFSZ - len,
+                ",{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":"
+                "\"(未执行: 本轮并行工具调用超过 %d 个上限, 这一次没有运行; "
+                "请减少一次发出的调用数量, 分多轮执行)\"}",
+                esc_id, STREAM_CALLS_MAX);
+            free(esc_id);
             if (n2 <= 0 || (size_t)n2 >= BUFSZ - len) ok = 0;
         }
 
@@ -324,6 +373,14 @@ static void agent_turn(const char *user_msg) {
 done:
     if (rolled_back) {
         messages[savepoint] = '\0';
+        /* 对话回滚了, 但文件已经改了 —— 说清楚并列出改了哪些, 免得用户以为也还原了 */
+        if (g_touched_files[0]) {
+            char note[1200];
+            snprintf(note, sizeof(note),
+                     "(注意: 本轮已改动的文件不会随对话一起还原: %s)\r\n",
+                     g_touched_files);
+            append_text(note);
+        }
     }
     history_save();   /* 每轮 done 后保存 (含回滚后状态) */
 }

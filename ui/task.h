@@ -21,6 +21,20 @@ static void start_task(HWND hwnd) {
     read_edit_utf8(g_hCfg[CFG_KEY], g_api_key, sizeof(g_api_key));
     read_edit_utf8(g_hCfg[CFG_MDL], g_model,   sizeof(g_model));
     read_edit_utf8(g_hWorkspace, g_workspace, sizeof(g_workspace));
+
+    /* 工作目录必须存在且是目录: 否则 SetCurrentDirectoryW 静默失败, 命令会落在上一个
+     * CWD 上, 而 path_in_workspace 又按 g_workspace 放行 —— 校验基准和执行位置分家。 */
+    {
+        wchar_t wchk[MAX_PATH];
+        if (!utf8_to_wide(g_workspace, wchk, MAX_PATH)) wchk[0] = L'\0';
+        DWORD attr = wchk[0] ? GetFileAttributesW(wchk) : INVALID_FILE_ATTRIBUTES;
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            MessageBoxW(hwnd, L"工作目录为空或不存在, 请重新选择。", L"工作目录无效",
+                        MB_OK | MB_ICONWARNING);
+            return;
+        }
+    }
+
     if (g_active_ws[0] && strcmp(g_workspace, g_active_ws) != 0) {
         /* 工作目录已变更: 当前对话落盘保留, 另起新会话 (不自动加载历史) */
         if (strlen(messages) > strlen(SYSTEM_PROMPT)) history_save();
@@ -37,7 +51,11 @@ static void start_task(HWND hwnd) {
     }
 
     wchar_t wws[MAX_PATH];
-    if (utf8_to_wide(g_workspace, wws, MAX_PATH)) SetCurrentDirectoryW(wws);
+    if (utf8_to_wide(g_workspace, wws, MAX_PATH) && !SetCurrentDirectoryW(wws)) {
+        MessageBoxW(hwnd, L"无法切换到该工作目录, 请检查权限。", L"工作目录无效",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
 
     WCHAR *wbuf = (WCHAR*)malloc((size_t)(wlen + 1) * sizeof(WCHAR));
     GetWindowTextW(g_hInput, wbuf, wlen + 1);

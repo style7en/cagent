@@ -32,6 +32,14 @@ static void (*cagent_emit)(const char *utf8, int role) = NULL;  /* 输出一段�
 static void (*cagent_on_done)(void) = NULL;                   /* 一轮 Agent 结束 */
 static void (*cagent_read_config_ui)(void) = NULL;            /* 从 UI 同步配置到全局 */
 
+/* 流式分段控制: 每次发起流式请求前调 begin 标记新分段;
+ * 请求失败重试前调 undo 回删本分段已上屏的内容 —— 否则重试会把半截回复和完整回复
+ * 拼在一起, 界面显示的和实际写进 messages 的对不上。前端必须按调用顺序投递
+ * (与 emit 一样走消息队列, 不能用跨线程 SendMessage, 否则会插队打乱顺序)。
+ * 未设置钩子时安全降级: 只增不删。 */
+static void (*cagent_stream_begin)(void) = NULL;
+static void (*cagent_stream_undo)(void) = NULL;
+
 /* 安全的输出封装: 前端只需提供 cagent_emit。默认按 SYS 角色输出。 */
 static void append_text(const char *utf8) {
     if (cagent_emit) cagent_emit(utf8, CAGENT_ROLE_SYS);

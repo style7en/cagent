@@ -112,9 +112,12 @@ static int json_selftest(void) {
 
 /* —— 真实实现 —— */
 
+#define JSON_MAX_DEPTH 64   /* 递归深度上限: 响应是不可信输入, 无界递归会栈溢出 */
+
 typedef struct {
     const char *p;
     int ok;
+    int depth;               /* 当前嵌套深度 (进入容器时 +1, 返回时 -1) */
 } JParser;
 
 static void json_skip_ws(JParser *ps) {
@@ -273,8 +276,13 @@ static JValue *json_parse_value(JParser *ps) {
         v->str = s;
         return v;
     }
-    if (c == '{') return json_parse_object(ps);
-    if (c == '[') return json_parse_array(ps);
+    if (c == '{' || c == '[') {
+        if (ps->depth >= JSON_MAX_DEPTH) { ps->ok = 0; return NULL; }
+        ps->depth++;
+        JValue *v = (c == '{') ? json_parse_object(ps) : json_parse_array(ps);
+        ps->depth--;
+        return v;
+    }
     if (c == 't') {
         if (strncmp(ps->p,"true",4)==0) { ps->p+=4; JValue *v=json_new(J_BOOL); if(v)v->b=1; return v; }
         ps->ok=0; return NULL;
@@ -302,7 +310,7 @@ static JValue *json_parse_value(JParser *ps) {
 
 JValue *json_parse(const char *text) {
     if (!text) return NULL;
-    JParser ps = { text, 1 };
+    JParser ps = { text, 1, 0 };
     /* 跳过 UTF-8 BOM */
     if ((unsigned char)text[0]==0xEF && (unsigned char)text[1]==0xBB && (unsigned char)text[2]==0xBF)
         ps.p = text + 3;

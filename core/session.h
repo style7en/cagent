@@ -16,6 +16,58 @@ static void get_app_path(char *out, size_t cap, const char *filename) {
 
 static void get_ini_path(char *out, size_t cap)     { get_app_path(out, cap, "cagent.ini"); }
 
+/* 会话目录: <exe>\sessions\ (与 get_app_path(x, "") 一样以 \ 结尾, 便于直接拼文件名)。
+ * 首次使用时创建; 建不出来 (目录被占用/只读) 则退回 exe 目录, 保证对话仍能存盘。 */
+static void sessions_dir(char *out, size_t cap) {
+    char base[MAX_PATH];
+    get_app_path(base, sizeof(base), "");
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), "%ssessions", base);
+
+    int ok = 0;
+    wchar_t wdir[MAX_PATH];
+    if (utf8_to_wide(dir, wdir, MAX_PATH)) {
+        CreateDirectoryW(wdir, NULL);                 /* 已存在会失败, 忽略 */
+        DWORD attr = GetFileAttributesW(wdir);
+        ok = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+    }
+    snprintf(out, cap, "%s", ok ? dir : base);
+
+    size_t n = strlen(out);
+    if (n > 0 && out[n - 1] != '\\' && n + 1 < cap) { out[n] = '\\'; out[n + 1] = '\0'; }
+}
+
+/* 把散落在 exe 目录的旧会话 (history_*.json) 一次性搬进 sessions\。
+ * 只移动不改内容; 目标已存在则跳过 (不覆盖); 同步更新 ini 里记录的 last_session。 */
+static CAGENT_MAYBE_UNUSED void migrate_legacy_sessions(void) {
+    char root[MAX_PATH], dstdir[MAX_PATH], pat[MAX_PATH];
+    get_app_path(root, sizeof(root), "");
+    sessions_dir(dstdir, sizeof(dstdir));
+    if (strcmp(root, dstdir) == 0) return;            /* 退回模式: 无处可搬 */
+
+    snprintf(pat, sizeof(pat), "%shistory_*.json", root);
+    wchar_t wpat[MAX_PATH];
+    if (!utf8_to_wide(pat, wpat, MAX_PATH)) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char name[MAX_PATH];
+        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof(name), NULL, NULL);
+        char src[MAX_PATH], dst[MAX_PATH];
+        snprintf(src, sizeof(src), "%s%s", root, name);
+        snprintf(dst, sizeof(dst), "%s%s", dstdir, name);
+        wchar_t wsrc[MAX_PATH], wdst[MAX_PATH];
+        if (!utf8_to_wide(src, wsrc, MAX_PATH) || !utf8_to_wide(dst, wdst, MAX_PATH)) continue;
+        if (GetFileAttributesW(wdst) != INVALID_FILE_ATTRIBUTES) continue;   /* 已搬过 */
+        if (!MoveFileW(wsrc, wdst)) continue;                                  /* 没权限等, 留在原地 */
+        if (g_last_session[0] && strcmp(g_last_session, src) == 0)
+            snprintf(g_last_session, sizeof(g_last_session), "%s", dst);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
 /* 记录最近使用的会话文件路径 (存内存全局, 随 config_save 持久化到 ini)。 */
 static void record_last_session(const char *path) {
     snprintf(g_last_session, sizeof(g_last_session), "%s", path);
@@ -47,18 +99,20 @@ static void ws_to_histname(const char *ws, char *out, size_t cap) {
     snprintf(out, cap, "history_%s_%08X.json", san, djb2_hash(ws));
 }
 
-/* 为新会话生成一个不存在的会话文件路径 (工作目录 + 哈希 + 时间戳, 支持同目录多会话) */
+/* 为新会话生成一个不存在的会话文件路径 (sessions 目录 + 工作目录哈希 + 时间戳, 支持多会话) */
 static void build_new_session_path(char *out, size_t cap) {
     char base[256];
     ws_to_histname(g_workspace, base, sizeof(base));
     base[strlen(base) - 5] = '\0';             /* 去掉 ".json" */
+    char dir[MAX_PATH];
+    sessions_dir(dir, sizeof(dir));
     for (int n = 0; ; n++) {
         char name[300];
         if (n == 0)
             snprintf(name, sizeof(name), "%s_%lld.json", base, (long long)time(NULL));
         else
             snprintf(name, sizeof(name), "%s_%lld_%d.json", base, (long long)time(NULL), n);
-        get_app_path(out, cap, name);
+        snprintf(out, cap, "%s%s", dir, name);
         FILE *test = fopen_utf8(out, "rb");
         if (!test) return;                     /* 不存在 -> 可用 */
         fclose(test);

@@ -88,6 +88,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_hCfg[CFG_KEY], EM_SETPASSWORDCHAR, (WPARAM)'*', 0);
 
         config_load();
+        migrate_legacy_sessions();   /* 旧版散落在 exe 目录的会话搬进 sessions\ */
         set_edit_utf8(g_hCfg[CFG_URL], g_api_url);
         set_edit_utf8(g_hCfg[CFG_KEY], g_api_key);
         set_edit_utf8(g_hCfg[CFG_MDL], g_model);
@@ -254,6 +255,19 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         char *txt = (char*)lp;
         do_append(txt, (int)wp);
         free(txt);
+        return 0;
+    }
+    if (msg == WM_APP_STREAM) {
+        if (wp == 1) {
+            g_stream_chars = 0;
+        } else if (g_stream_chars > 0) {
+            /* -1 表示选到真正的末尾, 避免 GetWindowTextLengthW 的估算误差留下残尾 */
+            long start = GetWindowTextLengthW(h) - g_stream_chars;
+            if (start < 0) start = 0;
+            SendMessageW(h, EM_SETSEL, start, -1);
+            SendMessageW(h, EM_REPLACESEL, FALSE, (LPARAM)L"");
+            g_stream_chars = 0;
+        }
         return 0;
     }
     if (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL ||

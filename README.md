@@ -10,6 +10,7 @@
 cagent/
 ├── Makefile            # 构建脚本
 ├── cagent.ini          # 配置文件 (首次启动后自动生成)
+├── sessions/           # 历史会话 (运行时生成, 首次保存时自动创建; 旧版散落的 history_*.json 启动时自动搬入)
 ├── cagent_ui.c         # 界面聚合入口 (仅按依赖顺序 include ui/)
 ├── cagent_core.h       # 核心聚合入口 (仅按依赖顺序 include core/)
 ├── core/               # 平台无关核心, 按子功能拆分 (单 TU, 全 static)
@@ -143,7 +144,7 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
   model=deepseek-v4-flash
   skip_cert_verify=0
   workspace=C:\path\to\workspace
-  last_session=history_<工作目录>_<哈希>.json
+  last_session=sessions\history_<工作目录>_<哈希>.json
   ```
 
 ### 操作
@@ -167,13 +168,13 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
 | 静默工具执行 | `CreateProcess + CREATE_NO_WINDOW + 匿名管道`,不弹 cmd 黑框 |
 | 纯内存 IO | 无 `req.json`/`resp.json` 临时文件 |
 | 配置持久化 | 启动加载/退出保存 `cagent.ini` |
-| 协作式取消 | Agent 运行时"发送"按钮变"停止",点击后在迭代间隙优雅退出并回滚本轮历史 |
+| 协作式取消 | Agent 运行时"发送"按钮变"停止",点击后在迭代间隙优雅退出并回滚本轮**对话**;已执行的文件改动不会撤销,回滚提示会列出改过哪些文件 |
 | 网络错误诊断 | WinHTTP 错误码翻译为中文(DNS/连接/超时/SSL 证书),便于排错 |
-| 网络重试/退避 | 网络抖动(连接重置/超时/限流/5xx)自动指数退避重试,避免整轮对话回滚;取消与 4xx 客户端错误不重试 |
+| 网络重试/退避 | 网络抖动(连接重置/超时/限流/5xx)自动指数退避重试,避免整轮对话回滚;取消与 4xx 客户端错误不重试;重试前**回删已上屏的半截回复**,界面不会出现两段重复内容 |
 | API Key 加密 | DPAPI (`CryptProtectData`) 加密存储 `cagent.ini` 中的 Key,明文不入盘 |
-| 工作目录隔离 | 文件工具仅限工作目录内(路径强制解析),越界访问被拒绝 |
+| 工作目录隔离 | 文件工具仅限工作目录内(路径强制解析),越界访问被拒绝;**不解析符号链接/junction**,工作目录内指向外部的链接可绕过该限制,需要真正隔离请用容器/虚拟机;启动前会校验工作目录确实存在 |
 | 命令执行超时 | `run_pipe` 默认 60s,超时经作业对象终止整个进程树,避免长时间卡死(可用 `CAGENT_CMD_TIMEOUT` 以秒覆盖) |
-| 对话历史持久化 | 每轮 done 后按工作目录保存 `history_*.json`;启动不自动加载,通过"加载会话"按钮按需载入并按角色回放到界面 |
+| 对话历史持久化 | 每轮 done 后按工作目录存到 `sessions\history_*.json`(不污染根目录);启动不自动加载,通过"加载会话"按钮按需载入并按角色回放到界面 |
 | RichEdit 显示 | 历史框用 RICHEDIT50W,按角色分色;emoji 区段显式指定 Segoe UI Emoji 字体 |
 | 流式 SSE | LLM 响应逐字流式显示(`stream:true`),工具调用 delta 累积 |
 
@@ -182,7 +183,9 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
 目前内置(对齐 pi.dev 的极简理念,核心只保留 3 个工具):
 
 - `execute_bash(command)` — 执行 shell 命令并捕获输出(不拦截,由用户自担风险);
-  默认超时 60s(超时杀掉整个进程树),输出超限自动截断并附提示
+  默认超时 60s(超时杀掉整个进程树),输出超限自动截断并附提示;
+  输出末尾附 `[exit=N]` **退出码**,模型据此判断命令成败;`stdin` 给 `NUL`(读到即 EOF),
+  交互式命令跑不起来而不是挂到超时
 - `read_file(path)` — 读取文件文本内容;非 UTF-8(如 GBK)文本会自动转成 UTF-8;
   超过上限时截断并告知文件总大小与续读方式
 - `edit_file(path, old_text, new_text)` — **定点替换编辑**(改局部内容的首选):`old_text`

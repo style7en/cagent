@@ -13,8 +13,9 @@ static int cmd_timeout_ms(void) {
 }
 
 /* 用 CreateProcess + 匿名管道静默运行命令(仅本地工具用),纯内存收发数据。
- * 子进程的 stdout+stderr 合并写入 output (含 \0)。
- * 返回实际读到的字节数,失败返回 -1。超过 timeout 则终止整个进程树。 */
+ * 子进程的 stdout+stderr 合并写入 output (含 \0), 末尾附一行 [exit=N] 退出码,
+ * 便于调用方判断命令成败 (超时场景不附, 已有"已终止"提示)。
+ * 返回实际读到的字节数,启动进程失败返回 -1。超过 timeout 则终止整个进程树。 */
 static size_t utf8_trim_len(const char *s, size_t len);   /* 前向声明 */
 
 /* 追加一段提示到输出尾部: 空间不足时先回退内容(对齐字符边界), 保证提示一定可见 */
@@ -42,7 +43,11 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    /* stdin 给 NUL (读到即 EOF): GUI 无控制台, GetStdHandle(STD_INPUT_HANDLE) 是无效的,
+     * 子进程拿到它行为不确定; 工具执行的命令本就不该读交互输入。 */
+    HANDLE hStdIn = CreateFileW(L"NUL", GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    si.hStdInput  = (hStdIn != INVALID_HANDLE_VALUE) ? hStdIn : NULL;
     si.hStdOutput = outW;
     si.hStdError  = outW;
 
@@ -58,9 +63,11 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     PROCESS_INFORMATION pi = {0};
     if (!CreateProcessW(NULL, wbuf, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        if (hStdIn != INVALID_HANDLE_VALUE) CloseHandle(hStdIn);
         CloseHandle(outR); CloseHandle(outW);
         return -1;
     }
+    if (hStdIn != INVALID_HANDLE_VALUE) CloseHandle(hStdIn);   /* 子进程已拿到自己的副本 */
     CloseHandle(outW);
 
     /* 作业对象: 超时统一杀死进程树 (含 cmd 派生的子进程) */
@@ -79,7 +86,7 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     char tmp[8192];
     int timedout = 0, truncated = 0;
     int timeout = cmd_timeout_ms();
-    DWORD deadline = GetTickCount() + (DWORD)timeout;
+    ULONGLONG deadline = GetTickCount64() + (ULONGLONG)timeout;   /* 64 位, 不受 49.7 天回绕影响 */
 
     /* 持续抽干管道直到子进程退出或超时。
      * 关键 1: 即使输出缓冲已满也必须继续读并丢弃多余数据, 否则子进程写满管道后会阻塞,
@@ -87,7 +94,7 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
      * 关键 2: PeekNamedPipe 在写端关闭后即失败(即使管道内仍有缓冲数据), 因此失败时必须
      *         改用 ReadFile 读净残留, 否则"写得快、退出快"的命令会整段丢输出。 */
     for (;;) {
-        if (GetTickCount() >= deadline) { timedout = 1; break; }
+        if (GetTickCount64() >= deadline) { timedout = 1; break; }
         DWORD avail = 0;
         if (!PeekNamedPipe(outR, NULL, 0, NULL, &avail, NULL)) {
             /* 写端已关闭: 读净缓冲中剩余数据, 读完即结束 */
@@ -122,6 +129,14 @@ static int run_pipe(const char *cmdline, char *output, size_t out_cap) {
     }
 
     WaitForSingleObject(pi.hProcess, timedout ? 2000 : INFINITE);
+    /* 退出码交给调用方判断命令成败 (超时已单独提示, 不附) */
+    if (!timedout) {
+        DWORD exit_code = 0;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        char note[40];
+        snprintf(note, sizeof(note), "\n[exit=%lu]", (unsigned long)exit_code);
+        append_note(output, &pos, out_cap, note);
+    }
     if (hJob) CloseHandle(hJob);
     CloseHandle(outR);
     CloseHandle(pi.hProcess);

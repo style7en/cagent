@@ -75,29 +75,80 @@ typedef struct {
     char args[ARGS_MAX];   /* arguments 片段累积 */
 } StreamToolCall;
 
+/* 单轮允许的最大并行 tool_calls (超出部分只记 id/name, 回填"未执行"结果) */
+#define STREAM_CALLS_MAX 8
+
+/* content 满时给截断标记预留的尾部空间 */
+#define CONTENT_TAIL_RESERVE 128
+
 /* 流式上下文: 跨 http_post_stream 传递 */
 typedef struct {
     char content_buf[BUFSZ];   /* 累积完整 content 供 messages */
     size_t content_len;
-    StreamToolCall calls[8];
+    StreamToolCall calls[STREAM_CALLS_MAX];
     int n_calls;
     char finish[24];           /* stop / length / tool_calls / content_filter 等 */
+    /* 本次 HTTP 分段的状态 (每次尝试前 memset 清零) */
+    int emitted;               /* 已向前端上屏过 AI 内容 (重试前据此回删) */
+    int truncated;             /* content 超出缓冲上限, 尾部被丢弃 */
+    struct { char id[256]; char name[64]; } dropped[STREAM_CALLS_MAX]; /* 超上限被丢弃的调用 */
+    int n_dropped;
 } StreamCtx;
 
 /* content delta 回调: 增量显示 + 累积到 content_buf。
- * 首个增量跳过前导换行, 避免 (thinking...) 后出现多余空行。 */
+ * 首个增量跳过前导换行, 避免 (thinking...) 后出现多余空行。
+ * 缓冲只收到离尾部 CONTENT_TAIL_RESERVE 字节处, 剩下留给截断标记 —— 否则尾部被静默
+ * 丢掉, 模型下一轮看不到自己说过什么; 界面照常显示完整内容。 */
 static void on_content_delta(void *ud, const char *delta) {
     StreamCtx *ctx = (StreamCtx*)ud;
     if (ctx->content_len == 0) {
         while (*delta == '\r' || *delta == '\n') delta++;
         if (!*delta) return;
     }
-    if (cagent_emit) cagent_emit(delta, CAGENT_ROLE_AI);
+    if (cagent_emit) { cagent_emit(delta, CAGENT_ROLE_AI); ctx->emitted = 1; }
+    if (ctx->truncated) return;
     size_t dl = strlen(delta);
-    if (ctx->content_len + dl < sizeof(ctx->content_buf) - 1) {
-        memcpy(ctx->content_buf + ctx->content_len, delta, dl);
-        ctx->content_len += dl;
-        ctx->content_buf[ctx->content_len] = '\0';
+    if (ctx->content_len + dl + CONTENT_TAIL_RESERVE > sizeof(ctx->content_buf)) {
+        ctx->truncated = 1;
+        return;
+    }
+    memcpy(ctx->content_buf + ctx->content_len, delta, dl);
+    ctx->content_len += dl;
+    ctx->content_buf[ctx->content_len] = '\0';
+}
+
+/* 把一个 delta 里的 tool_calls 按 index 累积进 ctx (流式分片拼接)。
+ * 超出 STREAM_CALLS_MAX 的调用不再保存参数, 只记下 id/name —— 必须记下来, 否则这些
+ * 调用既不出现在回传的 assistant 消息里、也没有 tool 结果, 模型会以为它们已经执行过。 */
+static void stream_apply_tool_calls(StreamCtx *ctx, const JValue *tcs) {
+    if (!tcs || tcs->type != J_ARR) return;
+    for (size_t j = 0; j < tcs->arr.n; j++) {
+        const JValue *tc = tcs->arr.items[j];
+        int idx = 0;
+        const JValue *idxv = json_obj_get(tc, "index");
+        if (idxv && idxv->type == J_NUM) idx = (int)idxv->num;
+        if (idx < 0) continue;
+        const char *id   = json_as_str(json_obj_get(tc, "id"));
+        const JValue *fn = json_obj_get(tc, "function");
+        const char *name = json_as_str(json_obj_get(fn, "name"));
+        const char *args = json_as_str(json_obj_get(fn, "arguments"));
+        if (idx >= STREAM_CALLS_MAX) {
+            if (ctx->n_dropped >= STREAM_CALLS_MAX || !id || !id[0]) continue;
+            snprintf(ctx->dropped[ctx->n_dropped].id,
+                     sizeof(ctx->dropped[ctx->n_dropped].id), "%s", id);
+            snprintf(ctx->dropped[ctx->n_dropped].name,
+                     sizeof(ctx->dropped[ctx->n_dropped].name), "%s", name ? name : "");
+            ctx->n_dropped++;
+            continue;
+        }
+        if (idx >= ctx->n_calls) ctx->n_calls = idx + 1;
+        StreamToolCall *sc = &ctx->calls[idx];
+        if (id && *id) snprintf(sc->id, sizeof(sc->id), "%s", id);
+        if (name && *name) snprintf(sc->name, sizeof(sc->name), "%s", name);
+        if (args) {
+            size_t al = strlen(sc->args);
+            snprintf(sc->args + al, sizeof(sc->args) - al, "%s", args);
+        }
     }
 }
 
@@ -217,27 +268,7 @@ static int http_post_stream_once(const char *url, const char *api_key,
                         const char *content = json_as_str(json_obj_get(delta, "content"));
                         if (content) on_content_delta(ctx, content);
                         const JValue *tcs = json_obj_get(delta, "tool_calls");
-                        if (tcs && tcs->type == J_ARR) {
-                            for (size_t j = 0; j < tcs->arr.n; j++) {
-                                const JValue *tc = tcs->arr.items[j];
-                                int idx = 0;
-                                const JValue *idxv = json_obj_get(tc, "index");
-                                if (idxv && idxv->type == J_NUM) idx = (int)idxv->num;
-                                if (idx < 0 || idx >= 8) continue;
-                                if (idx >= ctx->n_calls) ctx->n_calls = idx + 1;
-                                StreamToolCall *sc = &ctx->calls[idx];
-                                const char *id = json_as_str(json_obj_get(tc, "id"));
-                                if (id && *id) snprintf(sc->id, sizeof(sc->id), "%s", id);
-                                const JValue *fn = json_obj_get(tc, "function");
-                                const char *name = json_as_str(json_obj_get(fn, "name"));
-                                if (name && *name) snprintf(sc->name, sizeof(sc->name), "%s", name);
-                                const char *args = json_as_str(json_obj_get(fn, "arguments"));
-                                if (args) {
-                                    size_t al = strlen(sc->args);
-                                    snprintf(sc->args + al, sizeof(sc->args) - al, "%s", args);
-                                }
-                            }
-                        }
+                        stream_apply_tool_calls(ctx, tcs);
                         json_free(root);
                     }
                 }
@@ -285,6 +316,8 @@ static int http_post_stream(const char *url, const char *api_key,
         if (!retryable) break;
         if (attempt >= maxr) break;
 
+        /* 本分段已上屏的半截回复必须先回删, 否则重试后界面会拼出两段重复内容 */
+        if (ctx->emitted && cagent_stream_undo) cagent_stream_undo();
         if (cagent_emit) append_text("(网络瞬时错误, 正在重试...)\r\n");
         /* 指数退避: base, 2*base, 4*base ... (累计可在长链路上叠加) */
         DWORD wait = base * (1u << attempt);

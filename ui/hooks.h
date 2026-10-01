@@ -23,6 +23,12 @@ static void gui_on_done(void) {
     SetFocus(g_hInput);
 }
 
+/* 流式分段: 发请求前开新分段, 重试前回删本分段已上屏的内容。
+ * 走 PostMessage 而非 SendMessage —— 与 gui_emit 的追加同队列, 才能保证"先追加后回删"
+ * 的顺序; 跨线程 SendMessage 会插到已投递的追加消息前面, 顺序就乱了。 */
+static void gui_stream_begin(void) { PostMessageW(g_hHistory, WM_APP_STREAM, 1, 0); }
+static void gui_stream_undo(void)  { PostMessageW(g_hHistory, WM_APP_STREAM, 0, 0); }
+
 /* 退出时从 Edit 同步配置到全局。 */
 static void gui_read_config_ui(void) {
     if (g_hCfg[CFG_URL]) read_edit_utf8(g_hCfg[CFG_URL], g_api_url, sizeof(g_api_url));

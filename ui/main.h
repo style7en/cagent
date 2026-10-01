@@ -27,6 +27,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     cagent_emit = gui_emit;
     cagent_on_done = gui_on_done;
     cagent_read_config_ui = gui_read_config_ui;
+    cagent_stream_begin = gui_stream_begin;
+    cagent_stream_undo = gui_stream_undo;
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     enable_dpi_awareness();
