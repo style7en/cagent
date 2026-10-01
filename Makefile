@@ -4,37 +4,48 @@ WINDRES = windres
 CFLAGS  = -Wall -Wextra -Os
 LDFLAGS = -s
 
+# 源码全部在 src/, 资源在 res/, 回归测试在 test/; 编译产物留在仓库根 ——
+# 程序的"数据根"就是 exe 所在目录 (core/session.h 的 get_exe_dir_utf8 用它定位
+# cagent.ini / sessions\ / log\ / SYSTEM_PROMPT), 所以 exe 不能挪进子目录,
+# 否则配置文件会跟着跑到那里去。
 GUI_TARGET = cagent.exe
-GUI_SRC = cagent_ui.c
+GUI_SRC = src/main_gui.c
 GUI_RES = app.res
 
-# 子模块头: 核心按功能拆在 core/, 界面拆在 ui/
-CORE_HDRS = cagent_core.h $(wildcard core/*.h)
-UI_HDRS = $(wildcard ui/*.h)
+# 子模块头: 核心按功能拆在 src/core/, 界面拆在 src/ui/
+CORE_HDRS = src/cagent_core.h $(wildcard src/core/*.h)
+UI_HDRS = $(wildcard src/ui/*.h)
 
+# GUI 入口额外 include 了 "test/test.h" (只为 --selftest), 路径靠 -I. 解析
+GUI_CFLAGS = -I.
 GUI_LDFLAGS = -mwindows -lcomctl32 -lwinhttp -lcrypt32 -lshell32 -lole32 -luuid
 
-# 控制台回归测试: 复用 core/* 全部 static 实现, 退出码 = 失败数
-TEST_SRC = test_main.c
+# 控制台回归测试: 复用 src/core/* 全部 static 实现, 退出码 = 失败数
+# -Isrc 找 cagent_core.h, -Itest 找同套件的 test.h
+TEST_SRC = test/main.c
+TEST_HDRS = test/test.h
 TEST_TARGET = cagent_test.exe
+TEST_CFLAGS = -Isrc -Itest
 TEST_LDFLAGS = -lcomctl32 -lwinhttp -lcrypt32 -lshell32 -lole32 -luuid
 
 .PHONY: all clean test
 
 all: $(GUI_TARGET)
 
-$(GUI_RES): app.rc app.ico
-	$(WINDRES) -O coff -o $@ $<
+# app.rc 里的 include "core/version.h" 与 ICON "app.ico" 都相对自身目录解析:
+# 前者要 src/ 才找得到 core/, 后者要 res/ 才找得到 app.ico, 故两个 -I 都要给。
+$(GUI_RES): res/app.rc res/app.ico $(CORE_HDRS)
+	$(WINDRES) -I src -I res -O coff -o $@ $<
 
-$(GUI_TARGET): $(GUI_SRC) $(CORE_HDRS) $(UI_HDRS) $(GUI_RES)
-	$(CC) $(CFLAGS) -o $@ $< $(GUI_RES) $(LDFLAGS) $(GUI_LDFLAGS)
+$(GUI_TARGET): $(GUI_SRC) $(CORE_HDRS) $(UI_HDRS) $(TEST_HDRS) $(GUI_RES)
+	$(CC) $(CFLAGS) $(GUI_CFLAGS) -o $@ $< $(GUI_RES) $(LDFLAGS) $(GUI_LDFLAGS)
 
 # make test: 编译并运行回归测试 (失败则 make 返回非 0)
 test: $(TEST_TARGET)
 	./$(TEST_TARGET)
 
-$(TEST_TARGET): $(TEST_SRC) $(CORE_HDRS)
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(LDFLAGS) $(TEST_LDFLAGS)
+$(TEST_TARGET): $(TEST_SRC) $(TEST_HDRS) $(CORE_HDRS)
+	$(CC) $(CFLAGS) $(TEST_CFLAGS) -o $@ $(TEST_SRC) $(LDFLAGS) $(TEST_LDFLAGS)
 
 clean:
 	@rm -rf $(GUI_TARGET) $(GUI_RES) $(TEST_TARGET)

@@ -11,36 +11,8 @@ static int utf8_to_wide(const char *u8, wchar_t *out, int cap) {
     return MultiByteToWideChar(CP_UTF8, 0, u8, -1, out, cap) > 0;
 }
 
-/* 把截断长度回退到 UTF-8 字符边界: 避免切出半个字符 (非法 UTF-8 会让整段文本被丢弃)。
- * 注意: 数据本身可能不是 UTF-8 (如 cmd 的 GBK 输出), 无法解析时原样返回 len——
- * 绝不能因为"不像 UTF-8"就把内容截成 0。 */
-static size_t utf8_trim_len(const char *s, size_t len) {
-    size_t i = 0;
-    while (i < len) {
-        unsigned char c = (unsigned char)s[i];
-        size_t need;
-        if (c >= 0xF0)      need = 4;
-        else if (c >= 0xE0) need = 3;
-        else if (c >= 0xC0) need = 2;
-        else                need = 1;
-        if (need > 1 && i + need > len) break;      /* 该字符被截断 -> 停 */
-        int ok = 1;
-        for (size_t k = 1; k < need; k++)
-            if (((unsigned char)s[i + k] & 0xC0) != 0x80) { ok = 0; break; }
-        if (!ok) return len;                        /* 非 UTF-8 数据: 不做截断 */
-        i += need;
-    }
-    return i;
-}
-
-/* 从 offset 起跳过 UTF-8 续字节 (0b10xxxxxx), 让读取起点落在字符边界。
- * 用于 read_file 的任意字节 offset: 起点切在多字节字符中间时向前对齐。
- * 若整段都是续字节 (理论罕见) 返回 n, 调用方按原样处理。 */
-static size_t utf8_skip_cont(const unsigned char *s, size_t n) {
-    size_t i = 0;
-    while (i < n && (s[i] & 0xC0) == 0x80) i++;
-    return i;
-}
+/* 字符边界工具 (utf8_trim_len / utf8_skip_cont / utf8_safe_copy / utf8_seq_len / is_valid_utf8)
+ * 已统一收敛到 core/utf8.h, 见那里的说明。 */
 
 /* UTF-8 路径打开文件: 必须走宽字符, 否则非 ASCII 路径 (中文目录) 会打不开 */
 static FILE *fopen_utf8(const char *path, const char *mode) {

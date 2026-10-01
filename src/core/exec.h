@@ -4,8 +4,6 @@
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
-static size_t utf8_trim_len(const char *s, size_t len);   /* 前向声明 (定义在 workspace.h) */
-
 /* 命令执行超时 (毫秒): 默认 60s, 可用环境变量 CAGENT_CMD_TIMEOUT (秒) 覆盖。 */
 static int cmd_timeout_ms(void) {
     char *e = getenv("CAGENT_CMD_TIMEOUT");

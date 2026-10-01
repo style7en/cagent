@@ -55,6 +55,16 @@ static int http_should_retry(int status) {
     return 0;                                   /* 其余 4xx 客户端错误 */
 }
 
+/* 429 限流窗口通常远长于普通网络抖动: 实测 3 次 (约 7 秒) 不够, 会白白回滚整轮。
+ * 给 429 单独提到 6 次 (800→1.6→3.2→6.4→12.8→25.6s ≈ 50 秒窗口); 其余错误维持默认。
+ * 环境变量 CAGENT_HTTP_RETRIES 显式调高时以较大者为准。 */
+#define HTTP_RATE_RETRIES 6
+static int http_max_retries_for(int status) {
+    int n = http_max_retries();
+    if (status == 429 && n < HTTP_RATE_RETRIES) n = HTTP_RATE_RETRIES;
+    return n;
+}
+
 /* 可中断睡眠: 期间若被取消则提前返回, 避免卡在退避里 */
 static void cancelable_sleep_ms(DWORD total) {
     DWORD step = 50;
@@ -73,6 +83,7 @@ typedef struct {
     char id[256];
     char name[64];
     char args[ARGS_MAX];   /* arguments 片段累积 */
+    int  args_overflow;    /* 累积将超上限: 置位并停止拼接, 执行期拒绝执行而非截尾成非法 JSON */
 } StreamToolCall;
 
 /* 单轮允许的最大并行 tool_calls (超出部分只记 id/name, 回填"未执行"结果) */
@@ -89,6 +100,11 @@ typedef struct {
     int n_calls;
     char finish[24];           /* stop / length / tool_calls / content_filter 等 */
     long prompt_tokens;        /* 服务端报告的 prompt_tokens (SSE usage; 不发则 0) */
+    /* 诊断留痕: 服务端返回 200 却解析不出 content/tool_calls 时, 日志里必须能看出它到底
+     * 发了什么 —— 否则那条回滚完全无从下手 (err_out 在成功路径上是空的, 一点线索都没有)。 */
+    char sse_head[512];        /* 第一条 data: 行的原文 (截断到 511 字节) */
+    int  n_data_lines;         /* 收到的 data: 行数 (含 [DONE]) */
+    int  n_bad_json;           /* 其中 JSON 解析失败的行数 */
     /* 本次 HTTP 分段的状态 (每次尝试前 memset 清零) */
     int emitted;               /* 已向前端上屏过 AI 内容 (重试前据此回删) */
     int truncated;             /* content 超出缓冲上限, 尾部被丢弃 */
@@ -146,9 +162,18 @@ static void stream_apply_tool_calls(StreamCtx *ctx, const JValue *tcs) {
         StreamToolCall *sc = &ctx->calls[idx];
         if (id && *id) snprintf(sc->id, sizeof(sc->id), "%s", id);
         if (name && *name) snprintf(sc->name, sizeof(sc->name), "%s", name);
-        if (args) {
+        if (args && !sc->args_overflow) {
             size_t al = strlen(sc->args);
-            snprintf(sc->args + al, sizeof(sc->args) - al, "%s", args);
+            size_t dl = strlen(args);
+            if (al + dl >= sizeof(sc->args)) {
+                /* 旧版在这里 snprintf 静默截尾, 产生"arguments 不是合法 JSON";
+                 * 现在停止拼接并置标志, 由执行期拒绝执行 + 交回模型明确原因 */
+                sc->args_overflow = 1;
+                log_line("[tool] arguments 超上限: name=%s 已累积=%zu 本片段=%zu 上限=%zu",
+                         sc->name[0] ? sc->name : "?", al, dl, sizeof(sc->args));
+            } else {
+                memcpy(sc->args + al, args, dl + 1);
+            }
         }
     }
 }
@@ -272,6 +297,9 @@ static int http_post_stream_once(const char *url, const char *api_key,
                 while (lbLen > 0 && linebuf[lbLen-1] == '\r') linebuf[--lbLen] = '\0';
                 if (strncmp(linebuf, "data: ", 6) == 0) {
                     const char *json = linebuf + 6;
+                    if (ctx->n_data_lines == 0)
+                        utf8_safe_copy(json, sizeof(ctx->sse_head) - 1, ctx->sse_head, sizeof(ctx->sse_head));
+                    ctx->n_data_lines++;
                     if (strcmp(json, "[DONE]") == 0) { if (completed) *completed = 1; lpos = 0; goto stream_done; }
                     JValue *root = json_parse(json);
                     if (root) {
@@ -290,6 +318,8 @@ static int http_post_stream_once(const char *url, const char *api_key,
                         if (pt && pt->type == J_NUM && pt->num > 0)
                             ctx->prompt_tokens = (long)pt->num;
                         json_free(root);
+                    } else {
+                        ctx->n_bad_json++;      /* 诊断计数: 200 但全是解析不了的 data 行 */
                     }
                 }
                 lpos = 0;
@@ -320,7 +350,6 @@ static int http_post_stream(const char *url, const char *api_key,
                             const char *body, size_t body_len,
                             char *err_out, size_t err_cap,
                             StreamCtx *ctx) {
-    int maxr = http_max_retries();
     DWORD base = http_retry_base_ms();
     int last_status = -1;
 
@@ -343,15 +372,23 @@ static int http_post_stream(const char *url, const char *api_key,
         /* 判断是否值得重试: 瞬时错误, 或 200 但流被截断 (需重取) */
         int retryable = http_should_retry(status) || (status == 200 && !completed);
         if (!retryable) break;
-        if (attempt >= maxr) break;
+        if (attempt >= http_max_retries_for(status)) break;
 
         /* 本分段已上屏的半截回复必须先回删, 否则重试后界面会拼出两段重复内容 */
         if (ctx->emitted && cagent_stream_undo) cagent_stream_undo();
         if (cagent_emit) append_text("(网络瞬时错误, 正在重试...)\r\n");
-        /* 指数退避: base, 2*base, 4*base ... (累计可在长链路上叠加) */
-        DWORD wait = base * (1u << attempt);
-        log_line("[http] 瞬时错误重试 attempt=%d status=%d wait=%lu ms err=%.300s",
-             attempt + 1, status, (unsigned long)wait, err_out);
+        /* 指数退避: base, 2*base, 4*base ... (累计可在长链路上叠加)。
+         * 移位前夹紧指数: 目前 http_max_retries() 已把次数夹在 ≤8, 所以 1u<<attempt 不会溢出,
+         * 但这个循环不该依赖别处的夹紧 —— 那个上限一旦被放宽, 移位就是 UB。
+         * 单次等待再给 60s 上限, 免得长链路叠加出十几分钟的静默 (默认基数下不会触及)。 */
+        int sh = (attempt > 16) ? 16 : attempt;
+        DWORD wait = base * (1u << sh);
+        if (wait > 60000) wait = 60000;
+        /* err 按字符边界截取: %.300s 会切半汉字, 日志自己先变成非法 UTF-8 */
+        char eprev[304];
+        utf8_safe_copy(err_out, 300, eprev, sizeof(eprev));
+        log_line("[http] 瞬时错误重试 attempt=%d status=%d wait=%lu ms err=%s",
+             attempt + 1, status, (unsigned long)wait, eprev);
         cancelable_sleep_ms(wait);
     }
     return last_status;

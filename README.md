@@ -1,6 +1,6 @@
 # cagent
 
-用 C 语言实现的极简 AI Agent,**零第三方依赖**,运行在 Windows 平台。Win32 GUI 版,核心 (`cagent_core.h`) 与界面 (`cagent_ui.c`) 分离,共用同一段 Agent 循环。
+用 C 语言实现的极简 AI Agent,**零第三方依赖**,运行在 Windows 平台。Win32 GUI 版,核心 (`src/cagent_core.h`) 与界面 (`src/main_gui.c`) 分离,共用同一段 Agent 循环。
 
 ---
 
@@ -10,40 +10,53 @@
 cagent/
 ├── Makefile            # 构建脚本
 ├── LICENSE             # MIT 许可证
-├── cagent.ini          # 配置文件 (首次启动后自动生成)
+├── cagent.exe          # 编译产物 —— 注意: exe 所在目录就是"数据根"
+├── cagent.ini          # 配置文件 (首次启动后自动生成; 必须与 exe 同目录)
 ├── SYSTEM_PROMPT       # 可选: 外置系统提示词 (存在则替代内置默认)
 ├── sessions/           # 历史会话 (运行时生成, 首次保存时自动创建; 旧版散落的 history_*.json 启动时自动搬入)
 ├── log/                # 运行日志 + 失败请求留档 (log=1 时生成, 不入库)
-├── cagent_ui.c         # 界面聚合入口 (仅按依赖顺序 include ui/)
-├── cagent_core.h       # 核心聚合入口 (仅按依赖顺序 include core/)
-├── core/               # 平台无关核心, 按子功能拆分 (单 TU, 全 static)
-│   ├── base.h          # 平台头 / 角色常量 / 宿主钩子 / 输出封装
-│   ├── state.h         # 缓冲常量 / 全局状态 / 工具声明
-│   ├── crypto.h        # DPAPI: API Key 加密存储
-│   ├── json.h          # 轻量 JSON 解析器 / 转义 / 自测
-│   ├── exec.h          # 命令执行: CreateProcess + 管道 + 超时
-│   ├── net.h           # WinHTTP 与 SSE 流式解析
-│   ├── encoding.h      # 编码转换: UTF-8/OEM 检测与转换、字符边界
-│   ├── workspace.h     # 工作目录解析、越界限制、UTF-8 文件/路径
-│   ├── tools.h         # 结构化工具: execute_bash / read_file / write_file / edit_file
-│   ├── agent.h         # Agent 循环: LLM <-> 工具调用、取消与回滚
-│   ├── session.h       # 会话持久化: 存取 / 回放 / 多会话命名
-│   └── config.h        # ini 配置读写
-├── ui/                 # Win32 界面, 按子功能拆分
-│   ├── state.h         # 控件 ID / 消息 / 全局句柄与字体
-│   ├── hooks.h         # 宿主钩子实现
-│   ├── helpers.h       # Edit 读写(UTF-8) + RichEdit 分角色追加
-│   ├── task.h          # 启动一轮 Agent
-│   ├── wndproc.h       # 布局 / 子类 / 主窗口过程
-│   ├── dpi.h           # 高 DPI 适配
-│   ├── session_dlg.h   # 会话选择对话框 (枚举 / 自绘列表 / 载入)
-│   └── main.h          # 程序入口
-├── app.rc / app.ico    # 图标资源
-└── cagent.exe          # 编译产物
+├── src/                # 全部源码
+│   ├── main_gui.c      # 界面聚合入口 (include ui/ 与 test/, 供 --selftest)
+│   ├── cagent_core.h   # 核心聚合入口 (仅按依赖顺序 include core/)
+│   ├── core/           # 平台无关核心, 按子功能拆分 (单 TU, 全 static)
+│   │   ├── version.h   # 版本号单一事实来源 (RC / --version / 标题栏引用)
+│   │   ├── base.h      # 平台头 / 角色常量 / 宿主钩子 / 输出封装
+│   │   ├── utf8.h      # UTF-8 解码与字符边界 (全项目唯一实现)
+│   │   ├── state.h     # 缓冲常量 / 全局状态 / 工具声明
+│   │   ├── log.h       # 运行日志 / 失败请求留档 / 发送前 UTF-8 预检
+│   │   ├── crypto.h    # DPAPI: API Key 加密存储
+│   │   ├── json.h      # 轻量 JSON 解析器 / 转义 / 自测
+│   │   ├── exec.h      # 命令执行: CreateProcess + 管道 + 超时
+│   │   ├── net.h       # WinHTTP 与 SSE 流式解析
+│   │   ├── encoding.h  # OEM(GBK) → UTF-8 转码
+│   │   ├── workspace.h # 工作目录解析、越界限制、UTF-8 文件/路径
+│   │   ├── tools.h     # 结构化工具: execute_bash / read_file / write_file / edit_file
+│   │   ├── agent.h     # Agent 循环: LLM <-> 工具调用、取消与回滚
+│   │   ├── session.h   # 会话持久化: 存取 / 回放 / 多会话命名
+│   │   └── config.h    # ini 配置读写
+│   └── ui/             # Win32 界面, 按子功能拆分
+│       ├── state.h     # 控件 ID / 消息 / 全局句柄与字体
+│       ├── hooks.h     # 宿主钩子实现
+│       ├── helpers.h   # Edit 读写(UTF-8) + RichEdit 分角色追加与 Markdown 渲染
+│       ├── task.h      # 启动一轮 Agent
+│       ├── wndproc.h   # 布局 / 子类 / 主窗口过程
+│       ├── dpi.h       # 高 DPI 适配
+│       ├── session_dlg.h # 会话选择对话框 (枚举 / 自绘列表 / 载入)
+│       └── main.h      # 程序入口
+└── test/               # 回归测试 (与 src/ 分开: 核心不该为前端自检背上测试代码)
+    ├── test.h          # 测试套件本体 run_all_tests (需先 include src/cagent_core.h)
+    └── main.c          # 控制台入口 (make test)
+└── res/                # 资源
+    ├── app.rc          # 图标 + 版本信息
+    └── app.ico
 ```
 
-> 拆分方式: `core/` 与 `ui/` 下的头文件全部是 `static` 实现, 由聚合头按依赖顺序
+> 拆分方式: `src/core/` 与 `src/ui/` 下的头文件全部是 `static` 实现, 由聚合头按依赖顺序
 > include, 仍是**单编译单元**, 无额外链接步骤, 也不引入任何第三方依赖。
+
+> 为什么编译产物留在仓库根、而不收进 `build/`: 程序把 **exe 所在目录当作数据根**
+> (见 `src/core/session.h` 的 `get_exe_dir_utf8`), 用它定位 `cagent.ini` / `sessions\` /
+> `log\` / `SYSTEM_PROMPT`。exe 一旦挪进子目录, 这些都会跟着跑过去。
 
 ---
 
@@ -72,7 +85,7 @@ make cagent.exe
 
 ## 测试
 
-项目带一套**离线自动化回归测试**(`core/test.h` 的 `run_all_tests`),覆盖 JSON 解析/转义、
+项目带一套**离线自动化回归测试**(`test/test.h` 的 `run_all_tests`),覆盖 JSON 解析/转义、
 编码检测与字符边界、工具分发与参数校验、`edit_file` 定点编辑的各类边界、HTTP 重试判定、
 上下文压缩(消息遍历 / 保底丢弃的配对完整性 / 超限 400 识别 / token 与字节水位)、
 `read_file` 的 offset 分块续读、外置系统提示词的转义包装与无效回退。无需网络或 GUI,改动核心代码后跑一遍即可当作护栏。
@@ -81,13 +94,15 @@ make cagent.exe
 make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 即通过)
 ```
 
-也可对 GUI 二进制直接自测(结果写到 `selftest.txt`):
+也可对 GUI 二进制直接自测(结果写到**当前工作目录**下的 `selftest.txt`):
 
 ```bash
 ./cagent.exe --selftest
 ```
 
-> 测试通过 `test_main.c` 直接复用 `cagent_core.h` 的全部 `static` 实现编译成控制台程序,
+> 测试代码独立在 `test/`,**不**进 `cagent_core.h` 的聚合 —— 核心不该为了某个前端的一键自检
+> 而背上测试代码。需要它的入口各自显式 include:`test/main.c`(命令行)与 `src/main_gui.c`
+> (GUI 的 `--selftest` 分支)。两者都直接复用 `src/cagent_core.h` 的全部 `static` 实现,
 > 因此测的就是真实代码路径,而非另写一份桩。
 
 ---
@@ -272,7 +287,7 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
 └─────────────────────────────────────────┘
 ```
 
-`cagent_core.h` 中的 `agent_turn` / `agent_thread` 就是这个循环的实现,GUI 通过宿主钩子 (`cagent_emit` 等) 与之交互。
+`src/cagent_core.h` 中的 `agent_turn` / `agent_thread` 就是这个循环的实现,GUI 通过宿主钩子 (`cagent_emit` 等) 与之交互。
 
 ### 工具调用协议
 
@@ -327,9 +342,9 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 
 ## 版本号
 
-版本号的**唯一事实来源**在 `core/version.h`（`CAGENT_VER_MAJOR/MINOR/PATCH` 与 `CAGENT_VERSION_STR`），改动版本只改这一处，三处同步引用：
+版本号的**唯一事实来源**在 `src/core/version.h`（`CAGENT_VER_MAJOR/MINOR/PATCH` 与 `CAGENT_VERSION_STR`），改动版本只改这一处，三处同步引用：
 
-- **Windows 文件属性**：`app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.1.1.0` + 字符串 `1.1.1`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。
+- **Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.1.1.0` + 字符串 `1.1.1`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。`app.rc` 里的 `#include "core/version.h"` 与 `ICON "app.ico"` 都相对自身目录解析，故 Makefile 给 windres 传了 `-I src -I res`。
 - **命令行**：`cagent.exe --version` 打印 `cagent 1.1.1`（有父控制台则打印到终端，否则弹对话框）。
 - **窗口标题栏**：显示 `cagent 1.1.1`。
 

@@ -233,10 +233,15 @@ static void dispatch_tool(const char *name, const char *args_json, const char *f
              (finish && strcmp(finish, "length") == 0));
         log_line("[tool] arguments 原文: %s", (args_json && args_json[0]) ? args_json : "(空)");
         if (args_json) log_check_utf8("tool.arguments", args_json, alen);
+        /* 预览必须按 UTF-8 字符边界截取 (utf8_safe_copy), 否则 %.200s 会切半汉字,
+         * 非法字节随 tool 结果进 messages → 下一次请求被服务端 400 invalid unicode */
+        char prev[201];
+        utf8_safe_copy((args_json && args_json[0]) ? args_json : "(空)",
+                       200, prev, sizeof(prev));
         snprintf(tool_out, BUFSZ,
-                 "(参数解析失败: %s 的 arguments 不是合法 JSON%s, 原始内容前 200 字节: %.200s)",
+                 "(参数解析失败: %s 的 arguments 不是合法 JSON%s, 原始内容前 200 字节: %s)",
                  nm, (finish && strcmp(finish, "length") == 0) ? " (疑似被长度上限截断)" : "",
-                 (args_json && args_json[0]) ? args_json : "(空)");
+                 prev);
     } else {
         snprintf(tool_out, BUFSZ, "(参数类型错误: arguments 应为 JSON 对象)");
     }

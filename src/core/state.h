@@ -5,9 +5,15 @@
  */
 
 /* 上下文缓冲 1MB: 装得下约 30 万+ 汉字 / 更多的英文 token。
- * 静态缓冲共 4 块 (messages/body/resp/tool_out) + 请求期堆分配的 StreamCtx, 合计 ~5MB。 */
+ * 静态缓冲 4 块 (messages/body/resp/tool_out) 各 1MB; 请求期还堆分配 StreamCtx
+ * (~1.5MB: content_buf 1MB + 8 个 arguments 累积) 与工具调用表 (~0.5MB), 峰值约 6.5MB。 */
 #define BUFSZ           (1024 * 1024)
-#define ARGS_MAX        8192   /* tool_calls.arguments 累积上限 (流式与执行期统一) */
+#define ARGS_MAX        (64 * 1024)  /* tool_calls.arguments 累积上限 (流式与执行期统一)。
+                                      * 旧值 8192 会静默截断大参数产出非法 JSON;
+                                      * 超上限现在置 overflow 标志拒绝执行, 不再截断。
+                                      * 64KB ≈ 2 万汉字, 覆盖绝大多数调用; 相比 256KB
+                                      * 单轮并行 8 个调用省下约 1.5MB 堆。 */
+#define ARGS_DISPLAY_MAX 8192        /* 界面 [Tool] 行 arguments 展示上限 (执行与回传不受影响) */
 #define TOOL_OUTPUT_CAP (16 * 1024)  /* 单个工具结果进入上下文的上限, 超出即截断 */
 #define EDIT_MAX_BYTES  (2 * 1024 * 1024) /* edit_file 可处理的最大文件体积 */
 

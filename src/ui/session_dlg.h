@@ -59,15 +59,15 @@ static int sess_enumerate(const char *dir) {
         int cnt = 0;
         session_read_meta(g_sess_paths[g_sess_n], ws, sizeof(ws), prev, sizeof(prev), &cnt);
 
-        /* 修改时间 -> 本地 "MM-DD HH:MM" */
+        /* 修改时间 -> 本地时间。ftLastWriteTime 是 UTC, FileTimeToLocalFileTime 已转本地;
+         * 原先又调 SystemTimeToTzSpecificLocalTime 把本地时间当 UTC 再偏移一次 (快 8 小时), 已删除 */
         FILETIME lft;
-        SYSTEMTIME st, lst;
+        SYSTEMTIME st;
         FileTimeToLocalFileTime(&fd.ftLastWriteTime, &lft);
         FileTimeToSystemTime(&lft, &st);
-        SystemTimeToTzSpecificLocalTime(NULL, &st, &lst);
         char tbuf[32];
         snprintf(tbuf, sizeof(tbuf), "%04d-%02d-%02d %02d:%02d",
-                 lst.wYear, lst.wMonth, lst.wDay, lst.wHour, lst.wMinute);
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
 
         /* 旧格式: 从文件名反推目录显示 */
         char wsdisp[180];

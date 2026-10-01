@@ -9,9 +9,10 @@
 typedef struct { char user_msg[BUFSZ]; } AgentTask;
 
 /* 本轮要执行的一个工具调用 (从 StreamCtx 拷贝而来)。
- * 每项含 8KB 参数缓冲, 8 项约 68KB —— 必须放堆, 不能放栈 (工作线程默认栈 1MB)。 */
+ * 每项含 256KB 参数缓冲, 8 项约 2MB —— 必须放堆, 不能放栈 (工作线程默认栈 1MB)。 */
 typedef struct {
     char id[256]; char name[64]; char args[ARGS_MAX]; char *output;
+    int too_big;   /* arguments 超上限: 不执行, 回填占位 "{}" + 原因交回模型 */
 } AgentToolCall;
 
 /* 内置默认系统提示词: 外置 SYSTEM_PROMPT 文件缺失或无效时的兜底。 */
@@ -450,8 +451,11 @@ static int compact_conversation(void) {
 static void agent_turn(const char *user_msg) {
     InterlockedExchange(&g_cancel, 0);
     g_touched_files[0] = '\0';                  /* 本轮改动记录重新计 (回滚提示要引用) */
-    log_line("[turn] 开始 ws=%s msgs_len=%zu user=%.120s",
-         g_workspace[0] ? g_workspace : "-", strlen(messages), user_msg);
+    /* 用户输入按字符边界截取: %.120s 会切半汉字, 日志自己就成了非法 UTF-8 */
+    char uprev[160];
+    utf8_safe_copy(user_msg, 120, uprev, sizeof(uprev));
+    log_line("[turn] 开始 ws=%s msgs_len=%zu user=%s",
+         g_workspace[0] ? g_workspace : "-", strlen(messages), uprev);
 
     /* 上下文压力检查 (token 优先, 字节兜底): 先压缩, 再开始本轮 */
     if (context_pressure()) {
@@ -470,6 +474,10 @@ static void agent_turn(const char *user_msg) {
     int rolled_back = 0;
     int iter = 0;              /* 迭代序号: 首轮的水位检查已在上面做过 */
     int overflow_retries = 0;  /* 400 上下文超限后的"压缩重试"次数 */
+    int utf8_heal_tried = 0;   /* 历史 UTF-8 自愈只做一次, 防止修不动时原地打转 */
+    /* 回滚/提前收束的原因。每一条离开本轮的非正常路径都要写上 —— 用户看到的只有
+     * "(本轮对话已回滚, ...)" 一句话, 日志里若不带原因, 事后根本无从判断是哪一步。 */
+    const char *reason = NULL;
     int ok;
     AgentToolCall *calls = NULL;   /* 本轮工具调用表 (堆分配); done 处兜底释放 */
     StreamCtx *ctx = NULL;         /* 本轮流式上下文 (堆分配); done 处兜底释放 */
@@ -477,19 +485,23 @@ static void agent_turn(const char *user_msg) {
     char *escaped = json_escape_alloc(user_msg);
     if (!escaped) {
         append_text("(内存不足, 已忽略本轮)\r\n");
+        reason = "内存不足 (user 消息转义失败)";
+        rolled_back = 1;
         goto done;
     }
     ok = msg_append(",{\"role\":\"user\",\"content\":\"%s\"}", escaped);
     free(escaped);
     if (!ok) {
         append_text("(输入过长, 已忽略本轮)\r\n");
-        messages[savepoint] = '\0';
-        goto done;
+        reason = "输入过长 (user 消息拼不进 messages)";
+        rolled_back = 1;
+        goto done;                            /* 截断交给 done 统一做, 这里不再重复 */
     }
 
     for (;;) {
         if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
             append_text("(已取消)\r\n");
+            reason = "用户取消 (轮次开始前)";
             rolled_back = 1;
             goto done;
         }
@@ -502,6 +514,7 @@ static void agent_turn(const char *user_msg) {
             log_line("[compact] 迭代间隙触发 -> %s, msgs_len=%zu", cok ? "成功" : "失败", strlen(messages));
             if (!cok) {
                 append_text("(压缩失败, 本轮到此暂停; 已完成的步骤都保留在对话中)\r\n");
+                reason = "上下文压缩失败 (保留已完成步骤, 不回滚)";
                 goto done;
             }
             savepoint = strlen(messages);   /* 历史已改写, 回滚基点随之更新 */
@@ -511,7 +524,35 @@ static void agent_turn(const char *user_msg) {
         snprintf(body, BUFSZ,
             "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true}",
             g_model, messages, TOOLS_JSON);
-        log_check_utf8("请求体", body, strlen(body));
+        if (log_check_utf8("请求体", body, strlen(body))) {
+            /* 本地预检发现非法 UTF-8: 拦截不发送 —— 发出去也只会被服务端 400
+             * invalid unicode 拒掉。坏字节偏移/消息序号在上面的 [utf8] 行里,
+             * 完整请求体留档 log\request_fail_<时间>_<序号>.json 供复现。 */
+            log_dump_request(body, strlen(body));
+            /* 回滚救不了"历史已污染": 坏字节若来自已持久化的 messages (旧版 oem_to_utf8
+             * 转码失败留下的 GBK 字节、或外部损坏的会话文件), 截回本轮 savepoint 之后
+             * 它照样在, 下一轮又被拦 —— 会话从此永久卡死, 用户只能去删文件。
+             * 所以先就地净化一次再重发; 净化不动 (坏字节不在 messages 里, 如 model 字段)
+             * 才走回滚。 */
+            if (!utf8_heal_tried) {
+                utf8_heal_tried = 1;
+                size_t healed = utf8_sanitize_inplace(messages);
+                if (healed) {
+                    log_line("[utf8] 历史含非法 UTF-8, 已就地净化 %zu 字节后重发 (msgs_len=%zu)",
+                             healed, strlen(messages));
+                    append_text("(消息历史含非法 UTF-8 字节, 已就地修复并重发本请求)\r\n");
+                    iter--;              /* 这次请求没发出去, 不计入迭代序号 */
+                    continue;            /* 重新拼 body (messages 已变) 再发一次 */
+                }
+            }
+            /* 提示要跟开关走: 日志关着时不会有留档, 说"详见 log\"就是假的 */
+            append_text(g_log_enabled
+                ? "(请求体含非法 UTF-8 字节, 已本地拦截未发送; 本轮回滚, 详见 log\\)\r\n"
+                : "(请求体含非法 UTF-8 字节, 已本地拦截未发送; 本轮回滚)\r\n");
+            reason = "请求体含非法 UTF-8, 本地拦截未发送";
+            rolled_back = 1;
+            goto done;
+        }
         log_line("[http] 请求 iter=%d msgs_len=%zu body_len=%zu",
              iter, strlen(messages), strlen(body));
 
@@ -524,6 +565,7 @@ static void agent_turn(const char *user_msg) {
         if (!ctx) {
             append_text("(内存不足, 本轮回滚)\r\n");
             append_text(ROLLBACK_HINT);
+            reason = "内存不足 (StreamCtx 分配失败)";
             rolled_back = 1;
             goto done;
         }
@@ -537,12 +579,16 @@ static void agent_turn(const char *user_msg) {
 
         if (status == -2) {
             append_text("(已取消)\r\n");
+            reason = "用户取消 (流式请求进行中)";
             rolled_back = 1;
             goto done;
         }
         if (status != 200) {
-            log_line("[http] 失败 status=%d iter=%d msgs_len=%zu resp=%.1000s",
-                 status, iter, strlen(messages), resp);
+            /* 响应体按字符边界截取: %.1000s 会切半汉字, 让日志自己先变成非法 UTF-8 */
+            char rprev[1024];
+            utf8_safe_copy(resp, 1000, rprev, sizeof(rprev));
+            log_line("[http] 失败 status=%d iter=%d msgs_len=%zu resp=%s",
+                 status, iter, strlen(messages), rprev);
             log_dump_request(body, strlen(body));
             /* 服务端报告上下文超限 (400): 压缩后原地重试, 而不是回滚丢掉整轮。
              * 重试有次数上限; 压缩失败则照常回滚。 */
@@ -561,13 +607,17 @@ static void agent_turn(const char *user_msg) {
                 append_text("(压缩失败)\r\n");
             }
             append_text(resp);
-            append_text(ROLLBACK_HINT);
-            rolled_back = 1;
+            /* 请求阶段失败 = 没收到任何响应内容, messages 状态完整 (此前所有工具往返
+             * 都已闭合): 保留已完成步骤, 只结束本轮 —— 学压缩失败的处理, 不让 429/网络
+             * 抖动白白吃掉整轮 (文件改动本来也不回滚)。用户取消在上面另行回滚。 */
+            append_text("(本轮未完成: 已完成的工具步骤保留在对话中, 可直接发下一条指令继续)\r\n");
+            reason = "HTTP 请求失败 (保留已完成步骤, 不回滚)";
             goto done;
         }
 
-        log_line("[http] 成功 iter=%d finish=%s prompt_tokens=%ld msgs_len=%zu",
-             iter, ctx->finish[0] ? ctx->finish : "-", ctx->prompt_tokens, strlen(messages));
+        log_line("[http] 成功 iter=%d finish=%s prompt_tokens=%ld data_lines=%d bad_json=%d msgs_len=%zu",
+             iter, ctx->finish[0] ? ctx->finish : "-", ctx->prompt_tokens,
+             ctx->n_data_lines, ctx->n_bad_json, strlen(messages));
 
         /* 服务端报告的 prompt_tokens (与请求时的 messages 长度配对, 供水位估算) */
         if (ctx->prompt_tokens > 0) {
@@ -599,26 +649,37 @@ static void agent_turn(const char *user_msg) {
                 if (esc) {
                     if (!msg_append(",{\"role\":\"assistant\",\"content\":\"%s\"}", esc)) {
                         append_text("(历史空间不足, 本轮回滚)\r\n");
+                        reason = "历史空间不足 (assistant content 拼不进 messages)";
                         rolled_back = 1;
                     }
                     free(esc);
+                } else {
+                    /* 转义分配失败: 这轮回复不会进历史, 下一轮模型看不到自己说过什么 */
+                    log_line("[turn] assistant content 转义失败(内存不足), 本轮回复未写入历史");
                 }
             } else {
+                /* 200 却没有 content: resp(=err_out) 在成功路径上是空的, 唯一线索就是
+                 * 原始 SSE 首行与解析失败计数 —— 不记下来这条回滚根本无从下手。 */
+                log_line("[http] 200 但无 content: finish=%s iter=%d data_lines=%d bad_json=%d sse_head=%s",
+                         ctx->finish[0] ? ctx->finish : "-", iter,
+                         ctx->n_data_lines, ctx->n_bad_json, ctx->sse_head);
                 if (strcmp(ctx->finish, "length") == 0)
                     append_text("(响应为空且已达长度上限, 本轮回滚)\r\n");
                 else
                     append_text("(响应解析失败)\r\n");
                 append_text(ROLLBACK_HINT);
+                reason = "服务端返回空 content (响应解析失败/空回复)";
                 rolled_back = 1;
             }
             goto done;
         }
 
         /* 有 tool_calls: 转 AgentToolCall 并执行。
-         * 调用表 (8 项 ≈ 68KB) 放堆: 放栈会和工作线程默认 1MB 栈争空间。 */
+         * 调用表 (8 项 ≈ 2MB) 放堆: 放栈会和工作线程默认 1MB 栈争空间。 */
         calls = (AgentToolCall*)calloc(STREAM_CALLS_MAX, sizeof(AgentToolCall));
         if (!calls) {
             append_text("(内存不足, 本轮回滚)\r\n");
+            reason = "内存不足 (工具调用表分配失败)";
             rolled_back = 1;
             goto done;
         }
@@ -628,11 +689,19 @@ static void agent_turn(const char *user_msg) {
             AgentToolCall *c = &calls[n_calls++];
             snprintf(c->id,   sizeof(c->id),   "%s", ctx->calls[i].id);
             snprintf(c->name, sizeof(c->name), "%s", ctx->calls[i].name);
-            snprintf(c->args, sizeof(c->args), "%s", ctx->calls[i].args);
+            c->too_big = ctx->calls[i].args_overflow;
+            if (c->too_big)
+                snprintf(c->args, sizeof(c->args), "{}");                    /* 残缺 JSON 不回传, 用占位 */
+            else
+                snprintf(c->args, sizeof(c->args), "%s", ctx->calls[i].args);/* 旧的写法先整段拷 256KB 再被覆盖 */
         }
         if (n_calls == 0 && ctx->n_dropped == 0) {
+            log_line("[http] 200 但 tool_calls 无法还原: finish=%s iter=%d data_lines=%d bad_json=%d sse_head=%s",
+                     ctx->finish[0] ? ctx->finish : "-", iter,
+                     ctx->n_data_lines, ctx->n_bad_json, ctx->sse_head);
             append_text("(tool_calls 解析失败)\r\n");
             append_text(ROLLBACK_HINT);
+            reason = "tool_calls 解析失败 (没能还原出可执行的调用)";
             rolled_back = 1;
             goto done;
         }
@@ -640,28 +709,54 @@ static void agent_turn(const char *user_msg) {
         for (int i = 0; i < n_calls; i++) {
             if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
                 append_text("(已取消)\r\n");
+                reason = "用户取消 (工具执行中)";
                 rolled_back = 1;
                 goto done;
             }
             AgentToolCall *c = &calls[i];
-            /* [Tool]/[Output] 提示行按实际上限堆分配, 不占栈 */
-            size_t cap = ARGS_MAX + 128;
-            char *line = (char*)malloc(cap);
-            if (line) {
-                snprintf(line, cap, "[Tool] %s(%s)\r\n", c->name, c->args);
-                append_text(line);
-                free(line);
+            if (c->too_big) {
+                /* arguments 超上限: 拒绝执行并把原因交回模型 (执行只会得到非法 JSON) */
+                char msg[512];
+                snprintf(msg, sizeof(msg), "[Tool] %s -> 未执行 (arguments 超过 %dKB 上限)\r\n",
+                         c->name, (int)(ARGS_MAX / 1024));
+                append_text(msg);
+                snprintf(tool_out, sizeof(tool_out),
+                         "(未执行: arguments 超过 %dKB 上限, 已拒绝; 大文件请改用 edit_file "
+                         "分段修改, 或用 execute_bash 分批写入)", (int)(ARGS_MAX / 1024));
+                log_line("[tool] 拒绝执行: name=%s arguments 超过 %dKB 上限",
+                         c->name, (int)(ARGS_MAX / 1024));
+            } else {
+                /* [Tool] 提示行按展示上限堆分配, 不占栈; 执行与回传仍是完整参数。
+                 * 摘要必须按字符边界截取 (utf8_safe_copy): 旧的 %.8192s 会切半汉字,
+                 * 而且硬编码的 8192 与 ARGS_DISPLAY_MAX 脱钩 —— 改宏它不会跟着变。 */
+                size_t cap = ARGS_DISPLAY_MAX + 256;
+                char *line = (char*)malloc(cap);
+                if (line) {
+                    if (c->args[ARGS_DISPLAY_MAX]) {
+                        char *prev = (char*)malloc(cap);
+                        if (prev) {
+                            utf8_safe_copy(c->args, ARGS_DISPLAY_MAX, prev, cap);
+                            snprintf(line, cap, "[Tool] %s(%s…)\r\n", c->name, prev);
+                            free(prev);
+                        } else {
+                            snprintf(line, cap, "[Tool] %s(参数过长, 未显示)\r\n", c->name);
+                        }
+                    } else {
+                        snprintf(line, cap, "[Tool] %s(%s)\r\n", c->name, c->args);
+                    }
+                    append_text(line);
+                    free(line);
+                }
+                dispatch_tool(c->name, c->args, ctx->finish);   /* 错误原因写进 tool_out 交回模型 */
             }
-            dispatch_tool(c->name, c->args, ctx->finish);   /* 错误原因写进 tool_out 交回模型 */
             c->output = strdup(tool_out);
             size_t tl = strlen(tool_out);
-            cap = tl + 64;
-            line = (char*)malloc(cap);
-            if (line) {
+            char *oline = (char*)malloc(tl + 64);
+            if (oline) {
                 int eol = (tl > 0 && (tool_out[tl-1] == '\n' || tool_out[tl-1] == '\r'));
-                snprintf(line, cap, eol ? "[Output]\r\n%s" : "[Output]\r\n%s\r\n", tool_out);
-                append_text(line);
-                free(line);
+                snprintf(oline, tl + 64, eol ? "[Output]\r\n%s" : "[Output]\r\n%s\r\n", tool_out);
+                append_text(oline);
+                free(oline);
             }
         }
 
@@ -736,6 +831,7 @@ static void agent_turn(const char *user_msg) {
             /* 任一步失败: 把本次拼接的 assistant+tool 段全部截掉, 回滚整轮 */
             messages[mstart] = '\0';
             append_text("(历史空间或内存不足, 本轮回滚)\r\n");
+            reason = "历史空间/内存不足 (assistant+tool 段拼装失败)";
             rolled_back = 1;
             goto done;
         }
@@ -747,7 +843,11 @@ done:
         for (int i = 0; i < STREAM_CALLS_MAX; i++) free(calls[i].output);
         free(calls);
     }
-    log_line("[turn] 结束 iter=%d 回滚=%d msgs_len=%zu", iter, rolled_back, strlen(messages));
+    log_line("[turn] 结束 iter=%d 回滚=%d reason=%s msgs_len=%zu touched=%s",
+             iter, rolled_back, reason ? reason : "-", strlen(messages),
+             g_touched_files[0] ? g_touched_files : "-");
+    /* reason 是给日志用的: 界面上那句"(本轮对话已回滚, ...)"对用户够用, 但事后排查必须
+     * 能对上到底走的哪条路径 (取消/内存/UTF-8/解析失败/HTTP)。只记一个 回滚=1 定位不了。 */
     if (rolled_back) {
         messages[savepoint] = '\0';
         /* 对话回滚了, 但文件已经改了 —— 说清楚并列出改了哪些, 免得用户以为也还原了 */

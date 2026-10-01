@@ -1,12 +1,15 @@
 /*
- * core/test.h - 自动化回归测试 (纯静态, 随 cagent_core.h 一起编译)
+ * test/test.h - 自动化回归测试套件 (纯静态)
  *
  * run_all_tests() 覆盖: JSON 解析/转义、编码检测与字符边界、工具分发与参数校验、
  * edit_file 定点编辑的各类边界、HTTP 重试判定。无网络/GUI 依赖, 可离线运行。
  *
+ * 位置: 独立于 src/ —— 核心不该为了某个前端的一键自检而背上测试代码。
+ * 前置条件: **必须先 include src/cagent_core.h** (本文件直接调用那里的 static 函数)。
+ *
  * 复用方式:
- *   - GUI 二进制: cagent.exe --selftest 调用它, 结果写入 selftest.txt
- *   - 命令行: make test 编译 cagent_test.exe 并运行, 退出码即失败数
+ *   - 命令行: make test 编译 test/main.c, 退出码即失败数
+ *   - GUI 二进制: cagent.exe --selftest 调用它, 结果写入 exe 同目录的 selftest.txt
  *
  * 设计取向: 不依赖 LLM/网络, 直接调用各 static 函数并断言行为, 作为"改动即回归"的护栏。
  */
@@ -136,6 +139,127 @@ static int run_all_tests(void) {
             json_free(tcs);
             free(c);
         }
+    }
+
+    /* ---- SSE: arguments 超过旧 8KB 上限要完整保留, 超硬上限置 overflow 而非截断 ---- */
+    {
+        StreamCtx *c = (StreamCtx*)calloc(1, sizeof(StreamCtx));
+        CHK(c != NULL);
+        if (c) {
+            enum { CHUNK = 4096 };              /* 每个 delta 片段字节数; 取 4KB 便于整除 ARGS_MAX */
+            char piece[CHUNK + 1];
+            memset(piece, 'a', CHUNK); piece[CHUNK] = '\0';
+            /* 先灌到硬上限的四分之一: 旧版 8192 上限在这里就静默截出非法 JSON 了 */
+            int quarter = (int)(ARGS_MAX / 4 / CHUNK);
+            if (quarter < 1) quarter = 1;
+            for (int i = 0; i < quarter; i++) {
+                char text[CHUNK + 104];
+                snprintf(text, sizeof(text),
+                         "[{\"index\":0,\"function\":{\"name\":\"write_file\","
+                         "\"arguments\":\"%s\"}}]", piece);
+                JValue *tcs = json_parse(text);
+                CHK(tcs != NULL);
+                stream_apply_tool_calls(c, tcs);
+                json_free(tcs);
+            }
+            CHK(c->calls[0].args_overflow == 0);
+            CHK(strlen(c->calls[0].args) == (size_t)quarter * CHUNK);   /* 一个字节不少 */
+            /* 继续灌到超过硬上限: 置标志、停止拼接, 由执行期拒绝执行 */
+            for (int i = 0; i < 64 && !c->calls[0].args_overflow; i++) {
+                char text[CHUNK + 104];
+                snprintf(text, sizeof(text),
+                         "[{\"index\":0,\"function\":{\"name\":\"write_file\","
+                         "\"arguments\":\"%s\"}}]", piece);
+                JValue *tcs = json_parse(text);
+                CHK(tcs != NULL);
+                stream_apply_tool_calls(c, tcs);
+                json_free(tcs);
+            }
+            CHK(c->calls[0].args_overflow == 1);              /* 超限有信号, 不再静默 */
+            /* 原来是 strlen(args) < sizeof(args) —— 对正确 NUL 结尾的缓冲恒真, 等于没测。
+             * 换成真检查: 停在上限之内、正好落在片段边界、内容没错位。 */
+            size_t al2 = strlen(c->calls[0].args);
+            CHK(al2 > 0 && al2 < (size_t)ARGS_MAX);
+            CHK(al2 % CHUNK == 0);
+            int all_a = 1;
+            for (size_t k = 0; k < al2; k++)
+                if (c->calls[0].args[k] != 'a') { all_a = 0; break; }
+            CHK(all_a);
+            free(c);
+        }
+    }
+
+    /* ---- UTF-8 预检返回值 (供发送前拦截) + 错误预览的安全截取 ---- */
+    {
+        CHK(log_check_utf8("t", "你好", strlen("你好")) == 0);       /* 合法 → 0 */
+        const char half[] = {'a', (char)0xE4, 'b', 0};               /* 半截多字节 */
+        CHK(log_check_utf8("t", half, 3) == 1);                      /* 非法 → 1 (可拦截) */
+        CHK(log_check_utf8("t", "\xC0\xAF", 2) == 1);                /* 过长编码 → 1 */
+        CHK(log_check_utf8("t", "\xED\xA0\x80", 3) == 1);            /* 代理区 → 1 */
+        CHK(log_check_utf8("t", "\x80", 1) == 1);                    /* 孤立续字节 → 1 */
+
+        char out[64];
+        utf8_safe_copy("a中b", 2, out, sizeof(out));                 /* 第 2 字节切在"中"中间 */
+        CHK(strcmp(out, "a") == 0);                                  /* 整字符丢弃, 不出半个 */
+        utf8_safe_copy("a中b", 4, out, sizeof(out));                 /* 恰好完整"中" */
+        CHK(strcmp(out, "a中") == 0);
+        utf8_safe_copy("a中b", 99, out, sizeof(out));                /* 不需要截断 */
+        CHK(strcmp(out, "a中b") == 0);
+        const char badsrc[] = {'x', (char)0xFF, 'y', 0};             /* 源本身含非法字节 */
+        utf8_safe_copy(badsrc, 10, out, sizeof(out));
+        CHK(strcmp(out, "xy") == 0);                                 /* 输出仍合法 */
+        CHK(log_check_utf8("t", out, strlen(out)) == 0);
+
+        /* 严格性回归: 旧实现用位掩码判定首字节, 下列非法序列全被放过 → 预检形同虚设 */
+        CHK(log_check_utf8("t", "\xC0\x80", 2) == 1);                /* overlong 2B */
+        CHK(log_check_utf8("t", "\xC1\xBF", 2) == 1);                /* overlong 2B */
+        CHK(log_check_utf8("t", "\xE0\x80\x80", 3) == 1);            /* overlong 3B */
+        CHK(log_check_utf8("t", "\xF0\x80\x80\x80", 4) == 1);        /* overlong 4B */
+        CHK(log_check_utf8("t", "\xF4\x90\x80\x80", 4) == 1);        /* 超 U+10FFFF */
+        CHK(log_check_utf8("t", "\xF4\x8F\xBF\xBF", 4) == 0);        /* 边界 U+10FFFF 合法 */
+    }
+
+    /* ---- 就地净化: 长度不变 (messages/固定缓冲按容量算), 结果必为合法 UTF-8 ---- */
+    {
+        char b1[] = "a中b";                                       /* 合法: 一个字节都不动 */
+        CHK(utf8_sanitize_inplace(b1) == 0);
+        CHK(strcmp(b1, "a中b") == 0);
+
+        char b2[] = {'a', (char)0xE4, (char)0xB8, 'b', 0};         /* "中" 少一个字节 */
+        size_t n2 = strlen(b2);
+        CHK(utf8_sanitize_inplace(b2) == 2);                       /* E4 与 B8 各是一个坏字节 */
+        CHK(strlen(b2) == n2);                                     /* 长度不变 */
+        CHK(strcmp(b2, "a??b") == 0);
+        CHK(is_valid_utf8((const unsigned char*)b2, strlen(b2)) == 1);
+
+        char b3[] = "GBK:\xc4\xe3\xba\xc3";                        /* 中文 Windows 上的 GBK 字节 */
+        n2 = strlen(b3);
+        CHK(utf8_sanitize_inplace(b3) == 4);
+        CHK(strlen(b3) == n2);
+        CHK(is_valid_utf8((const unsigned char*)b3, strlen(b3)) == 1);
+    }
+
+    /* ---- 坏字节归属的消息序号: 0-based, 且跳过字符串内的字面 {"role" ---- */
+    {
+        const char *b = "{\"model\":\"m\",\"messages\":["
+                        "{\"role\":\"user\",\"content\":\"hi\"},"
+                        "{\"role\":\"assistant\",\"content\":\"x {\\\"role\\\":\\\"fake\\\"} y\"},"
+                        "{\"role\":\"user\",\"content\":\"ZZ\"}"
+                        "],\"tools\":[{\"role\":\"x\"}]}";
+        size_t bl = strlen(b);
+        const char *p = strstr(b, "\"ZZ\"");   /* 第 3 条: 旧实现会因 content 内假 {"role" 与 tools 段而数到 4 */
+        CHK(p != NULL && msg_index_of(b, bl, (size_t)(p - b)) == 2);
+        p = strstr(b, "\"hi\"");
+        CHK(p != NULL && msg_index_of(b, bl, (size_t)(p - b)) == 0);   /* 第 1 条 → 0 (不再差 1) */
+        CHK(msg_index_of(b, bl, 5) == 0);                              /* 坏字节在 messages 之前 */
+    }
+
+    /* ---- 429 重试策略: 限流窗口比普通抖动长, 单独给到 6 次 (实测 3 次会白丢整轮) ---- */
+    if (!getenv("CAGENT_HTTP_RETRIES")) {        /* 环境变量覆盖时语义不同, 跳过 */
+        CHK(http_max_retries_for(429) == HTTP_RATE_RETRIES);
+        CHK(http_max_retries_for(500) == http_max_retries());   /* 其余维持默认 */
+        CHK(http_max_retries_for(-1)  == http_max_retries());
+        CHK(http_max_retries_for(429) > http_max_retries());     /* 429 确实更宽 */
     }
 
     /* ---- SSE: content 装不下要置截断标志并留出标记空间 ---- */

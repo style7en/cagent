@@ -268,6 +268,11 @@ static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
     int ok = load_messages_from_text(buf);
     free(buf);
     if (ok) {
+        /* 会话文件可能被旧版本写过非法字节 (转码失败留下的 GBK 原始字节) 或在外部损坏。
+         * 载入即净化: 否则这串字节每轮都会被 agent_turn 的预检拦下, 会话永久卡死。 */
+        size_t healed = utf8_sanitize_inplace(messages);
+        if (healed)
+            log_line("[utf8] 载入的会话含非法 UTF-8: 已就地净化 %zu 字节 (%s)", healed, path);
         snprintf(g_history_file, sizeof(g_history_file), "%s", path); /* 绑定本对话到该文件 */
         snprintf(g_last_session, sizeof(g_last_session), "%s", path);
     }
