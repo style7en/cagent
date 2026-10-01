@@ -14,9 +14,10 @@ cagent/
 ├── cagent.ini          # 配置文件 (首次启动后自动生成; 必须与 exe 同目录)
 ├── SYSTEM_PROMPT       # 可选: 外置系统提示词 (存在则替代内置默认)
 ├── sessions/           # 历史会话 (运行时生成, 首次保存时自动创建; 旧版散落的 history_*.json 启动时自动搬入)
+│                       #   xxx.json=当前, xxx.json.bak=上一轮, xxx.json.pre_compact=压缩前存档
 ├── log/                # 运行日志 + 失败请求留档 (log=1 时生成, 不入库)
 ├── src/                # 全部源码
-│   ├── main_gui.c      # 界面聚合入口 (include ui/ 与 test/, 供 --selftest)
+│   ├── main_gui.c      # 界面聚合入口 (仅按依赖顺序 include ui/)
 │   ├── cagent_core.h   # 核心聚合入口 (仅按依赖顺序 include core/)
 │   ├── core/           # 平台无关核心, 按子功能拆分 (单 TU, 全 static)
 │   │   ├── version.h   # 版本号单一事实来源 (RC / --version / 标题栏引用)
@@ -43,8 +44,8 @@ cagent/
 │       ├── dpi.h       # 高 DPI 适配
 │       ├── session_dlg.h # 会话选择对话框 (枚举 / 自绘列表 / 载入)
 │       └── main.h      # 程序入口
-└── test/               # 回归测试 (与 src/ 分开: 核心不该为前端自检背上测试代码)
-    ├── test.h          # 测试套件本体 run_all_tests (需先 include src/cagent_core.h)
+└── test/               # 回归测试 (与 src/ 完全分开, 产品二进制不带测试代码)
+    ├── test.h          # 测试套件本体 run_all_tests + json_selftest
     └── main.c          # 控制台入口 (make test)
 └── res/                # 资源
     ├── app.rc          # 图标 + 版本信息
@@ -57,6 +58,11 @@ cagent/
 > 为什么编译产物留在仓库根、而不收进 `build/`: 程序把 **exe 所在目录当作数据根**
 > (见 `src/core/session.h` 的 `get_exe_dir_utf8`), 用它定位 `cagent.ini` / `sessions\` /
 > `log\` / `SYSTEM_PROMPT`。exe 一旦挪进子目录, 这些都会跟着跑过去。
+
+> 会话文件是**原子写**的: 先写 `xxx.json.tmp`, 内容完整落盘后再用 `MoveFileEx` 整体替换。
+> 进程被杀、磁盘写满都不会把已有历史截断成半截 —— 旧文件在新内容落盘前一个字节都不动。
+> 在此之上, `xxx.json.bak` 存上一轮的完整历史供回退, `xxx.json.pre_compact` 是上下文压缩
+> 前的存档; 两者都只有一代, 且主文件被删后会在下次启动时作为孤儿清掉。
 
 ---
 
@@ -94,16 +100,14 @@ make cagent.exe
 make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 即通过)
 ```
 
-也可对 GUI 二进制直接自测(结果写到**当前工作目录**下的 `selftest.txt`):
-
-```bash
-./cagent.exe --selftest
-```
-
-> 测试代码独立在 `test/`,**不**进 `cagent_core.h` 的聚合 —— 核心不该为了某个前端的一键自检
-> 而背上测试代码。需要它的入口各自显式 include:`test/main.c`(命令行)与 `src/main_gui.c`
-> (GUI 的 `--selftest` 分支)。两者都直接复用 `src/cagent_core.h` 的全部 `static` 实现,
-> 因此测的就是真实代码路径,而非另写一份桩。
+> **测试代码全部独立在 `test/`, 产品二进制一行都带。** 它不进 `cagent_core.h` 的聚合,
+> 只有 `test/main.c` 会 include —— 所以 `cagent.exe` 里没有测试代码, 构建时也不需要
+> 额外的 `-I`。测试直接复用 `src/cagent_core.h` 的全部 `static` 实现,因此测的就是真实
+> 代码路径,而非另写一份桩。
+>
+> 历史上还有个 `cagent.exe --selftest` 入口(把结果写进 `selftest.txt`): 它存在的唯一理由
+> 是 GUI 子系统没有控制台、`printf` 没地方去, 只能用文件中转 —— 代价是逼着产品二进制
+> 带上整套测试代码(约 20KB)并给 GUI 编译加 `-I.`。已移除; 要验二进制就用 `make test`。
 
 ---
 
@@ -344,7 +348,10 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 
 版本号的**唯一事实来源**在 `src/core/version.h`（`CAGENT_VER_MAJOR/MINOR/PATCH` 与 `CAGENT_VERSION_STR`），改动版本只改这一处，三处同步引用：
 
-- **Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.1.1.0` + 字符串 `1.1.1`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。`app.rc` 里的 `#include "core/version.h"` 与 `ICON "app.ico"` 都相对自身目录解析，故 Makefile 给 windres 传了 `-I src -I res`。
+- **Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.1.1.0` + 字符串 `1.1.1`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。
+  - `app.rc` 里的 `#include "core/version.h"` 与 `ICON "app.ico"` 都相对自身目录解析，故 Makefile 给 windres 传了 `-I src -I res`。
+  - Makefile 还给 windres 传了 `-c 65001`：`app.rc` 是 UTF-8(无 BOM)，而 windres 默认按**系统 ANSI 码页**解释源码（中文 Windows 上是 936/GBK）。漏了这个选项，非 ASCII 字符串会被按 GBK 拆成乱码写进资源 —— 表现为文件属性里出现 `C 璇█鏋佺畝缂栫▼ Agent` 这类乱码。**新增非 ASCII 文本前请确认该选项仍在。**
+  - `FileDescription` 当前是纯英文（`cagent - a minimal AI coding agent in C`），一个额外的保险。
 - **命令行**：`cagent.exe --version` 打印 `cagent 1.1.1`（有父控制台则打印到终端，否则弹对话框）。
 - **窗口标题栏**：显示 `cagent 1.1.1`。
 

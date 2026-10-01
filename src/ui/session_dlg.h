@@ -1,7 +1,7 @@
 /*
  * ui/session_dlg.h - 会话选择对话框: 枚举 / 自绘列表 / 载入
  *
- * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 main_gui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* ===== 历史会话选择对话框 (非模态, 由主消息循环驱动) ===== */

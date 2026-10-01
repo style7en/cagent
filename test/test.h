@@ -4,15 +4,130 @@
  * run_all_tests() 覆盖: JSON 解析/转义、编码检测与字符边界、工具分发与参数校验、
  * edit_file 定点编辑的各类边界、HTTP 重试判定。无网络/GUI 依赖, 可离线运行。
  *
- * 位置: 独立于 src/ —— 核心不该为了某个前端的一键自检而背上测试代码。
+ * 位置: 独立于 src/ —— 核心与产品二进制都不该背测试代码。
  * 前置条件: **必须先 include src/cagent_core.h** (本文件直接调用那里的 static 函数)。
  *
- * 复用方式:
- *   - 命令行: make test 编译 test/main.c, 退出码即失败数
- *   - GUI 二进制: cagent.exe --selftest 调用它, 结果写入 exe 同目录的 selftest.txt
+ * 唯一的运行方式是命令行: make test 编译 test/main.c, 退出码即失败数。
+ * (曾经还有个 `cagent.exe --selftest` 入口把结果写进 selftest.txt, 已移除 ——
+ *  GUI 子系统没有控制台才需要文件中转, 而它逼着产品二进制带上整套测试代码, 不划算。)
  *
  * 设计取向: 不依赖 LLM/网络, 直接调用各 static 函数并断言行为, 作为"改动即回归"的护栏。
  */
+
+/* ---- 测试用的隔离工作目录 ----
+ * 必须是**绝对路径**: g_workspace 的相对值现在按 exe 目录解析 (见 workspace.h 的
+ * normalize_workspace), 若沿用"塞个相对路径、靠 CWD 规范化"的旧写法, 测试结果就会随
+ * "从哪个目录启动"变化 —— 从仓库根跑能过, 换个目录全挂。 */
+static char g_test_ws[MAX_PATH];
+
+static void test_ws_begin(void) {
+    char exedir[MAX_PATH];
+    get_exe_dir_utf8(exedir, sizeof(exedir));
+    snprintf(g_test_ws, sizeof(g_test_ws), "%s\\cagent_test_ws", exedir);
+    wchar_t wd[MAX_PATH];
+    if (utf8_to_wide(g_test_ws, wd, MAX_PATH)) CreateDirectoryW(wd, NULL);
+    snprintf(g_workspace, sizeof(g_workspace), "%s", g_test_ws);
+    g_touched_files[0] = '\0';
+}
+
+/* 删掉测试工作目录里的一个文件 (走绝对路径, 不受 CWD 影响) */
+static void test_ws_rm(const char *name) {
+    char p[MAX_PATH];
+    wchar_t w[MAX_PATH];
+    snprintf(p, sizeof(p), "%s\\%s", g_test_ws, name);
+    if (utf8_to_wide(p, w, MAX_PATH)) DeleteFileW(w);
+}
+
+static void test_ws_end(void) {
+    wchar_t w[MAX_PATH];
+    if (utf8_to_wide(g_test_ws, w, MAX_PATH)) RemoveDirectoryW(w);
+    g_workspace[0] = '\0';
+}
+
+/* ---- JSON 解析 / 转义 / DPAPI 自检 ----
+ * 原在 core/json.h 里与真实实现挤在同一个产品头文件里。
+ * 既然测试已独立到 test/, 一并搬过来 —— 产品二进制不该带测试代码。 */
+
+static int json_selftest(void) {
+    int fails = 0;
+    #define CHK(cond) do { if(!(cond)) { printf("FAIL: %s\n", #cond); fails++; } } while(0)
+
+    /* 基本对象 + 各类型 */
+    {
+        JValue *r = json_parse("{\"name\":\"abc\",\"n\":3,\"b\":true,\"x\":null}");
+        CHK(r != NULL && r->type == J_OBJ);
+        CHK(json_as_str(json_obj_get(r,"name")) && strcmp(json_as_str(json_obj_get(r,"name")),"abc")==0);
+        CHK(json_obj_get(r,"n") && json_obj_get(r,"n")->num == 3.0);
+        CHK(json_obj_get(r,"b") && json_obj_get(r,"b")->b == 1);
+        CHK(json_obj_get(r,"x") && json_obj_get(r,"x")->type == J_NULL);
+        json_free(r);
+    }
+    /* 数组 + 嵌套对象 */
+    {
+        JValue *r = json_parse("{\"arr\":[1,2,{\"k\":\"v\"}]}");
+        CHK(r != NULL);
+        const JValue *a = json_obj_get(r,"arr");
+        CHK(a && a->type == J_ARR && a->arr.n == 3);
+        CHK(json_arr_at(a,1) && json_arr_at(a,1)->num == 2.0);
+        CHK(json_as_str(json_obj_get(json_arr_at(a,2),"k")) && strcmp(json_as_str(json_obj_get(json_arr_at(a,2),"k")),"v")==0);
+        json_free(r);
+    }
+    /* 转义 + 中文 + 代理对 */
+    {
+        JValue *r = json_parse("\"a\\nb\\tc\\\\d\\\"e\\/\\u4e2d\\uD83D\\uDE00\"");
+        CHK(r != NULL && r->type == J_STR);
+        CHK(r && strcmp(r->str, "a\nb\tc\\d\"e/中😀") == 0);
+        json_free(r);
+    }
+    /* OpenAI 风格 tool_calls (arguments 是字符串化 JSON, 需二次解析) */
+    {
+        JValue *r = json_parse("{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"execute_bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}");
+        CHK(r != NULL);
+        const JValue *msg = json_obj_get(json_arr_at(json_obj_get(r,"choices"),0),"message");
+        CHK(msg != NULL);
+        const JValue *tcs = json_obj_get(msg,"tool_calls");
+        CHK(tcs && tcs->type==J_ARR && tcs->arr.n==1);
+        const JValue *tc0 = json_arr_at(tcs,0);
+        CHK(json_as_str(json_obj_get(tc0,"id")) && strcmp(json_as_str(json_obj_get(tc0,"id")),"call_1")==0);
+        const char *args = json_as_str(json_obj_get(json_obj_get(tc0,"function"),"arguments"));
+        CHK(args != NULL);
+        JValue *argsj = json_parse(args);
+        CHK(argsj != NULL);
+        CHK(json_as_str(json_obj_get(argsj,"command")) && strcmp(json_as_str(json_obj_get(argsj,"command")),"ls")==0);
+        json_free(argsj);
+        json_free(r);
+    }
+    /* 非法输入 */
+    CHK(json_parse("{") == NULL);
+    CHK(json_parse("[1,]") == NULL);
+    CHK(json_parse("\"unterminated") == NULL);
+    CHK(json_parse("") == NULL);
+    /* BOM + 前后空白 */
+    {
+        JValue *r = json_parse("\xEF\xBB\xBF  {\"k\":\"v\"}  ");
+        CHK(r != NULL && strcmp(json_as_str(json_obj_get(r,"k")),"v")==0);
+        json_free(r);
+    }
+
+    /* DPAPI round-trip + 明文兼容 */
+    {
+        const char *plain = "sk-test-key-123";
+        char *enc = dpapi_protect(plain);
+        CHK(enc != NULL && strncmp(enc, "dpapi:", 6) == 0);
+        char *dec = dpapi_unprotect(enc);
+        CHK(dec != NULL && strcmp(dec, plain) == 0);
+        free(enc); free(dec);
+        char *dec2 = dpapi_unprotect("sk-plain-key");
+        CHK(dec2 != NULL && strcmp(dec2, "sk-plain-key") == 0);
+        free(dec2);
+    }
+
+    if (fails == 0) printf("json_selftest: OK\n");
+    else printf("json_selftest: %d FAIL(s)\n", fails);
+    return fails ? 1 : 0;
+    #undef CHK
+}
+
 
 static int run_all_tests(void) {
     int fails = 0;
@@ -60,10 +175,7 @@ static int run_all_tests(void) {
 
     /* ---- 工具: edit_file 定点编辑边界 ---- */
     {
-        /* 准备隔离的测试工作目录 (相对 CWD, GetFullPathName 会规范化) */
-        CreateDirectoryA("cagent_test_ws", NULL);
-        strcpy(g_workspace, "cagent_test_ws");
-        g_touched_files[0] = '\0';
+        test_ws_begin();   /* 隔离工作目录 (绝对路径, 建在 exe 同目录) */
 
         /* 写一个测试文件 (ASCII, 合法 UTF-8) */
         tool_write_file("e.txt", "alpha\nbeta\ngamma\n");
@@ -101,12 +213,11 @@ static int run_all_tests(void) {
         tool_write_file("gbk.txt", "\xC4\xE3\n");   /* 原始 GBK 字节 (你 + 换行) */
         tool_edit_file("gbk.txt", "你", "您");
         CHK(strstr(tool_out, "不是 UTF-8") != NULL);
-        remove("cagent_test_ws/gbk.txt");
+        test_ws_rm("gbk.txt");
 
         /* 清理测试目录 */
-        remove("cagent_test_ws/e.txt");
-        RemoveDirectoryA("cagent_test_ws");
-        g_workspace[0] = '\0';
+        test_ws_rm("e.txt");
+        test_ws_end();
     }
 
     /* ---- 命令执行: 退出码 ---- */
@@ -322,8 +433,7 @@ static int run_all_tests(void) {
 
     /* ---- 沙箱: 路径穿越 / 越界必须被拒 ---- */
     {
-        CreateDirectoryA("cagent_test_ws", NULL);
-        strcpy(g_workspace, "cagent_test_ws");
+        test_ws_begin();
         /* 相对路径穿越到工作目录外 */
         CHK(path_in_workspace("../escape.txt") == 0);
         CHK(path_in_workspace("..\\escape.txt") == 0);
@@ -337,8 +447,7 @@ static int run_all_tests(void) {
         CHK(strstr(tool_out, "路径在工作目录外") != NULL);
         tool_edit_file("C:\\windows\\system32\\x.txt", "a", "b");
         CHK(strstr(tool_out, "路径在工作目录外") != NULL);
-        RemoveDirectoryA("cagent_test_ws");
-        g_workspace[0] = '\0';
+        test_ws_end();
     }
 
     /* ---- 会话命名: 同秒冲突要能避开 ---- */
@@ -350,6 +459,47 @@ static int run_all_tests(void) {
         build_new_session_path(sp2, sizeof(sp2));
         CHK(strcmp(sp1, sp2) != 0);           /* 冲突时应换名, 而非覆盖 */
         remove(sp1);
+    }
+
+    /* ---- 会话原子写: 失败时目标必须原样不动, 且不留 .tmp ----
+     * 会话是整文件覆盖的, 老的 fopen(path,"wb") 会先截断旧内容, 中途出事就全丢。
+     * 这里用"把目标设为只读"构造 MoveFileEx 失败 (实测返回 ERROR_ACCESS_DENIED),
+     * 验证旧内容完好 —— 这正是原子写相对直接覆盖的核心保证。 */
+    {
+        test_ws_begin();
+        char atomic[MAX_PATH], atomictmp[MAX_PATH];
+        snprintf(atomic,    sizeof(atomic),    "%s\\atomic.json",     g_test_ws);
+        snprintf(atomictmp, sizeof(atomictmp), "%s\\atomic.json.tmp", g_test_ws);
+        wchar_t wdst[MAX_PATH], wtmp[MAX_PATH];
+        CHK(utf8_to_wide(atomic, wdst, MAX_PATH));
+        CHK(utf8_to_wide(atomictmp, wtmp, MAX_PATH));
+
+        char buf[256];
+
+        /* 1. 正常写: 内容正确, 且不残留中间文件 */
+        CHK(session_write_atomic(atomic, "WS", ",{\"role\":\"user\",\"content\":\"hi\"}") == 1);
+        buf[0] = '\0';
+        { FILE *f = fopen_utf8(atomic, "rb");
+          if (f) { fread(buf, 1, sizeof(buf) - 1, f); fclose(f); } }
+        CHK(strstr(buf, "\"workspace\":\"WS\"") != NULL);
+        CHK(strstr(buf, "\"messages\":[") != NULL);
+        CHK(strstr(buf, "hi") != NULL);
+        CHK(GetFileAttributesW(wtmp) == INVALID_FILE_ATTRIBUTES);   /* .tmp 已随替换消失 */
+
+        /* 2. 写入失败 (目标只读 -> MoveFileEx 拒绝): 旧内容完好, 新内容没混进去 */
+        SetFileAttributesW(wdst, FILE_ATTRIBUTE_READONLY);
+        CHK(session_write_atomic(atomic, "WS2", ",{\"role\":\"user\",\"content\":\"NEW\"}") == 0);
+        SetFileAttributesW(wdst, FILE_ATTRIBUTE_NORMAL);            /* 复位, 否则删不掉 */
+        buf[0] = '\0';
+        { FILE *f = fopen_utf8(atomic, "rb");
+          if (f) { fread(buf, 1, sizeof(buf) - 1, f); fclose(f); } }
+        CHK(strstr(buf, "hi") != NULL);        /* 旧内容原封不动 */
+        CHK(strstr(buf, "NEW") == NULL);       /* 失败的那次没污染目标 */
+        CHK(GetFileAttributesW(wtmp) == INVALID_FILE_ATTRIBUTES);   /* 失败路径也清掉了 .tmp */
+
+        test_ws_rm("atomic.json");
+        test_ws_rm("atomic.json.tmp");
+        test_ws_end();
     }
 
     /* ---- 上下文压缩: 消息遍历辅助 ---- */
@@ -459,8 +609,7 @@ static int run_all_tests(void) {
 
     /* ---- 工具: read_file 的 offset 分块续读 ---- */
     {
-        CreateDirectoryA("cagent_test_ws", NULL);
-        strcpy(g_workspace, "cagent_test_ws");
+        test_ws_begin();
 
         /* 20KB 文件: 默认 16KB 上限必须截断并给出续读 offset */
         {
@@ -489,7 +638,7 @@ static int run_all_tests(void) {
             tool_read_file("big.txt", 999999);
             CHK(strstr(tool_out, "已无内容") != NULL);
 
-            remove("cagent_test_ws/big.txt");
+            test_ws_rm("big.txt");
         }
 
         /* offset 落在多字节字符中间: 前移到字符边界, 不出乱码
@@ -508,11 +657,10 @@ static int run_all_tests(void) {
             dispatch_tool("read_file", "{\"path\":\"u8.txt\",\"offset\":\"abc\"}", "");
             CHK(strcmp(tool_out, "aaaa你你你") == 0);
 
-            remove("cagent_test_ws/u8.txt");
+            test_ws_rm("u8.txt");
         }
 
-        RemoveDirectoryA("cagent_test_ws");
-        g_workspace[0] = '\0';
+        test_ws_end();
     }
 
     /* ---- run_pipe / append_note 边界: 空/过小缓冲绝不越界写 ---- */

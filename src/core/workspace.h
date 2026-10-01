@@ -39,10 +39,54 @@ static void get_exe_dir_utf8(char *out, size_t cap) {
     WideCharToMultiByte(CP_UTF8, 0, wexe, -1, out, (int)cap, NULL, NULL);
 }
 
-/* 确保 g_workspace 已初始化 (默认 exe 目录) */
+/* 把 g_workspace 归一化成绝对路径并去掉结尾反斜杠 (幂等)。
+ *
+ * 为什么必须做: path_in_workspace 内部用 GetFullPathNameW 规范化待校验路径, 而它解析
+ * **相对路径**时依据的是**当时的进程 CWD**; 这个 CWD 又会被 ui/task.h 的
+ * SetCurrentDirectoryW 反复改写 —— ini 里一旦填了相对的 workspace=, "哪些路径算在工作
+ * 目录内"就会随历史操作漂移 (校验基准与执行位置分家)。归一化后判据不再依赖 CWD。
+ *
+ * 相对值按 **exe 目录**解析 (与 ini/log/sessions 的锚点一致), 不按 CWD —— 否则同一个 ini
+ * 从不同目录启动会得到不同的工作目录, 那才是最糟的"不稳定"。解析失败保留原值, 不清空配置。 */
+static void normalize_workspace(void) {
+    if (!g_workspace[0]) return;
+
+    char cand[MAX_PATH];
+    int absolute = (g_workspace[0] == '\\' || g_workspace[0] == '/' ||
+                    (g_workspace[0] && g_workspace[1] == ':'));
+    if (absolute) {
+        snprintf(cand, sizeof(cand), "%s", g_workspace);
+    } else {
+        char exedir[MAX_PATH];
+        get_exe_dir_utf8(exedir, sizeof(exedir));
+        if (!exedir[0]) return;
+        snprintf(cand, sizeof(cand), "%s\\%s", exedir, g_workspace);
+    }
+
+    wchar_t win[MAX_PATH], wout[MAX_PATH];
+    if (!utf8_to_wide(cand, win, MAX_PATH)) return;
+    DWORD n = GetFullPathNameW(win, MAX_PATH, wout, NULL);
+    if (n == 0 || n >= MAX_PATH) return;
+
+    char out[MAX_PATH];
+    if (WideCharToMultiByte(CP_UTF8, 0, wout, -1, out, sizeof(out), NULL, NULL) <= 0) return;
+
+    /* 去掉结尾反斜杠, 与 get_exe_dir_utf8 保持一致。但 "C:\" 不能剥成 "C:" ——
+     * 那是"盘符相对路径", 含义完全不同, 故保留长度 2 的根形式。 */
+    size_t len = strlen(out);
+    while (len > 2 && (out[len-1] == '\\' || out[len-1] == '/')) out[--len] = '\0';
+
+    if (strcmp(out, g_workspace) != 0) {           /* 只在真的变了时记一次 (归一化后即幂等) */
+        log_line("[ws] workspace 归一化: %s -> %s", g_workspace, out);
+        snprintf(g_workspace, sizeof(g_workspace), "%s", out);
+    }
+}
+
+/* 确保 g_workspace 已初始化 (无值则默认 exe 目录) 并已归一化。
+ * 归一化是幂等的, 所以在每个入口都调一次是安全的 —— 见 normalize_workspace 的说明。 */
 static void ensure_workspace(void) {
-    if (g_workspace[0]) return;
-    get_exe_dir_utf8(g_workspace, sizeof(g_workspace));
+    if (!g_workspace[0]) get_exe_dir_utf8(g_workspace, sizeof(g_workspace));
+    normalize_workspace();
 }
 
 /* 检查 path 规范化后是否在 g_workspace 内。返回 1 合法, 0 非法。 */

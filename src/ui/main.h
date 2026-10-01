@@ -1,7 +1,7 @@
 /*
  * ui/main.h - 程序入口: 注册窗口类 / 图标 / 消息循环
  *
- * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 main_gui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
@@ -17,10 +17,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
             MessageBoxW(NULL, CAGENT_VERSION_WSTR, L"cagent", MB_OK | MB_ICONINFORMATION);
         }
         return 0;
-    }
-    if (cmd && strstr(cmd, "--selftest")) {
-        freopen("selftest.txt", "w", stdout);
-        return run_all_tests();   /* 覆盖 JSON/编码/工具/HTTP 的全套回归 */
     }
 
     /* 安装宿主钩子 (必须在 agent 运行前设置) */

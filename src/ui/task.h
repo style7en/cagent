@@ -1,7 +1,7 @@
 /*
  * ui/task.h - 启动一轮 Agent: 配置校验 / 工作目录 / 线程派发
  *
- * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 main_gui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* ===== 启动一轮 Agent (GUI) ===== */
@@ -21,6 +21,15 @@ static void start_task(HWND hwnd) {
     read_edit_utf8(g_hCfg[CFG_KEY], g_api_key, sizeof(g_api_key));
     read_edit_utf8(g_hCfg[CFG_MDL], g_model,   sizeof(g_model));
     read_edit_utf8(g_hWorkspace, g_workspace, sizeof(g_workspace));
+    /* 先归一化成绝对路径再校验: 用户填相对路径时, 下面的存在性检查与 SetCurrentDirectoryW
+     * 都会随 CWD 漂移 (相对值按 exe 目录解析, 见 normalize_workspace)。变了就回写输入框,
+     * 让用户看到实际生效的值。 */
+    {
+        char before[MAX_PATH];
+        snprintf(before, sizeof(before), "%s", g_workspace);
+        normalize_workspace();
+        if (strcmp(before, g_workspace) != 0) set_edit_utf8(g_hWorkspace, g_workspace);
+    }
 
     /* 工作目录必须存在且是目录: 否则 SetCurrentDirectoryW 静默失败, 命令会落在上一个
      * CWD 上, 而 path_in_workspace 又按 g_workspace 放行 —— 校验基准和执行位置分家。 */

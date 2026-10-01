@@ -22,92 +22,12 @@ struct JValue {
     };
 };
 
-/* 前向声明: selftest 在桩实现之前定义, 需先声明全部公共 API */
+/* 前向声明: 真实实现里 json_parse_value 会先用到 json_free, 故公共 API 要先声明 */
 void         json_free(JValue *v);
 JValue       *json_parse(const char *text);
 const JValue *json_obj_get(const JValue *obj, const char *key);
 const JValue *json_arr_at(const JValue *arr, size_t i);
 const char   *json_as_str(const JValue *v);
-
-static int json_selftest(void) {
-    int fails = 0;
-    #define CHK(cond) do { if(!(cond)) { printf("FAIL: %s\n", #cond); fails++; } } while(0)
-
-    /* 基本对象 + 各类型 */
-    {
-        JValue *r = json_parse("{\"name\":\"abc\",\"n\":3,\"b\":true,\"x\":null}");
-        CHK(r != NULL && r->type == J_OBJ);
-        CHK(json_as_str(json_obj_get(r,"name")) && strcmp(json_as_str(json_obj_get(r,"name")),"abc")==0);
-        CHK(json_obj_get(r,"n") && json_obj_get(r,"n")->num == 3.0);
-        CHK(json_obj_get(r,"b") && json_obj_get(r,"b")->b == 1);
-        CHK(json_obj_get(r,"x") && json_obj_get(r,"x")->type == J_NULL);
-        json_free(r);
-    }
-    /* 数组 + 嵌套对象 */
-    {
-        JValue *r = json_parse("{\"arr\":[1,2,{\"k\":\"v\"}]}");
-        CHK(r != NULL);
-        const JValue *a = json_obj_get(r,"arr");
-        CHK(a && a->type == J_ARR && a->arr.n == 3);
-        CHK(json_arr_at(a,1) && json_arr_at(a,1)->num == 2.0);
-        CHK(json_as_str(json_obj_get(json_arr_at(a,2),"k")) && strcmp(json_as_str(json_obj_get(json_arr_at(a,2),"k")),"v")==0);
-        json_free(r);
-    }
-    /* 转义 + 中文 + 代理对 */
-    {
-        JValue *r = json_parse("\"a\\nb\\tc\\\\d\\\"e\\/\\u4e2d\\uD83D\\uDE00\"");
-        CHK(r != NULL && r->type == J_STR);
-        CHK(r && strcmp(r->str, "a\nb\tc\\d\"e/中😀") == 0);
-        json_free(r);
-    }
-    /* OpenAI 风格 tool_calls (arguments 是字符串化 JSON, 需二次解析) */
-    {
-        JValue *r = json_parse("{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"execute_bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}");
-        CHK(r != NULL);
-        const JValue *msg = json_obj_get(json_arr_at(json_obj_get(r,"choices"),0),"message");
-        CHK(msg != NULL);
-        const JValue *tcs = json_obj_get(msg,"tool_calls");
-        CHK(tcs && tcs->type==J_ARR && tcs->arr.n==1);
-        const JValue *tc0 = json_arr_at(tcs,0);
-        CHK(json_as_str(json_obj_get(tc0,"id")) && strcmp(json_as_str(json_obj_get(tc0,"id")),"call_1")==0);
-        const char *args = json_as_str(json_obj_get(json_obj_get(tc0,"function"),"arguments"));
-        CHK(args != NULL);
-        JValue *argsj = json_parse(args);
-        CHK(argsj != NULL);
-        CHK(json_as_str(json_obj_get(argsj,"command")) && strcmp(json_as_str(json_obj_get(argsj,"command")),"ls")==0);
-        json_free(argsj);
-        json_free(r);
-    }
-    /* 非法输入 */
-    CHK(json_parse("{") == NULL);
-    CHK(json_parse("[1,]") == NULL);
-    CHK(json_parse("\"unterminated") == NULL);
-    CHK(json_parse("") == NULL);
-    /* BOM + 前后空白 */
-    {
-        JValue *r = json_parse("\xEF\xBB\xBF  {\"k\":\"v\"}  ");
-        CHK(r != NULL && strcmp(json_as_str(json_obj_get(r,"k")),"v")==0);
-        json_free(r);
-    }
-
-    /* DPAPI round-trip + 明文兼容 */
-    {
-        const char *plain = "sk-test-key-123";
-        char *enc = dpapi_protect(plain);
-        CHK(enc != NULL && strncmp(enc, "dpapi:", 6) == 0);
-        char *dec = dpapi_unprotect(enc);
-        CHK(dec != NULL && strcmp(dec, plain) == 0);
-        free(enc); free(dec);
-        char *dec2 = dpapi_unprotect("sk-plain-key");
-        CHK(dec2 != NULL && strcmp(dec2, "sk-plain-key") == 0);
-        free(dec2);
-    }
-
-    if (fails == 0) printf("json_selftest: OK\n");
-    else printf("json_selftest: %d FAIL(s)\n", fails);
-    return fails ? 1 : 0;
-    #undef CHK
-}
 
 /* —— 真实实现 —— */
 

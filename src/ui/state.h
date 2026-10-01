@@ -1,7 +1,7 @@
 /*
  * ui/state.h - 控件 ID / 自定义消息 / 全局句柄与字体
  *
- * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 main_gui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* 界面层额外依赖: Shell/COM (选目录对话框) */

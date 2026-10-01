@@ -51,7 +51,7 @@
 #include "core/session.h"
 #include "core/config.h"
 
-/* 注: 回归测试套件在仓库根的 test/test.h, 刻意**不**在这里聚合 —— 核心不该为了某个前端
- * 的 --selftest 而背上测试代码。需要它的入口自行 include (见 src/main_gui.c 与 test/main.c)。 */
+/* 注: 回归测试套件在仓库根的 test/, 刻意**不**在这里聚合 —— 核心不该背测试代码,
+ * 产品二进制也不该。只有测试入口 (test/main.c) 会 include 它。 */
 
 #endif /* CAGENT_CORE_H */

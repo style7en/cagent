@@ -1,7 +1,7 @@
 /*
  * ui/wndproc.h - 布局 / 输入框子类 / 主窗口过程 / 历史框子类
  *
- * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 main_gui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* ===== 布局 / 子类化 / 窗口过程 ===== */
@@ -91,6 +91,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         log_line("[启动] cagent %s, 日志已启用 (cagent.ini 里 log=0 可关)", CAGENT_VERSION_STR);
         system_prompt_init();        /* 读 exe 同目录外置 SYSTEM_PROMPT, 缺失/无效静默用默认 */
         migrate_legacy_sessions();   /* 旧版散落在 exe 目录的会话搬进 sessions\ */
+        cleanup_orphan_session_backups();   /* 主文件已删的 .bak / .pre_compact 顺手清掉 */
         set_edit_utf8(g_hCfg[CFG_URL], g_api_url);
         set_edit_utf8(g_hCfg[CFG_KEY], g_api_key);
         set_edit_utf8(g_hCfg[CFG_MDL], g_model);

@@ -26,10 +26,6 @@
 #include <commctrl.h>
 #include <richedit.h>
 #include "cagent_core.h"
-/* 回归测试套件独立在 test/, 只有本文件的 --selftest 分支用它, 所以刻意不放进
- * cagent_core.h —— 核心不该为前端的一键自检背上测试代码。路径靠 Makefile 的 -I. 解析;
- * test.h 依赖核心的 static 函数, 必须排在 cagent_core.h 之后。 */
-#include "test/test.h"
 
 #include "ui/state.h"
 #include "ui/hooks.h"

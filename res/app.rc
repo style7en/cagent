@@ -1,4 +1,7 @@
 // cagent 资源: 应用图标 + 版本信息
+// 本文件是 UTF-8(无 BOM): windres 默认按系统 ANSI 码页解释源码, 中文 Windows 上是 936(GBK),
+// 非 ASCII 字符串会被拆成乱码写进资源。Makefile 已传 -c 65001 修正; 新增非 ASCII 文本时
+// 请确认该选项仍在, 否则文件属性里的描述会再次变乱码。
 #include "core/version.h"
 
 1 ICON "app.ico"
@@ -19,7 +22,7 @@ BEGIN
     BEGIN
         BLOCK "080404B0"    /* 0x0804=简体中文, 1200=Unicode */
         BEGIN
-            VALUE "FileDescription", "cagent - C 语言极简编程 Agent"
+            VALUE "FileDescription", "cagent - a minimal AI coding agent in C"
             VALUE "FileVersion", CAGENT_VERSION_STR
             VALUE "ProductName", "cagent"
             VALUE "ProductVersion", CAGENT_VERSION_STR

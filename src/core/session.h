@@ -68,6 +68,48 @@ static CAGENT_MAYBE_UNUSED void migrate_legacy_sessions(void) {
     FindClose(h);
 }
 
+/* 清理孤儿备份: 会话主文件被删掉/改名之后, 它的 .bak / .pre_compact 会永远留在
+ * sessions\ 里 (会话列表按 history_*.json 枚举, 列不出它们, 所以没人会注意到)。
+ * 只删"对应 .json 已不存在"的备份 —— 主文件还在的绝对不动。启动时调一次即可。 */
+static CAGENT_MAYBE_UNUSED void cleanup_orphan_session_backups(void) {
+    char dir[MAX_PATH];
+    sessions_dir(dir, sizeof(dir));                    /* 含结尾 \ */
+    char pat[MAX_PATH];
+    snprintf(pat, sizeof(pat), "%shistory_*", dir);    /* 主文件与两种备份都落在这个前缀下 */
+    wchar_t wpat[MAX_PATH];
+    if (!utf8_to_wide(pat, wpat, MAX_PATH)) return;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    int removed = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char name[MAX_PATH];
+        if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof(name), NULL, NULL) <= 0)
+            continue;
+
+        size_t nl = strlen(name);
+        const char *suffix = NULL;
+        if (nl > 4  && strcmp(name + nl - 4,  ".bak") == 0)         suffix = ".bak";
+        else if (nl > 12 && strcmp(name + nl - 12, ".pre_compact") == 0) suffix = ".pre_compact";
+        if (!suffix) continue;                         /* .json 主文件本身, 不动 */
+
+        char base[MAX_PATH];
+        snprintf(base, sizeof(base), "%s%.*s", dir, (int)(nl - strlen(suffix)), name);
+        wchar_t wbase[MAX_PATH];
+        if (!utf8_to_wide(base, wbase, MAX_PATH)) continue;
+        if (GetFileAttributesW(wbase) != INVALID_FILE_ATTRIBUTES) continue;   /* 主文件还在 */
+
+        char victim[MAX_PATH];
+        snprintf(victim, sizeof(victim), "%s%s", dir, name);
+        wchar_t wv[MAX_PATH];
+        if (utf8_to_wide(victim, wv, MAX_PATH) && DeleteFileW(wv)) removed++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (removed) log_line("[session] 已清理 %d 个孤儿备份 (对应的会话文件已不存在)", removed);
+}
+
 /* djb2 字符串哈希, 用于工作目录的稳定摘要 (防文件名超长/冲突) */
 static unsigned int djb2_hash(const char *s) {
     unsigned int h = 5381; int c;
@@ -214,6 +256,31 @@ static int load_messages_from_text(const char *text) {
     return 0;   /* 无法识别: 视为无有效历史, 从新对话开始 */
 }
 
+/* 原子写会话文件: 先写 <原名>.tmp, 内容完整落盘后再整体替换目标。
+ *
+ * 会话是整文件覆盖的, 直接 fopen(path,"wb") 会**先截断旧内容** —— 此时进程被杀、磁盘写满、
+ * 或写一半出错, 原历史就没了 (事后补的 .bak 只有一代, 救不回更早的)。
+ * 同卷上 MoveFileExW 的替换是原子的: 旧文件在新内容完整落盘之前一个字节都不动。
+ * 任一步失败都删掉 .tmp 并保持目标原样, 返回 0 让调用方上报。 */
+static int session_write_atomic(const char *path, const char *workspace_esc, const char *conv) {
+    char tmp[MAX_PATH + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    wchar_t wtmp[MAX_PATH + 8], wdst[MAX_PATH];
+    if (!utf8_to_wide(tmp, wtmp, MAX_PATH + 8)) return 0;
+    if (!utf8_to_wide(path, wdst, MAX_PATH)) return 0;
+
+    FILE *f = fopen_utf8(tmp, "wb");
+    if (!f) return 0;
+    /* workspace_esc 只含转义内容不带引号, 此处必须自己补上 */
+    int ok = (fprintf(f, "{\"workspace\":\"%s\",\"messages\":[", workspace_esc) > 0);
+    if (ok) ok = (fputs(conv, f) >= 0);
+    if (ok) ok = (fputs("]}", f) >= 0);
+    if (fclose(f) != 0) ok = 0;                 /* 磁盘满在这时才暴露, 不能只看写入调用 */
+    if (!ok) { DeleteFileW(wtmp); return 0; }   /* 目标保持不动 */
+    if (!MoveFileExW(wtmp, wdst, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(wtmp); return 0; }
+    return 1;
+}
+
 /* 保存历史: 自描述格式 {"workspace":...,"messages":[...]}, 仅存对话部分。 */
 static void history_save(void) {
     size_t skip = strlen(g_system_prompt);
@@ -226,7 +293,8 @@ static void history_save(void) {
     if (g_history_file[0] == '\0')
         build_new_session_path(g_history_file, sizeof(g_history_file));
     const char *path = g_history_file;
-    /* 覆盖前先备份上次内容, 防止压缩摘要/异常写入导致原历史不可恢复 */
+    /* 覆盖前备份上次内容。有了原子写, 它不再是"防写坏"的补丁, 而是"回退到上一轮"的入口:
+     * 存的是一份能正常加载的完整历史, 比 .tmp 兜底更有用。 */
     {
         wchar_t wsrc[MAX_PATH], wbak[MAX_PATH];
         if (utf8_to_wide(path, wsrc, MAX_PATH) &&
@@ -235,17 +303,12 @@ static void history_save(void) {
             CopyFileW(wsrc, wbak, FALSE);
         }
     }
-    FILE *f = fopen_utf8(path, "wb");
-    if (!f) return;
-    char *wse = json_escape_alloc(g_workspace);
-    if (!wse) { fclose(f); return; }
-    /* wse 只含转义内容不带引号, 此处必须自己补上 */
-    fprintf(f, "{\"workspace\":\"%s\",\"messages\":[", wse);
     if (conv[0] == ',') conv++;                 /* 数组内部不需要前导逗号 */
-    fputs(conv, f);
-    fputs("]}", f);
+    char *wse = json_escape_alloc(g_workspace);
+    if (!wse) return;
+    int ok = session_write_atomic(path, wse, conv);
     free(wse);
-    fclose(f);
+    if (!ok) { log_line("[session] 保存失败, 原文件未动: %s", path); return; }
     log_line("[session] 保存 %s (%zu bytes)", path, strlen(conv));
     snprintf(g_last_session, sizeof(g_last_session), "%s", path);
 }

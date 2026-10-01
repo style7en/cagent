@@ -1,7 +1,7 @@
 /*
  * ui/dpi.h - 高 DPI 适配 (三级降级)
  *
- * cagent 界面层的一部分, 由 cagent_ui.c 按依赖顺序聚合 (单 TU, 全 static)。
+ * cagent 界面层的一部分, 由 main_gui.c 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
 /* ===== DPI 适配 ===== */
