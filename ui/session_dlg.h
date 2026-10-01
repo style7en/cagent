@@ -91,7 +91,7 @@ static int sess_enumerate(const char *dir) {
 
 /* 应用选中的会话: 有实际对话才先保存 -> 载入选中文件 -> 同步 UI -> 回放。 */
 static void sess_apply_selected(const char *path) {
-    if (g_active_ws[0] && strlen(messages) > strlen(SYSTEM_PROMPT))
+    if (g_active_ws[0] && strlen(messages) > strlen(g_system_prompt))
         history_save();          /* 空对话不落盘, 避免覆盖旧会话文件 */
     if (!history_load_from_file(path)) return;
     set_edit_utf8(g_hWorkspace, g_workspace);

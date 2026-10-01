@@ -14,7 +14,8 @@ typedef struct {
     char id[256]; char name[64]; char args[ARGS_MAX]; char *output;
 } AgentToolCall;
 
-#define SYSTEM_PROMPT \
+/* 内置默认系统提示词: 外置 SYSTEM_PROMPT 文件缺失或无效时的兜底。 */
+#define SYSTEM_PROMPT_DEFAULT \
     "{\"role\":\"system\",\"content\":\"你是 cagent,一个极简的编程 Agent。" \
     "你有四个工具: execute_bash(执行命令)、read_file(读文件)、write_file(写文件)、edit_file(定点替换编辑)。" \
     "改已有文件的局部内容,优先用 edit_file: old_text 必须与文件中的原文完全一致(含空白与换行)且在文件中唯一, 只出现一次才会替换。" \
@@ -29,6 +30,11 @@ typedef struct {
     "任务不明确时,先向用户澄清。" \
     "任务完成后,停止并简要总结你做了什么。" \
     "始终用中文回答。回答简洁。\"}"
+
+/* 实际生效的 system 消息 JSON。默认指向内置默认串; 启动时 exe 同目录存在
+ * SYSTEM_PROMPT 文件的话, system_prompt_init() 替换为外置文件包装后的堆串
+ * (进程生命周期内最多替换一次, 不释放)。所有 messages 偏移都按它计算。 */
+static const char *g_system_prompt = SYSTEM_PROMPT_DEFAULT;
 
 /* messages 缓冲水位线: 接近上限时触发压缩, 防止越界. */
 #define MESSAGES_WATERMARK  ((BUFSZ * 3) / 4)
@@ -47,7 +53,58 @@ static const char *ROLLBACK_HINT = "\r\n(本轮对话已回滚, 不影响后续�
 
 /* 初始化 messages 为只含 system prompt 的状态。 */
 static void reset_conversation(void) {
-    snprintf(messages, BUFSZ, "%s", SYSTEM_PROMPT);
+    snprintf(messages, BUFSZ, "%s", g_system_prompt);
+}
+
+/* ===== 外置系统提示词 (exe 同目录的 SYSTEM_PROMPT 文件) ===== */
+
+/* 外置提示词原文上限 (字节); 超限视为无效, 静默回退默认 */
+#define SYSTEM_PROMPT_MAX_RAW (32 * 1024)
+
+static void get_app_path(char *out, size_t cap, const char *filename);   /* 定义在 session.h */
+
+/* 把提示词原文包装成 system 消息 JSON 并提交 (转义由 json_escape 负责,
+ * 引号/换行/CRLF 都安全)。空原文或超限返回 0, g_system_prompt 保持原值。 */
+static int system_prompt_set_raw(const char *raw) {
+    if (!raw || !raw[0] || strlen(raw) > SYSTEM_PROMPT_MAX_RAW) return 0;
+    char *esc = json_escape_alloc(raw);
+    if (!esc) return 0;
+    size_t need = strlen(esc) + 64;   /* 转义串 + 包装前后缀 + '\0' */
+    char *buf = (char*)malloc(need);
+    if (!buf) { free(esc); return 0; }
+    int n = snprintf(buf, need, "{\"role\":\"system\",\"content\":\"%s\"}", esc);
+    free(esc);
+    if (n <= 0 || (size_t)n >= need) { free(buf); return 0; }
+    g_system_prompt = buf;
+    return 1;
+}
+
+/* 启动时读取 exe 同目录的 SYSTEM_PROMPT 外置提示词。
+ * 文件不存在 / 空 / 超限 / 转码后为空 -> 静默保持内置默认。 */
+static void system_prompt_init(void) CAGENT_MAYBE_UNUSED;   /* 测试二进制不调用 (保持默认指针) */
+static void system_prompt_init(void) {
+    char path[MAX_PATH];
+    get_app_path(path, sizeof(path), "SYSTEM_PROMPT");
+    FILE *f = fopen_utf8(path, "rb");
+    if (!f) return;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    long fsz = ftell(f);
+    if (fsz <= 0 || fsz > SYSTEM_PROMPT_MAX_RAW) { fclose(f); return; }
+    rewind(f);
+    /* 2x 容量: GBK -> UTF-8 最坏膨胀 1.5 倍, oem_to_utf8 需要余量 */
+    char *buf = (char*)malloc((size_t)fsz * 2 + 1);
+    if (!buf) { fclose(f); return; }
+    size_t n = fread(buf, 1, (size_t)fsz, f);
+    fclose(f);
+    if (n == 0) { free(buf); return; }
+    buf[n] = '\0';
+    if (!is_valid_utf8((const unsigned char*)buf, n)) {   /* 非法 UTF-8: 按 GBK/ANSI 转换 */
+        oem_to_utf8(buf, (size_t)fsz * 2 + 1);
+        n = strlen(buf);
+    }
+    if (n == 0 || !is_valid_utf8((const unsigned char*)buf, n)) { free(buf); return; }
+    system_prompt_set_raw(buf);
+    free(buf);
 }
 
 /* 前向声明: agent_turn 调用历史保存, 其定义在 session.h (聚合顺序在本文件之后) */
@@ -61,7 +118,7 @@ static void chat_completions_url(char *out, size_t cap) {
 }
 
 /* ===== messages 遍历辅助 (压缩按"整条消息"操作, 避免拆散 assistant/tool 配对) =====
- * messages 形如 SYSTEM_PROMPT + ",{...},{...}"; conv = messages + strlen(SYSTEM_PROMPT)。 */
+ * messages 形如 g_system_prompt + ",{...},{...}"; conv = messages + strlen(g_system_prompt)。 */
 
 /* 前向声明: 定义在 session.h (聚合顺序在本文件之后), 同 exec.h 前向声明 utf8_trim_len */
 static size_t first_object_end(const char *s);
@@ -212,7 +269,7 @@ static void archive_session_before_compact(void) {
 /* 摘要压缩。halve=0: 摘要 [0,k) 保留 [k,n) 原文; halve=1: 只摘要 [0,k) 的前一半。
  * 成功返回 1 且已重写 messages; 失败返回 0 且 messages 保持原样。 */
 static int compact_via_summary(int halve) {
-    const char *conv = messages + strlen(SYSTEM_PROMPT);
+    const char *conv = messages + strlen(g_system_prompt);
     size_t total = strlen(conv);
     size_t n = msg_count(conv);
     if (n == 0) return 0;
@@ -256,11 +313,11 @@ static int compact_via_summary(int halve) {
         "(最近的几条消息会原样保留, 不必复述。)";
     char *esc_ask = json_escape_alloc(ask);
     if (!esc_ask) return 0;
-    size_t rcap = strlen(SYSTEM_PROMPT) + ks + strlen(esc_ask) + 64;
+    size_t rcap = strlen(g_system_prompt) + ks + strlen(esc_ask) + 64;
     char *req_msgs = (char*)malloc(rcap);
     if (!req_msgs) { free(esc_ask); return 0; }
     int rn = snprintf(req_msgs, rcap, "%s%.*s%s{\"role\":\"user\",\"content\":\"%s\"}",
-                      SYSTEM_PROMPT, (int)ks, conv, (k < n) ? "" : ",", esc_ask);
+                      g_system_prompt, (int)ks, conv, (k < n) ? "" : ",", esc_ask);
     free(esc_ask);
     if (rn <= 0 || (size_t)rn >= rcap) { free(req_msgs); return 0; }
 
@@ -301,13 +358,13 @@ static int compact_via_summary(int halve) {
     free(summary);
     if (!esc_sum) return 0;
     size_t tail_len = total - ks;
-    size_t ncap = strlen(SYSTEM_PROMPT) + strlen(esc_sum) + tail_len + 256;
+    size_t ncap = strlen(g_system_prompt) + strlen(esc_sum) + tail_len + 256;
     char *newbuf = (char*)malloc(ncap);
     if (!newbuf) { free(esc_sum); return 0; }
     int wn = snprintf(newbuf, ncap,
         "%s,{\"role\":\"user\",\"content\":\"[上下文已压缩] 以下是此前对话的摘要, "
         "请据此继续, 不要重复已完成的工作:\\n\\n%s\"}%s%.*s",
-        SYSTEM_PROMPT, esc_sum, (k < n) ? "," : "", (int)tail_len, conv + ks);
+        g_system_prompt, esc_sum, (k < n) ? "," : "", (int)tail_len, conv + ks);
     free(esc_sum);
     if (wn <= 0 || (size_t)wn >= ncap || wn >= BUFSZ) { free(newbuf); return 0; }
     memcpy(messages, newbuf, (size_t)wn + 1);
@@ -319,7 +376,7 @@ static int compact_via_summary(int halve) {
 /* 保底压缩: 不经模型, 从最旧开始按整条消息丢弃, 直到低于 compact_target_bytes。
  * 成功返回 1; 没有可丢的 (全丢/本来就没超) 返回 0, 交由调用方收束。 */
 static int compact_drop_oldest(void) {
-    const char *conv = messages + strlen(SYSTEM_PROMPT);
+    const char *conv = messages + strlen(g_system_prompt);
     size_t total = strlen(conv);
     size_t target = compact_target_bytes();
     if (total <= target) return 0;

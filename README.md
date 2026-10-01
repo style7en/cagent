@@ -10,6 +10,7 @@
 cagent/
 ├── Makefile            # 构建脚本
 ├── cagent.ini          # 配置文件 (首次启动后自动生成)
+├── SYSTEM_PROMPT       # 可选: 外置系统提示词 (存在则替代内置默认)
 ├── sessions/           # 历史会话 (运行时生成, 首次保存时自动创建; 旧版散落的 history_*.json 启动时自动搬入)
 ├── cagent_ui.c         # 界面聚合入口 (仅按依赖顺序 include ui/)
 ├── cagent_core.h       # 核心聚合入口 (仅按依赖顺序 include core/)
@@ -152,6 +153,13 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
   - `context_tokens`:模型上下文窗口(token 数),如 131072 (128K)、1000000 (1M)。
     配置后按服务端报告的 `prompt_tokens` 精确控制水位(到 80% 触发压缩);
     `0` 或不写 = 未知,退回按字节水位。
+
+### 外置系统提示词 `SYSTEM_PROMPT`
+
+- **位置**:与 `cagent.exe` 同目录,文件名 `SYSTEM_PROMPT`(无扩展名)
+- **内容**:纯文本,作为 system 提示词的正文;引号/换行由程序自动转义成 JSON
+- **编码**:UTF-8 优先;非 UTF-8(如中文 Windows 的 GBK/ANSI 另存)自动按系统代码页转换
+- **行为**:启动时读一次;文件不存在 / 为空 / 超过 32KB 时静默回退内置默认提示词
 
 ### 操作
 

@@ -239,7 +239,7 @@ static int run_all_tests(void) {
         strcat(messages, ",{\"role\":\"user\",\"content\":\"u2\"}");
         strcat(messages, ",{\"role\":\"assistant\",\"content\":\"done\"}");
 
-        const char *conv = messages + strlen(SYSTEM_PROMPT);
+        const char *conv = messages + strlen(g_system_prompt);
         CHK(msg_count(conv) == 5);
         size_t s, e;
         CHK(msg_bounds(conv, 0, &s, &e) == 1 && conv[s] == '{');
@@ -304,13 +304,13 @@ static int run_all_tests(void) {
         CHK(strlen(messages) == before);
 
         /* 目标约一半 -> 丢最旧若干条, 但保留段起点绝不能是孤立 tool 结果 */
-        const char *conv0 = messages + strlen(SYSTEM_PROMPT);
+        const char *conv0 = messages + strlen(g_system_prompt);
         g_context_tokens = (long)(strlen(conv0) / 3);     /* target ≈ conv 长度的一半 */
         int ok3 = compact_drop_oldest();
         CHK(ok3 == 1);
         CHK(strlen(messages) < before);
         {
-            const char *conv = messages + strlen(SYSTEM_PROMPT);
+            const char *conv = messages + strlen(g_system_prompt);
             if (conv[0] == ',') conv++;
             char *arr = (char*)malloc(strlen(conv) + 3);
             CHK(arr != NULL);
@@ -416,6 +416,35 @@ static int run_all_tests(void) {
         /* note 比整个缓冲还长: 截 note 而不是越界写 */
         append_note(sb, &pos, sizeof(sb), "LONG-NOTE-1234567890");   /* 20 字节 */
         CHK(pos == 15 && strcmp(sb, "LONG-NOTE-12345") == 0);
+    }
+
+    /* ---- 外置系统提示词: 转义包装 / 空原文 / 超限拒绝, 失败保持原指针 ---- */
+    {
+        const char *def = g_system_prompt;
+        const char *cur;
+
+        CHK(system_prompt_set_raw("hi") == 1);
+        CHK(strcmp(g_system_prompt, "{\"role\":\"system\",\"content\":\"hi\"}") == 0);
+
+        /* 含引号/换行的原文: 转义后仍是合法 JSON, content 还原一致 */
+        CHK(system_prompt_set_raw("say \"hi\"\nnext") == 1);
+        JValue *r = json_parse(g_system_prompt);
+        CHK(r != NULL && r->type == J_OBJ);
+        const JValue *c = r ? json_obj_get(r, "content") : NULL;
+        CHK(c != NULL && c->type == J_STR && strcmp(c->str, "say \"hi\"\nnext") == 0);
+        if (r) json_free(r);
+
+        /* 空原文 / 超 32KB: 拒绝提交, 指针不动 */
+        cur = g_system_prompt;
+        CHK(system_prompt_set_raw("") == 0 && g_system_prompt == cur);
+        char *big = (char*)malloc(SYSTEM_PROMPT_MAX_RAW + 2);
+        memset(big, 'a', SYSTEM_PROMPT_MAX_RAW + 1);
+        big[SYSTEM_PROMPT_MAX_RAW + 1] = '\0';
+        CHK(system_prompt_set_raw(big) == 0 && g_system_prompt == cur);
+        free(big);
+
+        g_system_prompt = def;   /* 恢复默认, 不影响后续判定 */
+        CHK(g_system_prompt == def);
     }
 
     #undef CHK

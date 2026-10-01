@@ -116,7 +116,7 @@ static void build_new_session_path(char *out, size_t cap) {
 
 /* 新建会话: 当前对话若有内容先落盘 (旧会话文件保留), 然后重开一个空对话。 */
 static CAGENT_MAYBE_UNUSED void history_start_new(void) {
-    if (g_active_ws[0] && strlen(messages) > strlen(SYSTEM_PROMPT))
+    if (g_active_ws[0] && strlen(messages) > strlen(g_system_prompt))
         history_save();                        /* 已有内容 -> 存到它绑定的文件 */
     reset_conversation();
     g_history_file[0] = '\0';                  /* 下次保存时生成新文件 */
@@ -216,7 +216,7 @@ static int load_messages_from_text(const char *text) {
 
 /* 保存历史: 自描述格式 {"workspace":...,"messages":[...]}, 仅存对话部分。 */
 static void history_save(void) {
-    size_t skip = strlen(SYSTEM_PROMPT);
+    size_t skip = strlen(g_system_prompt);
     if (strlen(messages) < skip) skip = strlen(messages);  /* 防越界 (messages 未初始化时) */
     const char *conv = messages + skip;        /* ',{...}' 对话 (含前导逗号) */
     /* 空对话且尚未绑定文件: 不落盘 (压缩失败重置等场景, 避免产生空的会话文件) */
@@ -276,7 +276,7 @@ static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
 /* 把当前 messages 里的对话按角色回放到前端 (跳过系统提示词), 格式与实时对话一致。 */
 static CAGENT_MAYBE_UNUSED void history_replay(void) {
     if (!cagent_emit) return;
-    size_t skip = strlen(SYSTEM_PROMPT);
+    size_t skip = strlen(g_system_prompt);
     const char *conv = messages + skip;
     if (*conv == ',') conv++;
     if (!*conv) return;

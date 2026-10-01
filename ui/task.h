@@ -37,7 +37,7 @@ static void start_task(HWND hwnd) {
 
     if (g_active_ws[0] && strcmp(g_workspace, g_active_ws) != 0) {
         /* 工作目录已变更: 当前对话落盘保留, 另起新会话 (不自动加载历史) */
-        if (strlen(messages) > strlen(SYSTEM_PROMPT)) history_save();
+        if (strlen(messages) > strlen(g_system_prompt)) history_save();
         reset_conversation();
         g_history_file[0] = '\0';
         append_text("(工作目录已变更, 已另起新会话; 旧会话可通过 [加载会话] 恢复)\r\n");
