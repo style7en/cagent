@@ -13,6 +13,7 @@ cagent/
 ├── cagent.ini          # 配置文件 (首次启动后自动生成)
 ├── SYSTEM_PROMPT       # 可选: 外置系统提示词 (存在则替代内置默认)
 ├── sessions/           # 历史会话 (运行时生成, 首次保存时自动创建; 旧版散落的 history_*.json 启动时自动搬入)
+├── log/                # 运行日志 + 失败请求留档 (log=1 时生成, 不入库)
 ├── cagent_ui.c         # 界面聚合入口 (仅按依赖顺序 include ui/)
 ├── cagent_core.h       # 核心聚合入口 (仅按依赖顺序 include core/)
 ├── core/               # 平台无关核心, 按子功能拆分 (单 TU, 全 static)
@@ -149,11 +150,14 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
   context_tokens=131072
   workspace=C:\path\to\workspace
   last_session=sessions\history_<工作目录>_<哈希>.json
+  log=1
   ```
 
   - `context_tokens`:模型上下文窗口(token 数),如 131072 (128K)、1000000 (1M)。
     配置后按服务端报告的 `prompt_tokens` 精确控制水位(到 80% 触发压缩);
     `0` 或不写 = 未知,退回按字节水位。
+  - `log`:运行日志开关,默认 `1`。写 `0` 关闭;日志在 `log\` 目录按天一个文件,
+    HTTP 失败时完整请求体另存为 `log\request_fail_N.json`,可直接对服务端重放复现。
 
 ### 外置系统提示词 `SYSTEM_PROMPT`
 

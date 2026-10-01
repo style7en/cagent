@@ -246,6 +246,7 @@ static void history_save(void) {
     fputs("]}", f);
     free(wse);
     fclose(f);
+    log_line("[session] 保存 %s (%zu bytes)", path, strlen(conv));
     snprintf(g_last_session, sizeof(g_last_session), "%s", path);
 }
 

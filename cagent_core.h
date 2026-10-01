@@ -34,6 +34,7 @@
 #include "core/version.h"   /* 版本号单一事实来源, 供 RC/--version/标题栏引用 */
 #include "core/base.h"
 #include "core/state.h"
+#include "core/log.h"      /* 运行日志: 错误复现取证 (log\ 目录), 开关由 config 控制 */
 #include "core/crypto.h"
 #include "core/json.h"
 #include "core/exec.h"

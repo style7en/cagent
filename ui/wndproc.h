@@ -88,6 +88,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_hCfg[CFG_KEY], EM_SETPASSWORDCHAR, (WPARAM)'*', 0);
 
         config_load();
+        log_line("[启动] cagent %s, 日志已启用 (cagent.ini 里 log=0 可关)", CAGENT_VERSION_STR);
         system_prompt_init();        /* 读 exe 同目录外置 SYSTEM_PROMPT, 缺失/无效静默用默认 */
         migrate_legacy_sessions();   /* 旧版散落在 exe 目录的会话搬进 sessions\ */
         set_edit_utf8(g_hCfg[CFG_URL], g_api_url);

@@ -6,6 +6,7 @@
 
 /* 简单 key=value 解析器 */
 static CAGENT_MAYBE_UNUSED void config_load(void) {
+    g_log_enabled = 1;   /* 运行日志默认开 (ini 里 log=0 可关); 测试不进本函数故不落盘 */
     char path[MAX_PATH];
     get_ini_path(path, sizeof(path));
     FILE *f = fopen_utf8(path, "rb");
@@ -46,6 +47,8 @@ static CAGENT_MAYBE_UNUSED void config_load(void) {
             snprintf(g_workspace, sizeof(g_workspace), "%s", val);
         else if (strcmp(key, "last_session") == 0)
             snprintf(g_last_session, sizeof(g_last_session), "%s", val);
+        else if (strcmp(key, "log") == 0)
+            g_log_enabled = (atoi(val) != 0);   /* 0 = 关闭运行日志 */
     }
     fclose(f);
 }
@@ -72,5 +75,6 @@ static CAGENT_MAYBE_UNUSED void config_save(void) {
     fprintf(f, "context_tokens=%ld\r\n", g_context_tokens);
     fprintf(f, "workspace=%s\r\n", g_workspace);
     fprintf(f, "last_session=%s\r\n", g_last_session);
+    fprintf(f, "log=%d\r\n", g_log_enabled);
     fclose(f);
 }

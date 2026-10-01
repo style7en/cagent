@@ -86,10 +86,15 @@ static void system_prompt_init(void) {
     char path[MAX_PATH];
     get_app_path(path, sizeof(path), "SYSTEM_PROMPT");
     FILE *f = fopen_utf8(path, "rb");
-    if (!f) return;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    if (!f) { log_line("[prompt] 未找到外置提示词, 使用内置默认: %s", path); return; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); log_line("[prompt] 外置提示词读取失败: %s", path); return; }
     long fsz = ftell(f);
-    if (fsz <= 0 || fsz > SYSTEM_PROMPT_MAX_RAW) { fclose(f); return; }
+    if (fsz <= 0 || fsz > SYSTEM_PROMPT_MAX_RAW) {
+        fclose(f);
+        log_line("[prompt] 外置提示词无效 (%ld bytes, 上限 %d), 回退默认: %s",
+             fsz, SYSTEM_PROMPT_MAX_RAW, path);
+        return;
+    }
     rewind(f);
     /* 2x 容量: GBK -> UTF-8 最坏膨胀 1.5 倍, oem_to_utf8 需要余量 */
     char *buf = (char*)malloc((size_t)fsz * 2 + 1);
@@ -102,8 +107,15 @@ static void system_prompt_init(void) {
         oem_to_utf8(buf, (size_t)fsz * 2 + 1);
         n = strlen(buf);
     }
-    if (n == 0 || !is_valid_utf8((const unsigned char*)buf, n)) { free(buf); return; }
-    system_prompt_set_raw(buf);
+    if (n == 0 || !is_valid_utf8((const unsigned char*)buf, n)) {
+        free(buf);
+        log_line("[prompt] 外置提示词转码后为空/仍非法 UTF-8, 回退默认: %s", path);
+        return;
+    }
+    if (system_prompt_set_raw(buf))
+        log_line("[prompt] 使用外置提示词 %s (%zu bytes)", path, n);
+    else
+        log_line("[prompt] 外置提示词包装失败, 回退默认: %s", path);
     free(buf);
 }
 
@@ -438,11 +450,15 @@ static int compact_conversation(void) {
 static void agent_turn(const char *user_msg) {
     InterlockedExchange(&g_cancel, 0);
     g_touched_files[0] = '\0';                  /* 本轮改动记录重新计 (回滚提示要引用) */
+    log_line("[turn] 开始 ws=%s msgs_len=%zu user=%.120s",
+         g_workspace[0] ? g_workspace : "-", strlen(messages), user_msg);
 
     /* 上下文压力检查 (token 优先, 字节兜底): 先压缩, 再开始本轮 */
     if (context_pressure()) {
         append_text("(上下文接近上限, 正在压缩为摘要...)\r\n");
-        if (!compact_conversation()) {
+        int cok = compact_conversation();
+        log_line("[compact] 轮首触发 -> %s, msgs_len=%zu", cok ? "成功" : "失败", strlen(messages));
+        if (!cok) {
             append_text("(压缩失败, 已自动另起新会话)\r\n");
             reset_conversation();
             g_history_file[0] = '\0';
@@ -482,7 +498,9 @@ static void agent_turn(const char *user_msg) {
          * 本轮提前收束, 用户可继续下一条指令。 */
         if (iter > 0 && context_pressure()) {
             append_text("(上下文接近上限, 正在压缩为摘要...)\r\n");
-            if (!compact_conversation()) {
+            int cok = compact_conversation();
+            log_line("[compact] 迭代间隙触发 -> %s, msgs_len=%zu", cok ? "成功" : "失败", strlen(messages));
+            if (!cok) {
                 append_text("(压缩失败, 本轮到此暂停; 已完成的步骤都保留在对话中)\r\n");
                 goto done;
             }
@@ -493,6 +511,9 @@ static void agent_turn(const char *user_msg) {
         snprintf(body, BUFSZ,
             "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true}",
             g_model, messages, TOOLS_JSON);
+        log_check_utf8("请求体", body, strlen(body));
+        log_line("[http] 请求 iter=%d msgs_len=%zu body_len=%zu",
+             iter, strlen(messages), strlen(body));
 
         append_text("(thinking...)\r\n");
 
@@ -520,6 +541,9 @@ static void agent_turn(const char *user_msg) {
             goto done;
         }
         if (status != 200) {
+            log_line("[http] 失败 status=%d iter=%d msgs_len=%zu resp=%.1000s",
+                 status, iter, strlen(messages), resp);
+            log_dump_request(body, strlen(body));
             /* 服务端报告上下文超限 (400): 压缩后原地重试, 而不是回滚丢掉整轮。
              * 重试有次数上限; 压缩失败则照常回滚。 */
             if (status == 400 && overflow_retries < CONTEXT_OVERFLOW_RETRIES &&
@@ -529,9 +553,11 @@ static void agent_turn(const char *user_msg) {
                 free(ctx);
                 ctx = NULL;
                 if (compact_conversation()) {
+                    log_line("[compact] 400超限触发 -> 成功, msgs_len=%zu", strlen(messages));
                     savepoint = strlen(messages);   /* 历史已改写, 回滚基点随之更新 */
                     continue;
                 }
+                log_line("[compact] 400超限触发 -> 失败");
                 append_text("(压缩失败)\r\n");
             }
             append_text(resp);
@@ -539,6 +565,9 @@ static void agent_turn(const char *user_msg) {
             rolled_back = 1;
             goto done;
         }
+
+        log_line("[http] 成功 iter=%d finish=%s prompt_tokens=%ld msgs_len=%zu",
+             iter, ctx->finish[0] ? ctx->finish : "-", ctx->prompt_tokens, strlen(messages));
 
         /* 服务端报告的 prompt_tokens (与请求时的 messages 长度配对, 供水位估算) */
         if (ctx->prompt_tokens > 0) {
@@ -718,6 +747,7 @@ done:
         for (int i = 0; i < STREAM_CALLS_MAX; i++) free(calls[i].output);
         free(calls);
     }
+    log_line("[turn] 结束 iter=%d 回滚=%d msgs_len=%zu", iter, rolled_back, strlen(messages));
     if (rolled_back) {
         messages[savepoint] = '\0';
         /* 对话回滚了, 但文件已经改了 —— 说清楚并列出改了哪些, 免得用户以为也还原了 */

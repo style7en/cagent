@@ -350,6 +350,8 @@ static int http_post_stream(const char *url, const char *api_key,
         if (cagent_emit) append_text("(网络瞬时错误, 正在重试...)\r\n");
         /* 指数退避: base, 2*base, 4*base ... (累计可在长链路上叠加) */
         DWORD wait = base * (1u << attempt);
+        log_line("[http] 瞬时错误重试 attempt=%d status=%d wait=%lu ms err=%.300s",
+             attempt + 1, status, (unsigned long)wait, err_out);
         cancelable_sleep_ms(wait);
     }
     return last_status;

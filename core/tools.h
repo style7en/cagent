@@ -226,6 +226,13 @@ static void dispatch_tool(const char *name, const char *args_json, const char *f
             snprintf(tool_out, BUFSZ, "(未知工具: %s; 可用工具: execute_bash / read_file / write_file / edit_file)", nm);
         }
     } else if (!argsj) {
+        /* 留全量取证: 长度 + finish_reason + 原文全文 (截断类 bug 看尾部即可定位) */
+        size_t alen = (args_json && args_json[0]) ? strlen(args_json) : 0;
+        log_line("[tool] arguments 非法 JSON: name=%s finish=%s len=%zu 疑似截断=%d",
+             nm, (finish && *finish) ? finish : "-", alen,
+             (finish && strcmp(finish, "length") == 0));
+        log_line("[tool] arguments 原文: %s", (args_json && args_json[0]) ? args_json : "(空)");
+        if (args_json) log_check_utf8("tool.arguments", args_json, alen);
         snprintf(tool_out, BUFSZ,
                  "(参数解析失败: %s 的 arguments 不是合法 JSON%s, 原始内容前 200 字节: %.200s)",
                  nm, (finish && strcmp(finish, "length") == 0) ? " (疑似被长度上限截断)" : "",

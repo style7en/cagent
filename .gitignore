@@ -15,6 +15,9 @@ cagent_history.json
 history_*.json
 sessions/
 
+# 运行日志与失败请求留档 (log=1 时生成)
+log/
+
 # 工作区数据 (记忆/日志, 非源码)
 .workbuddy/
 
