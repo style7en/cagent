@@ -23,3 +23,6 @@ sessions/
 .idea/
 *.swp
 *~
+
+# 外置系统提示词 (运行时本地文件, 同 cagent.ini)
+SYSTEM_PROMPT
