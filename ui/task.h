@@ -31,7 +31,7 @@ static void start_task(HWND hwnd) {
     snprintf(g_active_ws, sizeof(g_active_ws), "%s", g_workspace);
 
     if (!g_api_url[0] || !g_api_key[0] || !g_model[0]) {
-        MessageBoxW(hwnd, L"请填写 Url-Base、Key、Model 三项配置。",
+        MessageBoxW(hwnd, L"请填写 Base Url、Key、Model 三项配置。",
                     L"配置不完整", MB_OK | MB_ICONWARNING);
         return;
     }

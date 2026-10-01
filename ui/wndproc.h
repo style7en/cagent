@@ -70,7 +70,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               ANTIALIASED_QUALITY, FF_DONTCARE, L"Microsoft YaHei UI");
 
-        static const WCHAR *labels[3] = { L"Url-Base:", L"Key:", L"Model:" };
+        static const WCHAR *labels[3] = { L"Base Url:", L"Key:", L"Model:" };
         static const DWORD ed_styles[3] = { 0, ES_PASSWORD, 0 };
 
         for (int i = 0; i < 3; i++) {

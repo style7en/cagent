@@ -6,7 +6,7 @@
 
 static const char *winhttp_err_msg(DWORD code) {
     switch (code) {
-    case ERROR_WINHTTP_NAME_NOT_RESOLVED:        return "DNS 解析失败, 请检查 Url-Base";
+    case ERROR_WINHTTP_NAME_NOT_RESOLVED:        return "DNS 解析失败, 请检查 Base Url";
     case ERROR_WINHTTP_CANNOT_CONNECT:           return "无法连接服务器";
     case ERROR_WINHTTP_CONNECTION_ERROR:         return "连接被重置";
     case ERROR_WINHTTP_TIMEOUT:                  return "请求超时";

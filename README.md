@@ -103,7 +103,7 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
 
 ```
 +-----------------------------------+
-| Url-Base: [ https://...v1     ]   |  ← 三项配置, 启动时自动从 cagent.ini 读取
+| Base Url: [ https://...v1     ]   |  ← 三项配置, 启动时自动从 cagent.ini 读取
 | Key:      [ ********          ]   |  ← API Key 以 * 隐藏显示
 | Model:    [ deepseek-v4-flash ]   |
 +-----------------------------------+
@@ -123,7 +123,7 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
 
 | 字段 | 说明 |
 |---|---|
-| **Url-Base** | 填到 `/v1` 即可,程序自动追加 `/chat/completions`<br>例: `https://token.sensenova.cn/v1` |
+| **Base Url** | 填到 `/v1` 即可,程序自动追加 `/chat/completions`<br>例: `https://token.sensenova.cn/v1` |
 | **Key** | OpenAI 兼容的 API Key,显示为 `*` |
 | **Model** | 模型 ID,例: `deepseek-v4-flash` |
 | **skip_cert_verify** | 写在 `cagent.ini` 中,`1`=跳过 SSL 证书校验(自签端点用,默认 `0` 严格) |
