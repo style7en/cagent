@@ -11,20 +11,36 @@
  * 文案全部取自 core/version.h, 这里不出现字面量的版本号或地址 —— 改版本/地址只改那一处。
  *
  * 为什么不用 MessageBox: 它的正文是纯文本, 里面的链接点不开。而 SysLink 控件 / TaskDialog
- * 的超链接都要求 comctl32 v6 (必须给 EXE 嵌 manifest), 本程序没有 manifest。
- * 于是用最朴素也最可靠的做法: 带 SS_NOTIFY 的 STATIC 充当链接 —— 点击会向父窗口发
- * WM_COMMAND(STN_CLICKED), 我们接住后交给 ShellExecute 打开默认浏览器; 视觉上套系统
- * 链接色 + 下划线 + 手型光标, 用户能认出它是链接。
+ * 的超链接都要求 comctl32 v6 (本项目已通过 res/app.manifest 声明), 但那样又得改控件结构;
+ * 带 SS_NOTIFY 的 STATIC 更简单可靠 —— 点击会向父窗口发 WM_COMMAND(STN_CLICKED), 我们接住后
+ * 交给 ShellExecute 打开默认浏览器; 视觉上套系统链接色 + 下划线 + 手型光标。
+ *
+ * DPI: 对话框维护**自己的** g_about_dpi, 用 dp_at() 换算 ——
+ *   ① 它可能被拖到与主窗口不同缩放比例的显示器上;
+ *   ② **绝不能去写全局 g_dpi**, 那会让主窗口下次 layout() 用错比例。
+ *   布局全部集中在 about_layout(), 所以重新排布 = 重跑一次该函数。
  *
  * 非模态的生命周期与 session_dlg.h 一致: 窗口消息由主循环统一泵送, 关闭时自己恢复主窗口。
  */
 
-#define ID_ABOUT_URL       2004   /* GitHub 链接 (充当链接的 STATIC) */
-#define ID_ABOUT_URL_GITEE 2006   /* Gitee 链接 */
-#define ID_ABOUT_OK        2005   /* 关闭按钮 */
+#define ID_ABOUT_URL        2004   /* GitHub 链接 (充当链接的 STATIC) */
+#define ID_ABOUT_OK         2005   /* 关闭按钮 */
+#define ID_ABOUT_URL_GITEE  2006   /* Gitee 链接 */
+#define ID_ABOUT_TITLE      2007   /* "cagent" */
+#define ID_ABOUT_TAG        2008   /* 一句话定位 */
+#define ID_ABOUT_VER_L      2009   /* "版本" 标签 */
+#define ID_ABOUT_VER        2010   /* 版本号 */
+#define ID_ABOUT_GIT_L      2011   /* "GitHub" 标签 */
+#define ID_ABOUT_GITEE_L    2012   /* "Gitee" 标签 */
 
 static HWND g_about_wnd   = NULL;
 static HWND g_about_owner = NULL;
+
+/* 对话框自己的 DPI 与字体。字体按 g_about_dpi 从字体族**直接建**(不是克隆主窗口的
+ * g_hFont —— 那个可能是别的显示器上的尺寸)。 */
+static UINT  g_about_dpi = 96;
+static UINT  g_about_font_dpi = 0;      /* 下面三个字体是按哪个 DPI 建的 */
+static HFONT g_aboutFontUI    = NULL;
 static HFONT g_aboutFontTitle = NULL;
 static HFONT g_aboutFontLink  = NULL;
 
@@ -45,6 +61,62 @@ static void about_open_url(const char *url) {
         ShellExecuteW(NULL, L"open", wurl, NULL, NULL, SW_SHOWNORMAL);
 }
 
+/* 按 g_about_dpi 重建三种字体(界面体 / 标题加粗 / 链接下划线)。DPI 没变就什么都不做。
+ * 早先这里是"克隆主窗口 g_hFont 的 LOGFONT 再改一两项", 有两个毛病: 依赖主窗口的 DPI,
+ * 以及在同一个 LOGFONT 实例上连着改会让链接字体继承标题的 FW_BOLD(实测就是这样)。 */
+static void about_fonts_sync(void) {
+    if (g_about_font_dpi == g_about_dpi && g_aboutFontUI && g_aboutFontTitle && g_aboutFontLink)
+        return;
+    if (g_aboutFontUI)    { DeleteObject(g_aboutFontUI);    g_aboutFontUI    = NULL; }
+    if (g_aboutFontTitle) { DeleteObject(g_aboutFontTitle); g_aboutFontTitle = NULL; }
+    if (g_aboutFontLink)  { DeleteObject(g_aboutFontLink);  g_aboutFontLink  = NULL; }
+
+    int h = dp_at(g_about_dpi, 16);
+    g_aboutFontUI    = CreateFontW(h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+    g_aboutFontTitle = CreateFontW(h, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+    g_aboutFontLink  = CreateFontW(h, 0, 0, 0, FW_NORMAL, FALSE, TRUE,  FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+    g_about_font_dpi = g_about_dpi;
+}
+
+/* 排布全部控件并下发字体。窗口首次创建与 WM_DPICHANGED 都调它 —— 尺寸全部现算,
+ * 所以重跑一次就自动适配新 DPI。客户区固定 420x180 逻辑像素。
+ * 左内边距 16, 标签列 56(放得下 "GitHub"), 值列自 x=76 起, 行距 = 字体高度 + 4px。
+ * 这里的 420x180 与 show_about 里 dpi_adjust_rect 的尺寸是一套, 改一处必须改另一处。 */
+static void about_layout(HWND hwnd) {
+    const UINT d  = g_about_dpi;
+    const int  pad = dp_at(d, 16);
+    const int  lw  = dp_at(d, 56);
+    const int  vx  = pad + lw + dp_at(d, 4);      /* 值列起点 = 76 */
+    const int  vw  = dp_at(d, 420) - pad - vx;    /* 值列宽   = 328 */
+    const int  rh  = dp_at(d, 20);
+    const int  bw  = dp_at(d, 84);
+    const int  right = dp_at(d, 420);
+
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_TITLE),   pad, dp_at(d, 12),  dp_at(d, 388), dp_at(d, 22), TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_TAG),     pad, dp_at(d, 38),  dp_at(d, 388), rh,           TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_VER_L),   pad, dp_at(d, 66),  lw,            rh,           TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_VER),     vx,  dp_at(d, 66),  vw,            rh,           TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_GIT_L),   pad, dp_at(d, 90),  lw,            rh,           TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_URL),     vx,  dp_at(d, 90),  vw,            rh,           TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_GITEE_L), pad, dp_at(d, 114), lw,            rh,           TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_URL_GITEE), vx, dp_at(d, 114), vw,           rh,           TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_ABOUT_OK),      right - pad - bw, dp_at(d, 142), bw, dp_at(d, 26), TRUE);
+
+    SendMessageW(GetDlgItem(hwnd, ID_ABOUT_TITLE),     WM_SETFONT, (WPARAM)g_aboutFontTitle, TRUE);
+    SendMessageW(GetDlgItem(hwnd, ID_ABOUT_URL),       WM_SETFONT, (WPARAM)g_aboutFontLink,  TRUE);
+    SendMessageW(GetDlgItem(hwnd, ID_ABOUT_URL_GITEE), WM_SETFONT, (WPARAM)g_aboutFontLink,  TRUE);
+    static const int plain[] = { ID_ABOUT_TAG, ID_ABOUT_VER_L, ID_ABOUT_VER,
+                                ID_ABOUT_GIT_L, ID_ABOUT_GITEE_L, ID_ABOUT_OK };
+    for (int i = 0; i < (int)(sizeof(plain)/sizeof(plain[0])); i++)
+        SendMessageW(GetDlgItem(hwnd, plain[i]), WM_SETFONT, (WPARAM)g_aboutFontUI, TRUE);
+}
+
 static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -54,64 +126,46 @@ static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!utf8_to_wide(CAGENT_PROJECT_URL,       wgh,  512)) wgh[0]  = L'\0';
         if (!utf8_to_wide(CAGENT_PROJECT_URL_GITEE, wgt,  512)) wgt[0]  = L'\0';
 
-        /* 由控件字体派生出标题(加粗)与链接(下划线)两种变体, 保持字族一致。
-         * 必须各从**原始** lf 派生 —— 曾图省事在同一个 lf 上连着改(先置 FW_BOLD, 再加下划线)
-         * 去创建链接字体, 结果链接连标题的粗体一起继承, 显示成"加粗的下划线蓝字"。 */
-        if (!g_aboutFontTitle || !g_aboutFontLink) {
-            LOGFONTW base, lf;
-            GetObjectW(g_hFont, sizeof(base), &base);
-            if (!g_aboutFontTitle) { lf = base; lf.lfWeight    = FW_BOLD; g_aboutFontTitle = CreateFontIndirectW(&lf); }
-            if (!g_aboutFontLink)  { lf = base; lf.lfUnderline = TRUE;    g_aboutFontLink  = CreateFontIndirectW(&lf); }
+        g_about_dpi = dpi_of_window(hwnd);   /* 按对话框所在屏定 DPI */
+        about_fonts_sync();
+
+        /* 先建控件(尺寸留给 about_layout 摆), 再统一下发字体与位置 */
+        struct { int id; const WCHAR *cls; const WCHAR *txt; DWORD st; int link; } defs[] = {
+            { ID_ABOUT_TITLE,   L"STATIC", L"cagent",  SS_LEFT, 0 },
+            { ID_ABOUT_TAG,     L"STATIC", wtag,       SS_LEFT, 0 },
+            { ID_ABOUT_VER_L,   L"STATIC", L"版本",    SS_LEFT, 0 },
+            { ID_ABOUT_VER,     L"STATIC", wver,       SS_LEFT, 0 },
+            { ID_ABOUT_GIT_L,   L"STATIC", L"GitHub",  SS_LEFT, 0 },
+            { ID_ABOUT_URL,     L"STATIC", wgh,        SS_LEFT | SS_NOTIFY, 1 },
+            { ID_ABOUT_GITEE_L, L"STATIC", L"Gitee",   SS_LEFT, 0 },
+            { ID_ABOUT_URL_GITEE, L"STATIC", wgt,      SS_LEFT | SS_NOTIFY, 1 },
+        };
+        for (int i = 0; i < (int)(sizeof(defs)/sizeof(defs[0])); i++)
+            CreateWindowW(defs[i].cls, defs[i].txt, WS_CHILD | WS_VISIBLE | defs[i].st,
+                          0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)defs[i].id, NULL, NULL);
+
+        CreateWindowW(L"BUTTON", L"关闭",
+                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+                      0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_ABOUT_OK, NULL, NULL);
+
+        about_layout(hwnd);
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        /* 被拖到缩放比例不同的显示器: 换本对话框自己的 DPI, 重建字体, 重排, 再调整外框。
+         * **不碰全局 g_dpi** —— 那是主窗口的。 */
+        UINT nd = (UINT)HIWORD(wp);
+        g_about_dpi = nd ? nd : dpi_of_window(hwnd);
+        about_fonts_sync();
+        about_layout(hwnd);
+        {
+            const RECT *pr = (const RECT*)lp;
+            RECT r = { 0, 0, dp_at(g_about_dpi, 420), dp_at(g_about_dpi, 180) };
+            dpi_adjust_rect(&r, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE,
+                            WS_EX_DLGMODALFRAME, g_about_dpi);
+            MoveWindow(hwnd, pr->left, pr->top, r.right - r.left, r.bottom - r.top, TRUE);
         }
-
-        /* 紧凑排布: 左内边距 16, 标签列 56(放得下 "GitHub"), 值列自 x=76 起, 行距只给
-         * 字体实际高度 + 4px。全部按 96 DPI 逻辑像素书写, 经 dp() 换算 (见 ui/dpi.h)。
-         * 客户区 420x180 —— 与下面 show_about 里 AdjustWindowRectEx 的尺寸是一套,
-         * 改一处必须改另一处, 否则底部留白或按钮被裁掉。 */
-        const int pad = dp(16);
-        const int lw  = dp(56);
-        const int vx  = pad + lw + dp(4);       /* 值列起点 = 76 */
-        const int vw  = dp(420) - pad - vx;     /* 值列宽   = 328 */
-        const int rh  = dp(20);
-        const int bw  = dp(84);
-
-        HWND t;
-        t = CreateWindowW(L"STATIC", L"cagent", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          pad, dp(12), dp(388), dp(22), hwnd, NULL, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)(g_aboutFontTitle ? g_aboutFontTitle : g_hFont), TRUE);
-
-        t = CreateWindowW(L"STATIC", wtag, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          pad, dp(38), dp(388), rh, hwnd, NULL, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-        /* 三行"标签列 + 值列": 光秃秃一个 1.1.2 没人看得出是什么 */
-        t = CreateWindowW(L"STATIC", L"版本", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          pad, dp(66), lw, rh, hwnd, NULL, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-        t = CreateWindowW(L"STATIC", wver, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          vx, dp(66), vw, rh, hwnd, NULL, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-        /* 两个链接: SS_NOTIFY 才会把点击告诉父窗口 */
-        t = CreateWindowW(L"STATIC", L"GitHub", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          pad, dp(90), lw, rh, hwnd, NULL, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-        t = CreateWindowW(L"STATIC", wgh, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
-                          vx, dp(90), vw, rh, hwnd, (HMENU)(LONG_PTR)ID_ABOUT_URL, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)(g_aboutFontLink ? g_aboutFontLink : g_hFont), TRUE);
-
-        t = CreateWindowW(L"STATIC", L"Gitee", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          pad, dp(114), lw, rh, hwnd, NULL, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-        t = CreateWindowW(L"STATIC", wgt, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
-                          vx, dp(114), vw, rh, hwnd, (HMENU)(LONG_PTR)ID_ABOUT_URL_GITEE, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)(g_aboutFontLink ? g_aboutFontLink : g_hFont), TRUE);
-
-        t = CreateWindowW(L"BUTTON", L"关闭",
-                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-                          dp(420) - pad - bw, dp(142), bw, dp(26), hwnd,
-                          (HMENU)(LONG_PTR)ID_ABOUT_OK, NULL, NULL);
-        SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
         return 0;
     }
 
@@ -183,11 +237,11 @@ static void show_about(HWND owner) {
         reg = 1;
     }
 
-    /* 按客户区尺寸反推外框: 免得到手算边框/标题栏高度。
-     * 420x180 是**逻辑尺寸**, 经 dp() 换算; 与上面控件排布是一套 —— 改一处必须改另一处。
-     * 进程是系统级 DPI 感知, 所以 AdjustWindowRectEx 用的度量与 g_dpi 一致。 */
-    RECT r = {0, 0, dp(420), dp(180)};
-    AdjustWindowRectEx(&r, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    /* 先按**主窗口所在屏**定尺寸(窗口还没建, 只能问 owner), 建完后 WM_CREATE 会用
+     * 对话框自己的显示器再核一次。 */
+    g_about_dpi = dpi_of_window(owner);
+    RECT r = { 0, 0, dp_at(g_about_dpi, 420), dp_at(g_about_dpi, 180) };
+    dpi_adjust_rect(&r, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME, g_about_dpi);
     int cw = r.right - r.left, chh = r.bottom - r.top;
 
     g_about_owner = owner;

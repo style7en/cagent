@@ -49,6 +49,67 @@ static void layout(HWND hwnd) {
     MoveWindow(g_hSend,  gap * 2 + input_w, input_y, btn_w, input_h, TRUE);
 }
 
+/* ===== 字体与行距 (跨显示器 DPI 变化时要整体重做) ===== */
+
+static BOOL CALLBACK ui_font_cb(HWND h, LPARAM lp) {
+    (void)lp;
+    /* 输出区用独立字体, 其余控件共用界面字体 */
+    SendMessageW(h, WM_SETFONT,
+                 (WPARAM)(GetDlgCtrlID(h) == ID_HISTORY ? g_hFontHist : g_hFont), TRUE);
+    return TRUE;
+}
+
+/* 把当前字体下发到窗口的全部子控件。 */
+static void ui_fonts_apply(HWND hwnd) { EnumChildWindows(hwnd, ui_font_cb, 0); }
+
+/* 按 g_dpi 重建界面字体并下发。
+ * **顺序必须是** 建新的 -> 下发 -> 再删旧的; 反过来控件会短暂引用已释放的句柄。
+ * 窗口首次创建时也调它 —— 那时还没有子控件, 下发这一步自然是空操作。 */
+static void ui_fonts_rebuild(HWND hwnd) {
+    HFONT old[2] = { g_hFont, g_hFontHist };
+    g_hFont     = CreateFontW(dp(16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+    /* 输出区独立字体: 比控件/标签大一档, 阅读更醒目 */
+    g_hFontHist = CreateFontW(dp(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+    ui_fonts_apply(hwnd);
+    for (int i = 0; i < 2; i++) if (old[i]) DeleteObject(old[i]);
+}
+
+/* 收紧历史框行距: 用 PARAFORMAT2 设"精确"行距为字体字身高度(physical twips), 去掉 RichEdit
+ * 默认的额外行距; 按 LOGPIXELSY 换算以兼顾高 DPI。glyph 不会裁切。两个坑:
+ *   ① dyLineSpacing 是**绝对 twips**, 不随字体走 —— 字体换了(跨显示器 DPI 变化)就必须重设,
+ *      否则行高按旧字号卡死, 字号变大时字会被裁切;
+ *   ② 段落属性只作用于选中范围, 空选区时仅改光标所在那一段 —— 所以先全选、改完再还原选区。 */
+static void ui_history_parafmt(HWND h) {
+    if (!h) return;
+    LONG sel_s = 0, sel_e = 0;
+    SendMessageW(h, EM_GETSEL, (WPARAM)&sel_s, (LPARAM)&sel_e);
+    SendMessageW(h, EM_SETSEL, 0, -1);
+
+    PARAFORMAT2 pf;
+    memset(&pf, 0, sizeof(pf));
+    pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_LINESPACING;
+    pf.bLineSpacingRule = 4;          /* 精确行距 */
+    HDC hdc = GetDC(h);
+    HFONT oldf = (HFONT)SelectObject(hdc, g_hFontHist);
+    TEXTMETRICW tm;
+    if (GetTextMetricsW(hdc, &tm)) {
+        int lpy = GetDeviceCaps(hdc, LOGPIXELSY);
+        pf.dyLineSpacing = (LONG)((LONGLONG)tm.tmHeight * 1440 / (lpy ? lpy : 96));
+    } else {
+        pf.dyLineSpacing = dp(18) * 15;   /* 兜底: 18 逻辑像素 @96DPI 换算成 twips */
+    }
+    if (oldf) SelectObject(hdc, oldf);
+    ReleaseDC(h, hdc);
+    SendMessageW(h, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+    SendMessageW(h, EM_SETSEL, sel_s, sel_e);
+    SendMessageW(h, EM_SETMODIFY, FALSE, 0);
+}
+
 static LRESULT CALLBACK InputProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN && wp == VK_RETURN) {
         if (GetKeyState(VK_SHIFT) & 0x8000) {
@@ -68,15 +129,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         LoadLibraryW(L"Msftedit.dll");   /* 注册 RICHEDIT50W 控件类 */
 
-        /* 字号同样按逻辑像素书写, 经 dp() 换算 —— 否则在高缩放屏上字会小一半。
-         * 参数是字体的"字符单元高度", 不是磅值。 */
-        g_hFont = CreateFontW(dp(16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              ANTIALIASED_QUALITY, FF_DONTCARE, L"Microsoft YaHei UI");
-        /* 输出区独立字体: 比控件/标签大一档, 阅读更醒目 */
-        g_hFontHist = CreateFontW(dp(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              ANTIALIASED_QUALITY, FF_DONTCARE, L"Microsoft YaHei UI");
+        /* 此刻窗口已经落在某块显示器上 —— 按**这块屏**的 DPI 定 g_dpi。
+         * per-monitor 下不能沿用 dpi_init() 里那个(那是主屏的)。 */
+        g_dpi = dpi_of_window(hwnd);
+
+        /* 按 DPI 修正外框, 让客户区正好是 720x560 逻辑像素 */
+        {
+            RECT r = { 0, 0, dp(720), dp(560) };
+            dpi_adjust_rect(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, g_dpi);
+            SetWindowPos(hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        ui_fonts_rebuild(hwnd);   /* 建字体; 此刻还没有子控件, 下发是空操作 */
 
         static const WCHAR *labels[3] = { L"Base Url:", L"Key:", L"Model:" };
         static const DWORD ed_styles[3] = { 0, ES_PASSWORD, 0 };
@@ -126,28 +191,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_HISTORY, NULL, NULL);
         SendMessageW(g_hHistory, WM_SETFONT, (WPARAM)g_hFontHist, TRUE);
-
-        /* 收紧历史框行距: 用 PARAFORMAT2 设"精确"行距为字体字身高度(physical twips),
-           去除 RichEdit 默认额外行距; 按 LOGPIXELSY 换算以兼顾高 DPI。glyph 不会裁切。 */
-        {
-            PARAFORMAT2 pf;
-            memset(&pf, 0, sizeof(pf));
-            pf.cbSize = sizeof(pf);
-            pf.dwMask = PFM_LINESPACING;
-            pf.bLineSpacingRule = 4;          /* 精确行距 */
-            HDC hdc = GetDC(g_hHistory);
-            HFONT oldf = (HFONT)SelectObject(hdc, g_hFontHist);
-            TEXTMETRICW tm;
-            if (GetTextMetricsW(hdc, &tm)) {
-                int lpy = GetDeviceCaps(hdc, LOGPIXELSY);
-                pf.dyLineSpacing = (LONG)((LONGLONG)tm.tmHeight * 1440 / (lpy ? lpy : 96));
-            } else {
-                pf.dyLineSpacing = dp(18) * 15;   /* 兜底: 18 逻辑像素 @96DPI, 换算成 twips */
-            }
-            if (oldf) SelectObject(hdc, oldf);
-            ReleaseDC(g_hHistory, hdc);
-            SendMessageW(g_hHistory, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
-        }
+        ui_history_parafmt(g_hHistory);
 
         g_hInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL |
@@ -268,6 +312,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+
+    case WM_DPICHANGED: {
+        /* 窗口被拖到了缩放比例不同的显示器。四步都要做齐, 漏一步界面就会按旧 DPI 的尺寸
+         * 画在新屏上(比"不感知"更糟): ① 更新 DPI ② 重建并下发字体
+         * ③ 重设精确行距(twips 是绝对值) ④ 调整外框 + 重新排布 */
+        UINT nd = (UINT)HIWORD(wp);
+        g_dpi = nd ? nd : dpi_of_window(hwnd);
+        ui_fonts_rebuild(hwnd);
+        ui_history_parafmt(g_hHistory);
+        {
+            const RECT *pr = (const RECT*)lp;
+            RECT r = { 0, 0, dp(720), dp(560) };
+            dpi_adjust_rect(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, g_dpi);
+            SetWindowPos(hwnd, NULL, pr->left, pr->top, r.right - r.left, r.bottom - r.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        layout(hwnd);   /* 不必等 WM_SIZE, 显式来一次 */
+        return 0;
+    }
 
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)wp, TRANSPARENT);

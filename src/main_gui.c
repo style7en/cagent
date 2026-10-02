@@ -6,7 +6,7 @@
  *
  * 子模块 (按包含顺序, 即依赖顺序):
  *   state       控件 ID / 自定义消息 / 全局句柄与字体
- *   dpi         高 DPI 适配: 感知设定 + 统一缩放 dp() (必须排在用它的布局模块之前)
+ *   dpi         高 DPI: per-monitor v2 感知 + 统一缩放 dp()/dp_at() (必须排在布局模块之前)
  *   hooks       宿主钩子实现: 输出投递 / 一轮结束 / 配置同步
  *   helpers     UI 辅助: Edit 读写(UTF-8) 与 RichEdit 分角色追加
  *   task        启动一轮 Agent: 配置校验 / 工作目录 / 线程派发

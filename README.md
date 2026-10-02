@@ -365,11 +365,29 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 
 ### 高 DPI（`src/ui/dpi.h`）
 
-- **约定：所有布局常量与字号都按 96 DPI 的"逻辑像素"书写，一律用 `dp()` 换算成物理像素。** 想调尺寸就改逻辑值，不要再往布局里塞裸像素数字。这条适用于 `wndproc.h`（主窗口）、`about.h`、`session_dlg.h` 三处布局。
-- 字号同样要过 `dp()`：`CreateFontW` 的高度参数是"字符单元高度"的**像素数**，不跟着 DPI 走的话，在高缩放屏上字会小一半。
-- 当前是 **系统级 DPI 感知**（`DPI_AWARENESS_SYSTEM_AWARE`）：界面按系统 DPI 原生绘制，在缩放与主屏一致的显示器上清晰；拖到缩放比例不同的显示器时由系统位图缩放（尺寸正确、略糊，与"不感知"相比不更差）。
+- **约定：所有布局常量与字号都按 96 DPI 的"逻辑像素"书写，一律经 `dp()`（主窗口）/ `dp_at()`（对话框）换算成物理像素。** 想调尺寸就改逻辑值，不要再往布局里塞裸像素数字。适用于 `wndproc.h`（主窗口）、`about.h`、`session_dlg.h` 三处布局。
+- 字号同样要过换算：`CreateFontW` 的高度参数是"字符单元高度"的**像素数**，不跟着 DPI 走的话，在高缩放屏上字会小一半。
+- 当前是 **`PER_MONITOR_AWARE_V2`**：进程活在"窗口当前所在显示器"的 DPI 里，**每块屏都按原生分辨率绘制**，跨屏不受系统位图拉伸。
+- **代价：窗口跨屏时必须自己重算。** 收到 `WM_DPICHANGED` 要做齐四步，漏一步界面就会按旧 DPI 的尺寸画在新屏上（比"不感知"更糟 —— 尺寸直接错）：
+  1. 取该窗口的新 DPI（`HIWORD(wParam)`，或用 `dpi_of_window()`）
+  2. 重建字体并下发给全部控件（`ui_fonts_rebuild`：**建新的 → 下发 → 再删旧的**）
+  3. 重设 RichEdit 的精确行距（`ui_history_parafmt`：`dyLineSpacing` 是**绝对 twips**，不随字体自动变；且段落属性只作用于选中范围，所以要先全选、改完还原选区）
+  4. 用 `AdjustWindowRectExForDpi` 反推外框 + `SetWindowPos` + 重新排布
+
+  主窗口在 `wndproc.h` 里做齐了；两个对话框各有一份（`about_fonts_sync`/`about_layout`、`sess_fonts_sync`/`sess_create_list`/`sess_layout`）。
+- **`g_dpi` 只属于主窗口。** 对话框可能被拖到别的显示器上，所以各自维护 `g_about_dpi` / `g_sess_dpi` 并用 `dp_at()` 换算，**绝不能去写 `g_dpi`** —— 否则主窗口下次 `layout()` 会用错比例。对话框的字体也按自己的 DPI 从字体族直接建（`CAGENT_UI_FACE`），不克隆主窗口的 `g_hFont`。
+- 会话列表的行高由 `WM_MEASUREITEM` 一次性决定，而 ownerdraw 列表**不接受** `LB_SETITEMHEIGHT` 改行高，所以 DPI 变化时只能重建列表控件（`sess_create_list`）。
+- 降级：拿不到 PMv2 会退到系统级感知（`SetProcessDPIAware`）。退化后 `dpi_of_window()` 读到的就是系统 DPI，上述四步依然成立（只是 `WM_DPICHANGED` 不再触发），两条路径共用同一套代码。
 - **历史 bug**：这里原先传的是 `-5` = `DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED`，名字像"感知"实际是**不感知** —— 界面被整体位图放大，且窗口物理尺寸随所在显示器变化（同一份 `720x560` 的请求，在 200% 屏上是 `1440x1120`、250% 屏上是 `1800x1400`）。这也解释了早期"本机缩放到底是 200% 还是 250%"两次测量对不上的原因：不是测量误差，是窗口落在了不同显示器上。
-- **若要升级到 `PER_MONITOR_AWARE_V2`**：除了改 `dpi.h` 的常量，还**必须**在 `wndproc.h` 里处理 `WM_DPICHANGED`（更新 `g_dpi` → 重建字体 → 重新布局），否则窗口在副屏上尺寸会算错。当前没做这一步，所以选了系统级。
+
+**实测（把窗口在 200% 主屏与 250% 副屏之间来回移动）**：
+
+| 位置 | 客户区 | 第 1 个 Static |
+|---|---|---|
+| 主屏 200% | `1440x1120` = 720×2 | `@(16,24) 160x52` |
+| 副屏 250% | `1800x1400` = 720×2.5 | `@(20,30) 200x65` |
+
+来回切换可重复，数值精确到像素；关于对话框客户区 `840x360` = `dp(420)xdp(180)`，且关闭它不会带歪主窗口的比例。
   - `FileDescription` 当前是纯英文（`cagent - a minimal AI coding agent in C`），一个额外的保险。
 - **命令行**：`cagent.exe --version` 打印 `cagent 1.1.2`（有父控制台则打印到终端，否则弹对话框）。
 - **「关于」**：主窗口**系统菜单**里的「关于(A)...」（点标题栏图标 / `Alt+Space` / 右键标题栏都能打开），弹出对话框显示一句话功能 + 版本 + 两个项目地址（GitHub 与 Gitee 镜像，国内访问 gitee 更稳）。文案取自 `CAGENT_TAGLINE` / `CAGENT_VERSION_STR` / `CAGENT_PROJECT_URL` / `CAGENT_PROJECT_URL_GITEE`，两个地址都可点击打开默认浏览器，正文也可用 `Ctrl+C` 整段复制。

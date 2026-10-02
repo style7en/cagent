@@ -12,7 +12,13 @@ static char g_sess_paths[64][MAX_PATH];
 static char g_sess_ws[64][200];      /* 第一行: 工作目录 */
 static char g_sess_sub[64][300];     /* 第二行: N 条消息 · 时间 · 预览 */
 static int  g_sess_n = 0;
-static HFONT g_hFontBold = NULL;
+
+/* 对话框自己的 DPI 与字体 —— 同 about.h: 它可能被拖到与主窗口不同缩放比例的显示器上,
+ * 且**绝不能写全局 g_dpi**(那会让主窗口下次 layout() 用错比例)。 */
+static UINT  g_sess_dpi = 96;
+static UINT  g_sess_font_dpi = 0;
+static HFONT g_sessFont     = NULL;
+static HFONT g_sessFontBold = NULL;
 
 /* 旧格式文件从文件名反推工作目录显示 (sanitized: '_' 大多为分隔符)。 */
 static void ws_from_filename(const char *path, char *out, size_t cap) {
@@ -105,40 +111,98 @@ static void sess_apply_selected(const char *path) {
     history_replay();
 }
 
+/* ===== 布局与字体 (首次创建与 WM_DPICHANGED 共用) ===== */
+
+/* 按 g_sess_dpi 重建列表用的两种字体(常规 / 加粗)。直接按字体族建, 不克隆主窗口的 g_hFont ——
+ * 那个可能是别的显示器上的尺寸。 */
+static void sess_fonts_sync(void) {
+    if (g_sess_font_dpi == g_sess_dpi && g_sessFont && g_sessFontBold) return;
+    if (g_sessFont)     { DeleteObject(g_sessFont);     g_sessFont     = NULL; }
+    if (g_sessFontBold) { DeleteObject(g_sessFontBold); g_sessFontBold = NULL; }
+    int h = dp_at(g_sess_dpi, 16);
+    g_sessFont     = CreateFontW(h, 0,0,0, FW_NORMAL, FALSE,FALSE,FALSE, DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                 FF_DONTCARE, CAGENT_UI_FACE);
+    g_sessFontBold = CreateFontW(h, 0,0,0, FW_BOLD,   FALSE,FALSE,FALSE, DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                 FF_DONTCARE, CAGENT_UI_FACE);
+    g_sess_font_dpi = g_sess_dpi;
+}
+
+/* 重建会话列表控件并返回它。行高由 WM_MEASUREITEM 一次性决定, 而 ownerdraw 列表**不接受**
+ * LB_SETITEMHEIGHT 改行高 —— 所以 DPI 变化时只能重建, 否则行高会停在旧字号的尺度上。
+ * 首次创建时 old 为 NULL, 走同一条路径。 */
+static HWND sess_create_list(HWND hwnd) {
+    HWND old = GetDlgItem(hwnd, ID_SESS_LB);
+    LRESULT cur = old ? SendMessageW(old, LB_GETCURSEL, 0, 0) : (LRESULT)-1;
+    if (old) DestroyWindow(old);
+
+    HWND lb = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
+        LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
+        0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_SESS_LB, NULL, NULL);
+    for (int i = 0; i < g_sess_n; i++)
+        SendMessageW(lb, LB_ADDSTRING, 0, 0);
+    if (cur < 0) {   /* 首次: 预选最近使用的会话(ini 里记录的 last_session), 否则第一条 */
+        cur = 0;
+        for (int i = 0; i < g_sess_n; i++)
+            if (g_last_session[0] && strcmp(g_sess_paths[i], g_last_session) == 0) { cur = i; break; }
+    }
+    if (g_sess_n > 0) SendMessageW(lb, LB_SETCURSEL, cur, 0);
+    return lb;
+}
+
+/* 排布控件并下发字体。尺寸全部按当前 g_sess_dpi 现算, 所以重跑一次就适配新 DPI。
+ * 客户区按 540x450 逻辑像素设计 —— 与 show_session_dialog 里的外框计算是一套。 */
+static void sess_layout(HWND hwnd) {
+    const UINT d = g_sess_dpi;
+    MoveWindow(GetDlgItem(hwnd, ID_SESS_LB),  dp_at(d, 12),  dp_at(d, 12),
+               dp_at(d, 496), dp_at(d, 330), TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_SESS_OK), dp_at(d, 300), dp_at(d, 356),
+               dp_at(d, 100), dp_at(d, 32), TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_SESS_CAN), dp_at(d, 412), dp_at(d, 356),
+               dp_at(d, 100), dp_at(d, 32), TRUE);
+    SendMessageW(GetDlgItem(hwnd, ID_SESS_LB),  WM_SETFONT, (WPARAM)g_sessFont, TRUE);
+    SendMessageW(GetDlgItem(hwnd, ID_SESS_OK),  WM_SETFONT, (WPARAM)g_sessFont, TRUE);
+    SendMessageW(GetDlgItem(hwnd, ID_SESS_CAN), WM_SETFONT, (WPARAM)g_sessFont, TRUE);
+}
+
 static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        HWND lb = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
-            LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
-            dp(12), dp(12), dp(496), dp(330), hwnd, (HMENU)(LONG_PTR)ID_SESS_LB, NULL, NULL);
-        SendMessageW(lb, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-        if (!g_hFontBold) {
-            LOGFONTW lf;
-            GetObjectW(g_hFont, sizeof(lf), &lf);
-            lf.lfWeight = FW_BOLD;
-            g_hFontBold = CreateFontIndirectW(&lf);
-        }
-        for (int i = 0; i < g_sess_n; i++)
-            SendMessageW(lb, LB_ADDSTRING, 0, 0);
-        /* 预选最近使用的会话 (ini 里记录的 last_session), 否则选第一条 */
-        {
-            int sel = 0;
-            for (int i = 0; i < g_sess_n; i++)
-                if (g_last_session[0] && strcmp(g_sess_paths[i], g_last_session) == 0) { sel = i; break; }
-            if (g_sess_n > 0) SendMessageW(lb, LB_SETCURSEL, sel, 0);
-        }
-        /* 坐标按 96 DPI 逻辑像素书写, 经 dp() 换算 (见 ui/dpi.h) */
+        g_sess_dpi = dpi_of_window(hwnd);      /* 按对话框所在屏定 DPI */
+        sess_fonts_sync();
+
+        sess_create_list(hwnd);
         CreateWindowW(L"BUTTON", L"载入", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-            dp(300), dp(356), dp(100), dp(32), hwnd, (HMENU)(LONG_PTR)ID_SESS_OK, NULL, NULL);
+                      0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_SESS_OK, NULL, NULL);
         CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            dp(412), dp(356), dp(100), dp(32), hwnd, (HMENU)(LONG_PTR)ID_SESS_CAN, NULL, NULL);
-        SendMessageW(GetDlgItem(hwnd, ID_SESS_OK), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-        SendMessageW(GetDlgItem(hwnd, ID_SESS_CAN), WM_SETFONT, (WPARAM)g_hFont, TRUE);
+                      0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_SESS_CAN, NULL, NULL);
+        sess_layout(hwnd);
         return 0;
     }
+
+    case WM_DPICHANGED: {
+        /* 被拖到缩放比例不同的显示器: 换本对话框自己的 DPI, 重建字体与列表(行高要重算),
+         * 重排, 再调整外框。**不碰全局 g_dpi**。 */
+        UINT nd = (UINT)HIWORD(wp);
+        g_sess_dpi = nd ? nd : dpi_of_window(hwnd);
+        sess_fonts_sync();
+        sess_create_list(hwnd);
+        sess_layout(hwnd);
+        InvalidateRect(hwnd, NULL, TRUE);
+        {
+            const RECT *pr = (const RECT*)lp;
+            RECT r = { 0, 0, dp_at(g_sess_dpi, 540), dp_at(g_sess_dpi, 450) };
+            dpi_adjust_rect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
+                            FALSE, WS_EX_DLGMODALFRAME, g_sess_dpi);
+            MoveWindow(hwnd, pr->left, pr->top, r.right - r.left, r.bottom - r.top, TRUE);
+        }
+        return 0;
+    }
+
     case WM_MEASUREITEM:
-        ((MEASUREITEMSTRUCT*)lp)->itemHeight = dp(56);
+        ((MEASUREITEMSTRUCT*)lp)->itemHeight = dp_at(g_sess_dpi, 56);
         return TRUE;
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT*)lp;
@@ -151,18 +215,23 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* 第一行: 工作目录 (加粗) */
         SetTextColor(d->hDC, sel ? GetSysColor(COLOR_HIGHLIGHTTEXT)
                                  : GetSysColor(COLOR_WINDOWTEXT));
-        SelectObject(d->hDC, g_hFontBold);
+        SelectObject(d->hDC, g_sessFontBold);
         wchar_t w1[200];
         utf8_to_wide(g_sess_ws[idx], w1, 200);
-        RECT r1 = d->rcItem; r1.left += dp(10); r1.top += dp(6); r1.bottom = r1.top + dp(20);
+        RECT r1 = d->rcItem;
+        r1.left  += dp_at(g_sess_dpi, 10);
+        r1.top   += dp_at(g_sess_dpi, 6);
+        r1.bottom = r1.top + dp_at(g_sess_dpi, 20);
         DrawTextW(d->hDC, w1, -1, &r1, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         /* 第二行: 条数 · 时间 · 预览 (灰) */
         SetTextColor(d->hDC, sel ? GetSysColor(COLOR_HIGHLIGHTTEXT)
                                  : RGB(120, 120, 120));
-        SelectObject(d->hDC, g_hFont);
+        SelectObject(d->hDC, g_sessFont);
         wchar_t w2[300];
         utf8_to_wide(g_sess_sub[idx], w2, 300);
-        RECT r2 = d->rcItem; r2.left += dp(10); r2.top += dp(28);
+        RECT r2 = d->rcItem;
+        r2.left += dp_at(g_sess_dpi, 10);
+        r2.top  += dp_at(g_sess_dpi, 28);
         DrawTextW(d->hDC, w2, -1, &r2, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         if (d->itemState & ODS_FOCUS) DrawFocusRect(d->hDC, &d->rcItem);
         return TRUE;
@@ -221,10 +290,17 @@ static void show_session_dialog(HWND owner) {
         reg = 1;
     }
 
+    /* 按主窗口所在屏先定尺寸(窗口还没建, 只能问 owner); 建完后 WM_CREATE 会用对话框
+     * 自己的显示器再核一次。540x450 是**客户区**逻辑尺寸, 与 sess_layout 是一套。 */
+    g_sess_dpi = dpi_of_window(owner);
+    RECT wr = { 0, 0, dp_at(g_sess_dpi, 540), dp_at(g_sess_dpi, 450) };
+    dpi_adjust_rect(&wr, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
+                    FALSE, WS_EX_DLGMODALFRAME, g_sess_dpi);
+
     g_sess_owner = owner;
     g_sess_dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"CAGENT_SESSDLG", L"历史会话",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, dp(540), dp(450), owner, NULL,
+        CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top, owner, NULL,
         GetModuleHandleW(NULL), NULL);
     if (!g_sess_dlg) { g_sess_owner = NULL; return; }
 
