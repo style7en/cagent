@@ -203,7 +203,7 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
 |---|---|
 | HTTPS 网络 | **WinHTTP** (Windows 内置,无外部依赖) |
 | UI 不卡死 | LLM 调用走后台线程,UI 主线程 `PostMessage` 接收追加事件 |
-| 高 DPI 适配 | 三级降级: `SetProcessDpiAwarenessContext` → `SetProcessDpiAwareness` → `SetProcessDPIAware` |
+| 高 DPI 适配 | **PerMonitorV2**（声明在 `res/app.manifest`，每块显示器按原生分辨率绘制）+ 全部布局与字号经 `dp()` 换算 |
 | 中文显示 | 全程 UTF-8 ↔ UTF-16 转换,字体 Microsoft YaHei UI |
 | 静默工具执行 | `CreateProcess + CREATE_NO_WINDOW + 匿名管道`,不弹 cmd 黑框 |
 | 纯内存 IO | 无 `req.json`/`resp.json` 临时文件 |
@@ -361,7 +361,7 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 - **为什么必须有**：不声明 `Microsoft.Windows.Common-Controls 6.0.0.0` 依赖的进程会拿到 comctl32 **v5**，控件就是 Windows 2000 那种经典外观（3D 凸起按钮、2px 凹陷输入框）。实测本机（Win11 build 26100）**即使 exe 完全没有清单，也碰巧加载了 `WinSxS\...\comctl32 6.0.26100`** —— 也就是说加清单前外观本来就是主题化的，但那是撞运气，换台机器可能静默退回经典外观且不报任何错。加清单是把"碰巧"变成"保证"，**视觉上零变化**。
 - **怎么验证**：`FindResourceW(exe, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24))` 能取到即为已内嵌；进程里实际加载的 `comctl32.dll` 路径含 `WinSxS` 即为 v6。
 - **⚠️ 别用 `PrintWindow` 判断外观**：它渲染控件时**不走主题引擎**，会把主题化的扁平按钮画成 v5 的 3D 凸起按钮。判断外观只能用屏幕 `BitBlt`（且必须确认窗口在最前）。首次排查这个问题时就被它误导过。
-- 清单里**刻意没有声明 DPI 感知**（见下一节），因为 `<dpiAwareness>PerMonitorV2</dpiAwareness>` 还必须配合处理 `WM_DPICHANGED`，否则窗口在缩放比例不同的显示器上尺寸会错。
+- 清单里**还声明了 DPI 感知**（见下一节）：`<dpiAwareness>PerMonitorV2,PerMonitor</dpiAwareness>` 加 `<dpiAware>true/pm</dpiAware>`。放清单而不用 `SetProcessDpiAwarenessContext`，是因为加载器在**任何代码运行之前**就应用它，没有"调用失败被静默忽略"这种坑 —— 历史上正是那么栽的（见下节的历史 bug）。
 
 ### 高 DPI（`src/ui/dpi.h`）
 
@@ -377,15 +377,15 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
   主窗口在 `wndproc.h` 里做齐了；两个对话框各有一份（`about_fonts_sync`/`about_layout`、`sess_fonts_sync`/`sess_create_list`/`sess_layout`）。
 - **`g_dpi` 只属于主窗口。** 对话框可能被拖到别的显示器上，所以各自维护 `g_about_dpi` / `g_sess_dpi` 并用 `dp_at()` 换算，**绝不能去写 `g_dpi`** —— 否则主窗口下次 `layout()` 会用错比例。对话框的字体也按自己的 DPI 从字体族直接建（`CAGENT_UI_FACE`），不克隆主窗口的 `g_hFont`。
 - 会话列表的行高由 `WM_MEASUREITEM` 一次性决定，而 ownerdraw 列表**不接受** `LB_SETITEMHEIGHT` 改行高，所以 DPI 变化时只能重建列表控件（`sess_create_list`）。
-- 降级：拿不到 PMv2 会退到系统级感知（`SetProcessDPIAware`）。退化后 `dpi_of_window()` 读到的就是系统 DPI，上述四步依然成立（只是 `WM_DPICHANGED` 不再触发），两条路径共用同一套代码。
+- **感知由 `res/app.manifest` 声明，不在代码里设**。`src/ui/dpi.h` 只负责查询 DPI（`dpi_system` / `dpi_of_window`）和换算（`dp` / `dp_at`）—— 原来那条约 25 行的动态 `GetProcAddress` 降级链（`SetProcessDpiAwarenessContext` → `SetProcessDpiAwareness` → `SetProcessDPIAware`）已经删掉。清单由加载器在建进程前应用，**运行时不能再改**（这是好事）；Win8.1 起认 `dpiAware`、Win10 1703 起认 `dpiAwareness`，更早的系统不认识这两项，会退回"不感知"（尺寸对、略糊）。
 - **历史 bug**：这里原先传的是 `-5` = `DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED`，名字像"感知"实际是**不感知** —— 界面被整体位图放大，且窗口物理尺寸随所在显示器变化（同一份 `720x560` 的请求，在 200% 屏上是 `1440x1120`、250% 屏上是 `1800x1400`）。这也解释了早期"本机缩放到底是 200% 还是 250%"两次测量对不上的原因：不是测量误差，是窗口落在了不同显示器上。
 
 **实测（把窗口在 200% 主屏与 250% 副屏之间来回移动）**：
 
 | 位置 | 客户区 | 第 1 个 Static |
 |---|---|---|
-| 主屏 200% | `1440x1120` = 720×2 | `@(16,24) 160x52` |
-| 副屏 250% | `1800x1400` = 720×2.5 | `@(20,30) 200x65` |
+| 主屏 200% | `1440x1120` = 720×2 | `@(16,24) 160x44` |
+| 副屏 250% | `1800x1400` = 720×2.5 | `@(20,30) 200x55` |
 
 来回切换可重复，数值精确到像素；关于对话框客户区 `840x360` = `dp(420)xdp(180)`，且关闭它不会带歪主窗口的比例。
 

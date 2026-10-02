@@ -65,10 +65,7 @@ static BOOL CALLBACK ui_font_cb(HWND h, LPARAM lp) {
     return TRUE;
 }
 
-/* 把当前字体下发到窗口的全部子控件。 */
-static void ui_fonts_apply(HWND hwnd) { EnumChildWindows(hwnd, ui_font_cb, 0); }
-
-/* 按 g_dpi 重建界面字体并下发。
+/* 按 g_dpi 重建界面字体并下发到全部子控件。
  * **顺序必须是** 建新的 -> 下发 -> 再删旧的; 反过来控件会短暂引用已释放的句柄。
  * 窗口首次创建时也调它 —— 那时还没有子控件, 下发这一步自然是空操作。 */
 static void ui_fonts_rebuild(HWND hwnd) {
@@ -80,7 +77,7 @@ static void ui_fonts_rebuild(HWND hwnd) {
     g_hFontHist = CreateFontW(dp(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
-    ui_fonts_apply(hwnd);
+    EnumChildWindows(hwnd, ui_font_cb, 0);
     for (int i = 0; i < 2; i++) if (old[i]) DeleteObject(old[i]);
 }
 

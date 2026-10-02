@@ -129,10 +129,10 @@ static void sess_fonts_sync(void) {
     g_sess_font_dpi = g_sess_dpi;
 }
 
-/* 重建会话列表控件并返回它。行高由 WM_MEASUREITEM 一次性决定, 而 ownerdraw 列表**不接受**
+/* 重建会话列表控件。行高由 WM_MEASUREITEM 一次性决定, 而 ownerdraw 列表**不接受**
  * LB_SETITEMHEIGHT 改行高 —— 所以 DPI 变化时只能重建, 否则行高会停在旧字号的尺度上。
  * 首次创建时 old 为 NULL, 走同一条路径。 */
-static HWND sess_create_list(HWND hwnd) {
+static void sess_create_list(HWND hwnd) {
     HWND old = GetDlgItem(hwnd, ID_SESS_LB);
     LRESULT cur = old ? SendMessageW(old, LB_GETCURSEL, 0, 0) : (LRESULT)-1;
     if (old) DestroyWindow(old);
@@ -149,7 +149,6 @@ static HWND sess_create_list(HWND hwnd) {
             if (g_last_session[0] && strcmp(g_sess_paths[i], g_last_session) == 0) { cur = i; break; }
     }
     if (g_sess_n > 0) SendMessageW(lb, LB_SETCURSEL, cur, 0);
-    return lb;
 }
 
 /* 排布控件并下发字体。尺寸全部按当前 g_sess_dpi 现算, 所以重跑一次就适配新 DPI。

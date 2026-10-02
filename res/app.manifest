@@ -14,11 +14,10 @@
   Kept ASCII-only on purpose: windres copies this file byte-for-byte and its declared
   encoding is never re-processed, so there is nothing to get wrong here.
 
-  Note: DPI awareness is deliberately NOT declared here. The process currently uses
-  DPI_AWARENESS_SYSTEM_AWARE, set at runtime in src/ui/dpi.h. If it is ever moved into
-  the manifest, remember that <dpiAwareness>PerMonitorV2</dpiAwareness> also requires
-  handling WM_DPICHANGED, or the UI will be the wrong size on a monitor whose scale
-  differs from the primary one.
+  Note: DPI awareness IS declared here (see <application> below). It used to be set at runtime
+  in src/ui/dpi.h, which failed silently once (a wrong constant made the process unaware while
+  looking like it succeeded). Declaring it in the manifest is applied by the loader before any
+  code runs, so there is no failure mode to get wrong.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity type="win32" name="cagent" version="1.0.0.0" processorArchitecture="*"/>
@@ -33,4 +32,10 @@
                         language="*"/>
     </dependentAssembly>
   </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2,PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
 </assembly>
