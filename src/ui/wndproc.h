@@ -9,28 +9,30 @@
 static void layout(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom;
-    int gap = 8;
-    int row_h = 26;
-    int lbl_w = 80;
+    /* 以下全部按 96 DPI 逻辑像素书写, 经 dp() 换算成物理像素 (见 ui/dpi.h)。
+     * 调尺寸请改这些逻辑值, 不要再往布局里塞裸像素数字。 */
+    int gap = dp(8);
+    int row_h = dp(26);
+    int lbl_w = dp(80);
     int top_h = row_h * 4 + gap * 5;
-    int btn_w = 80;
-    int ws_btn_w = 72;
-    int new_w = 80;
-    int sess_w = 80;
-    int input_h = 72;
+    int btn_w = dp(80);
+    int ws_btn_w = dp(72);
+    int new_w = dp(80);
+    int sess_w = dp(80);
+    int input_h = dp(72);
     int input_y = H - input_h - gap;
     int input_w = W - btn_w - gap * 3;
 
     for (int i = 0; i < 3; i++) {
         int y = gap + i * (row_h + gap);
         HWND lbl = GetDlgItem(hwnd, ID_LBL_BASE + i);
-        MoveWindow(lbl,        gap,         y + 4, lbl_w,               row_h, TRUE);
-        MoveWindow(g_hCfg[i],  gap + lbl_w, y,     W - gap*2 - lbl_w,   row_h, TRUE);
+        MoveWindow(lbl,        gap,         y + dp(4), lbl_w,             row_h, TRUE);
+        MoveWindow(g_hCfg[i],  gap + lbl_w, y,         W - gap*2 - lbl_w, row_h, TRUE);
     }
     {
         int y = gap + 3 * (row_h + gap);
         HWND lbl = GetDlgItem(hwnd, ID_LBL_WS);
-        MoveWindow(lbl, gap, y + 4, lbl_w, row_h, TRUE);
+        MoveWindow(lbl, gap, y + dp(4), lbl_w, row_h, TRUE);
         /* 按钮从右往左依次排: 加载会话 | 新建会话 | 浏览... —— 顺序写死在这里,
          * 加成对/删除都只动这几行, 不必再手算每个偏移。工作目录输入框吃掉剩余宽度。 */
         int x = W - gap;
@@ -66,11 +68,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         LoadLibraryW(L"Msftedit.dll");   /* 注册 RICHEDIT50W 控件类 */
 
-        g_hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        /* 字号同样按逻辑像素书写, 经 dp() 换算 —— 否则在高缩放屏上字会小一半。
+         * 参数是字体的"字符单元高度", 不是磅值。 */
+        g_hFont = CreateFontW(dp(16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               ANTIALIASED_QUALITY, FF_DONTCARE, L"Microsoft YaHei UI");
         /* 输出区独立字体: 比控件/标签大一档, 阅读更醒目 */
-        g_hFontHist = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        g_hFontHist = CreateFontW(dp(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               ANTIALIASED_QUALITY, FF_DONTCARE, L"Microsoft YaHei UI");
 
@@ -138,7 +142,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int lpy = GetDeviceCaps(hdc, LOGPIXELSY);
                 pf.dyLineSpacing = (LONG)((LONGLONG)tm.tmHeight * 1440 / (lpy ? lpy : 96));
             } else {
-                pf.dyLineSpacing = 18 * 15;   /* 兜底: 18px @96DPI */
+                pf.dyLineSpacing = dp(18) * 15;   /* 兜底: 18 逻辑像素 @96DPI, 换算成 twips */
             }
             if (oldf) SelectObject(hdc, oldf);
             ReleaseDC(g_hHistory, hdc);

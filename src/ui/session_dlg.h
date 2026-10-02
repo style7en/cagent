@@ -111,7 +111,7 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HWND lb = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
             LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
-            12, 12, 496, 330, hwnd, (HMENU)(LONG_PTR)ID_SESS_LB, NULL, NULL);
+            dp(12), dp(12), dp(496), dp(330), hwnd, (HMENU)(LONG_PTR)ID_SESS_LB, NULL, NULL);
         SendMessageW(lb, WM_SETFONT, (WPARAM)g_hFont, TRUE);
         if (!g_hFontBold) {
             LOGFONTW lf;
@@ -128,16 +128,17 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_last_session[0] && strcmp(g_sess_paths[i], g_last_session) == 0) { sel = i; break; }
             if (g_sess_n > 0) SendMessageW(lb, LB_SETCURSEL, sel, 0);
         }
+        /* 坐标按 96 DPI 逻辑像素书写, 经 dp() 换算 (见 ui/dpi.h) */
         CreateWindowW(L"BUTTON", L"载入", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-            300, 356, 100, 32, hwnd, (HMENU)(LONG_PTR)ID_SESS_OK, NULL, NULL);
+            dp(300), dp(356), dp(100), dp(32), hwnd, (HMENU)(LONG_PTR)ID_SESS_OK, NULL, NULL);
         CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            412, 356, 100, 32, hwnd, (HMENU)(LONG_PTR)ID_SESS_CAN, NULL, NULL);
+            dp(412), dp(356), dp(100), dp(32), hwnd, (HMENU)(LONG_PTR)ID_SESS_CAN, NULL, NULL);
         SendMessageW(GetDlgItem(hwnd, ID_SESS_OK), WM_SETFONT, (WPARAM)g_hFont, TRUE);
         SendMessageW(GetDlgItem(hwnd, ID_SESS_CAN), WM_SETFONT, (WPARAM)g_hFont, TRUE);
         return 0;
     }
     case WM_MEASUREITEM:
-        ((MEASUREITEMSTRUCT*)lp)->itemHeight = 56;
+        ((MEASUREITEMSTRUCT*)lp)->itemHeight = dp(56);
         return TRUE;
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT*)lp;
@@ -153,7 +154,7 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SelectObject(d->hDC, g_hFontBold);
         wchar_t w1[200];
         utf8_to_wide(g_sess_ws[idx], w1, 200);
-        RECT r1 = d->rcItem; r1.left += 10; r1.top += 6; r1.bottom = r1.top + 20;
+        RECT r1 = d->rcItem; r1.left += dp(10); r1.top += dp(6); r1.bottom = r1.top + dp(20);
         DrawTextW(d->hDC, w1, -1, &r1, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         /* 第二行: 条数 · 时间 · 预览 (灰) */
         SetTextColor(d->hDC, sel ? GetSysColor(COLOR_HIGHLIGHTTEXT)
@@ -161,7 +162,7 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SelectObject(d->hDC, g_hFont);
         wchar_t w2[300];
         utf8_to_wide(g_sess_sub[idx], w2, 300);
-        RECT r2 = d->rcItem; r2.left += 10; r2.top += 28;
+        RECT r2 = d->rcItem; r2.left += dp(10); r2.top += dp(28);
         DrawTextW(d->hDC, w2, -1, &r2, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         if (d->itemState & ODS_FOCUS) DrawFocusRect(d->hDC, &d->rcItem);
         return TRUE;
@@ -223,7 +224,7 @@ static void show_session_dialog(HWND owner) {
     g_sess_owner = owner;
     g_sess_dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"CAGENT_SESSDLG", L"历史会话",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 540, 450, owner, NULL,
+        CW_USEDEFAULT, CW_USEDEFAULT, dp(540), dp(450), owner, NULL,
         GetModuleHandleW(NULL), NULL);
     if (!g_sess_dlg) { g_sess_owner = NULL; return; }
 

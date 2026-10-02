@@ -64,45 +64,53 @@ static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_aboutFontLink)  { lf = base; lf.lfUnderline = TRUE;    g_aboutFontLink  = CreateFontIndirectW(&lf); }
         }
 
-        /* 紧凑排布: 左内边距 16, 行距只给字体实际高度 + 4px, 不留大块空白。
-         * 标签列 56 宽(够放 "GitHub"), 值列从 x=76 起, 右留 16。
-         * 控件坐标写死在客户区 420x180 里 —— 改尺寸务必同步下面 AdjustWindowRectEx 的
-         * 客户区尺寸, 否则底部留白或按钮被裁掉。 */
+        /* 紧凑排布: 左内边距 16, 标签列 56(放得下 "GitHub"), 值列自 x=76 起, 行距只给
+         * 字体实际高度 + 4px。全部按 96 DPI 逻辑像素书写, 经 dp() 换算 (见 ui/dpi.h)。
+         * 客户区 420x180 —— 与下面 show_about 里 AdjustWindowRectEx 的尺寸是一套,
+         * 改一处必须改另一处, 否则底部留白或按钮被裁掉。 */
+        const int pad = dp(16);
+        const int lw  = dp(56);
+        const int vx  = pad + lw + dp(4);       /* 值列起点 = 76 */
+        const int vw  = dp(420) - pad - vx;     /* 值列宽   = 328 */
+        const int rh  = dp(20);
+        const int bw  = dp(84);
+
         HWND t;
         t = CreateWindowW(L"STATIC", L"cagent", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          16, 12, 388, 22, hwnd, NULL, NULL, NULL);
+                          pad, dp(12), dp(388), dp(22), hwnd, NULL, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)(g_aboutFontTitle ? g_aboutFontTitle : g_hFont), TRUE);
 
         t = CreateWindowW(L"STATIC", wtag, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          16, 38, 388, 20, hwnd, NULL, NULL, NULL);
+                          pad, dp(38), dp(388), rh, hwnd, NULL, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
         /* 三行"标签列 + 值列": 光秃秃一个 1.1.2 没人看得出是什么 */
         t = CreateWindowW(L"STATIC", L"版本", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          16, 66, 56, 20, hwnd, NULL, NULL, NULL);
+                          pad, dp(66), lw, rh, hwnd, NULL, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
         t = CreateWindowW(L"STATIC", wver, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          76, 66, 328, 20, hwnd, NULL, NULL, NULL);
+                          vx, dp(66), vw, rh, hwnd, NULL, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
         /* 两个链接: SS_NOTIFY 才会把点击告诉父窗口 */
         t = CreateWindowW(L"STATIC", L"GitHub", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          16, 90, 56, 20, hwnd, NULL, NULL, NULL);
+                          pad, dp(90), lw, rh, hwnd, NULL, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
         t = CreateWindowW(L"STATIC", wgh, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
-                          76, 90, 328, 20, hwnd, (HMENU)(LONG_PTR)ID_ABOUT_URL, NULL, NULL);
+                          vx, dp(90), vw, rh, hwnd, (HMENU)(LONG_PTR)ID_ABOUT_URL, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)(g_aboutFontLink ? g_aboutFontLink : g_hFont), TRUE);
 
         t = CreateWindowW(L"STATIC", L"Gitee", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                          16, 114, 56, 20, hwnd, NULL, NULL, NULL);
+                          pad, dp(114), lw, rh, hwnd, NULL, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
         t = CreateWindowW(L"STATIC", wgt, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
-                          76, 114, 328, 20, hwnd, (HMENU)(LONG_PTR)ID_ABOUT_URL_GITEE, NULL, NULL);
+                          vx, dp(114), vw, rh, hwnd, (HMENU)(LONG_PTR)ID_ABOUT_URL_GITEE, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)(g_aboutFontLink ? g_aboutFontLink : g_hFont), TRUE);
 
         t = CreateWindowW(L"BUTTON", L"关闭",
                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-                          320, 142, 84, 26, hwnd, (HMENU)(LONG_PTR)ID_ABOUT_OK, NULL, NULL);
+                          dp(420) - pad - bw, dp(142), bw, dp(26), hwnd,
+                          (HMENU)(LONG_PTR)ID_ABOUT_OK, NULL, NULL);
         SendMessageW(t, WM_SETFONT, (WPARAM)g_hFont, TRUE);
         return 0;
     }
@@ -176,8 +184,9 @@ static void show_about(HWND owner) {
     }
 
     /* 按客户区尺寸反推外框: 免得到手算边框/标题栏高度。
-     * 420x180 与上面控件的排布是一套 —— 改一处必须改另一处。 */
-    RECT r = {0, 0, 420, 180};
+     * 420x180 是**逻辑尺寸**, 经 dp() 换算; 与上面控件排布是一套 —— 改一处必须改另一处。
+     * 进程是系统级 DPI 感知, 所以 AdjustWindowRectEx 用的度量与 g_dpi 一致。 */
+    RECT r = {0, 0, dp(420), dp(180)};
     AdjustWindowRectEx(&r, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     int cw = r.right - r.left, chh = r.bottom - r.top;
 

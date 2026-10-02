@@ -27,7 +27,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     cagent_stream_undo = gui_stream_undo;
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    enable_dpi_awareness();
+    dpi_init();          /* 必须在创建窗口/字体之前: 设定 DPI 感知并记录 g_dpi */
     InitCommonControls();
 
     WNDCLASSW wc = {0};
@@ -41,9 +41,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
 
     /* 标题栏只写名字, 不带版本号: 版本在「关于」(系统菜单) 与 exe 文件属性里, 标题栏里
      * 那串数字每次发版都要跟着改, 且对用户没有信息量。 */
+    /* 除零/负数保护: dp() 依赖 g_dpi, 若 dpi_init() 未生效也算出一个合理尺寸 */
+    if (g_dpi < 48) g_dpi = 96;
     HWND hwnd = CreateWindowW(L"CagentGuiWnd", L"cagent",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 720, 560,
+        CW_USEDEFAULT, CW_USEDEFAULT, dp(720), dp(560),
         NULL, NULL, hInst, NULL);
 
     /* 标题栏/任务栏图标 (大 + 小) */

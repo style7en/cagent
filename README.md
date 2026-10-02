@@ -41,7 +41,7 @@ cagent/
 │       ├── helpers.h   # Edit 读写(UTF-8) + RichEdit 分角色追加与 Markdown 渲染
 │       ├── task.h      # 启动一轮 Agent
 │       ├── wndproc.h   # 布局 / 子类 / 主窗口过程
-│       ├── dpi.h       # 高 DPI 适配
+│       ├── dpi.h       # 高 DPI: 感知设定 + 统一缩放 dp() (布局与字号都经它换算)
 │       ├── session_dlg.h # 会话选择对话框 (枚举 / 自绘列表 / 载入)
 │       ├── about.h     # 关于对话框 (一句话功能 / 版本 / 两个项目地址, 地址可点)
 │       └── main.h      # 程序入口
@@ -361,7 +361,15 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 - **为什么必须有**：不声明 `Microsoft.Windows.Common-Controls 6.0.0.0` 依赖的进程会拿到 comctl32 **v5**，控件就是 Windows 2000 那种经典外观（3D 凸起按钮、2px 凹陷输入框）。实测本机（Win11 build 26100）**即使 exe 完全没有清单，也碰巧加载了 `WinSxS\...\comctl32 6.0.26100`** —— 也就是说加清单前外观本来就是主题化的，但那是撞运气，换台机器可能静默退回经典外观且不报任何错。加清单是把"碰巧"变成"保证"，**视觉上零变化**。
 - **怎么验证**：`FindResourceW(exe, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24))` 能取到即为已内嵌；进程里实际加载的 `comctl32.dll` 路径含 `WinSxS` 即为 v6。
 - **⚠️ 别用 `PrintWindow` 判断外观**：它渲染控件时**不走主题引擎**，会把主题化的扁平按钮画成 v5 的 3D 凸起按钮。判断外观只能用屏幕 `BitBlt`（且必须确认窗口在最前）。首次排查这个问题时就被它误导过。
-- 清单里**刻意没有声明 DPI 感知**（见 `src/ui/dpi.h`），因为 `<dpiAwareness>PerMonitorV2</dpiAwareness>` 还必须配合处理 `WM_DPICHANGED`，否则窗口在缩放比例不同的显示器上尺寸会错。
+- 清单里**刻意没有声明 DPI 感知**（见下一节），因为 `<dpiAwareness>PerMonitorV2</dpiAwareness>` 还必须配合处理 `WM_DPICHANGED`，否则窗口在缩放比例不同的显示器上尺寸会错。
+
+### 高 DPI（`src/ui/dpi.h`）
+
+- **约定：所有布局常量与字号都按 96 DPI 的"逻辑像素"书写，一律用 `dp()` 换算成物理像素。** 想调尺寸就改逻辑值，不要再往布局里塞裸像素数字。这条适用于 `wndproc.h`（主窗口）、`about.h`、`session_dlg.h` 三处布局。
+- 字号同样要过 `dp()`：`CreateFontW` 的高度参数是"字符单元高度"的**像素数**，不跟着 DPI 走的话，在高缩放屏上字会小一半。
+- 当前是 **系统级 DPI 感知**（`DPI_AWARENESS_SYSTEM_AWARE`）：界面按系统 DPI 原生绘制，在缩放与主屏一致的显示器上清晰；拖到缩放比例不同的显示器时由系统位图缩放（尺寸正确、略糊，与"不感知"相比不更差）。
+- **历史 bug**：这里原先传的是 `-5` = `DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED`，名字像"感知"实际是**不感知** —— 界面被整体位图放大，且窗口物理尺寸随所在显示器变化（同一份 `720x560` 的请求，在 200% 屏上是 `1440x1120`、250% 屏上是 `1800x1400`）。这也解释了早期"本机缩放到底是 200% 还是 250%"两次测量对不上的原因：不是测量误差，是窗口落在了不同显示器上。
+- **若要升级到 `PER_MONITOR_AWARE_V2`**：除了改 `dpi.h` 的常量，还**必须**在 `wndproc.h` 里处理 `WM_DPICHANGED`（更新 `g_dpi` → 重建字体 → 重新布局），否则窗口在副屏上尺寸会算错。当前没做这一步，所以选了系统级。
   - `FileDescription` 当前是纯英文（`cagent - a minimal AI coding agent in C`），一个额外的保险。
 - **命令行**：`cagent.exe --version` 打印 `cagent 1.1.2`（有父控制台则打印到终端，否则弹对话框）。
 - **「关于」**：主窗口**系统菜单**里的「关于(A)...」（点标题栏图标 / `Alt+Space` / 右键标题栏都能打开），弹出对话框显示一句话功能 + 版本 + 两个项目地址（GitHub 与 Gitee 镜像，国内访问 gitee 更稳）。文案取自 `CAGENT_TAGLINE` / `CAGENT_VERSION_STR` / `CAGENT_PROJECT_URL` / `CAGENT_PROJECT_URL_GITEE`，两个地址都可点击打开默认浏览器，正文也可用 `Ctrl+C` 整段复制。
