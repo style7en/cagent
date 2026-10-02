@@ -314,13 +314,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_DPICHANGED: {
-        /* 窗口被拖到了缩放比例不同的显示器。四步都要做齐, 漏一步界面就会按旧 DPI 的尺寸
-         * 画在新屏上(比"不感知"更糟): ① 更新 DPI ② 重建并下发字体
-         * ③ 重设精确行距(twips 是绝对值) ④ 调整外框 + 重新排布 */
+        /* 窗口被拖到了缩放比例不同的显示器。
+         * **顺序很关键**: 先按新 DPI 调整外框并重新排布控件, **最后**才重建字体。
+         * 反过来(先换字体)会让控件带着新字号、按**旧几何**先重画一次; 那一帧的像素若没被
+         * 随后的位移擦掉就会留在原位 —— 实测: 主屏(200%)拖到副屏(250%)后, "工作目录:" 上方
+         * 出现一排残留的笔画尖(屏幕上看得到, PrintWindow 重画时看不到, 因为它是残迹不是绘制错)。 */
         UINT nd = (UINT)HIWORD(wp);
         g_dpi = nd ? nd : dpi_of_window(hwnd);
-        ui_fonts_rebuild(hwnd);
-        ui_history_parafmt(g_hHistory);
+
         {
             const RECT *pr = (const RECT*)lp;
             RECT r = { 0, 0, dp(720), dp(560) };
@@ -328,11 +329,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowPos(hwnd, NULL, pr->left, pr->top, r.right - r.left, r.bottom - r.top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
-        layout(hwnd);   /* 不必等 WM_SIZE, 显式来一次 */
+        layout(hwnd);
+        ui_fonts_rebuild(hwnd);        /* 最后换字体: 控件按新几何重画一次即可 */
+        ui_history_parafmt(g_hHistory);
+
+        /* 兜底: DPI 切换期间父窗口可能有大片区域没被擦到(子控件位移留下的空档)。
+         * 整棵子树擦除 + 立即重画, 保证不留旧 DPI 的残迹。 */
+        RedrawWindow(hwnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
         return 0;
     }
 
     case WM_CTLCOLORSTATIC:
+        /* 透明背景: 标签不擦自己的底, 底色由父窗口提供。
+         * (试过改成"不透明 + 返回同色画刷"让标签自擦 —— 结果每个标签后面多出一块**白底**:
+         *  OPAQUE 模式下 STATIC 填充用的是 DC 的 BkColor 而不是返回的画刷, 而 BkColor 默认是白。
+         *  真要走自擦那条路, 必须同时 SetBkColor(COLOR_BTNFACE)。这里选择留在透明模式,
+         *  由 WM_DPICHANGED 末尾那次整棵子树重画来保证不留旧像素。) */
         SetBkMode((HDC)wp, TRANSPARENT);
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
 

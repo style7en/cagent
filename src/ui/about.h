@@ -153,12 +153,12 @@ static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_DPICHANGED: {
-        /* 被拖到缩放比例不同的显示器: 换本对话框自己的 DPI, 重建字体, 重排, 再调整外框。
-         * **不碰全局 g_dpi** —— 那是主窗口的。 */
+        /* 被拖到缩放比例不同的显示器。**顺序**: 建字体 -> 调整外框 -> 排布并下发字体。
+         * 字体只在 about_layout 里下发(那时控件已经移到新位置), 所以不会出现"新字号配旧几何"
+         * 的中间帧残迹。最后不碰全局 g_dpi —— 那是主窗口的。 */
         UINT nd = (UINT)HIWORD(wp);
         g_about_dpi = nd ? nd : dpi_of_window(hwnd);
         about_fonts_sync();
-        about_layout(hwnd);
         {
             const RECT *pr = (const RECT*)lp;
             RECT r = { 0, 0, dp_at(g_about_dpi, 420), dp_at(g_about_dpi, 180) };
@@ -166,16 +166,17 @@ static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             WS_EX_DLGMODALFRAME, g_about_dpi);
             MoveWindow(hwnd, pr->left, pr->top, r.right - r.left, r.bottom - r.top, TRUE);
         }
+        about_layout(hwnd);
+        RedrawWindow(hwnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
         return 0;
     }
 
     case WM_CTLCOLORSTATIC:
-        /* 链接用系统热链色 (跟随主题, 深色模式也不瞎), 背景与对话框一致否则会留白块 */
-        if (about_link_url(GetDlgCtrlID((HWND)lp))) {
-            SetBkMode((HDC)wp, TRANSPARENT);
+        /* 链接用系统热链色(跟随主题); 背景保持**透明** —— 同 wndproc.h 里那段注释:
+         * OPAQUE 模式下 STATIC 用的是 DC 的 BkColor(默认白)而不是返回的画刷, 会多出一块白底。 */
+        if (about_link_url(GetDlgCtrlID((HWND)lp)))
             SetTextColor((HDC)wp, GetSysColor(COLOR_HOTLIGHT));
-            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
-        }
         SetBkMode((HDC)wp, TRANSPARENT);
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
 

@@ -183,14 +183,13 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_DPICHANGED: {
-        /* 被拖到缩放比例不同的显示器: 换本对话框自己的 DPI, 重建字体与列表(行高要重算),
-         * 重排, 再调整外框。**不碰全局 g_dpi**。 */
+        /* 被拖到缩放比例不同的显示器。**顺序**: 建字体 -> 重建列表(行高要按新 DPI 重算)
+         * -> 调整外框 -> 排布并下发字体。字体只在 sess_layout 里下发(那时控件已在新位置),
+         * 避免"新字号配旧几何"的中间帧留下残迹。**不碰全局 g_dpi**。 */
         UINT nd = (UINT)HIWORD(wp);
         g_sess_dpi = nd ? nd : dpi_of_window(hwnd);
         sess_fonts_sync();
         sess_create_list(hwnd);
-        sess_layout(hwnd);
-        InvalidateRect(hwnd, NULL, TRUE);
         {
             const RECT *pr = (const RECT*)lp;
             RECT r = { 0, 0, dp_at(g_sess_dpi, 540), dp_at(g_sess_dpi, 450) };
@@ -198,6 +197,9 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             FALSE, WS_EX_DLGMODALFRAME, g_sess_dpi);
             MoveWindow(hwnd, pr->left, pr->top, r.right - r.left, r.bottom - r.top, TRUE);
         }
+        sess_layout(hwnd);
+        RedrawWindow(hwnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
         return 0;
     }
 
