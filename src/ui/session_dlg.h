@@ -105,6 +105,10 @@ static void sess_apply_selected(const char *path) {
     if (utf8_to_wide(g_workspace, wws, MAX_PATH))
         SetCurrentDirectoryW(wws);
     SetWindowTextW(g_hHistory, L"");
+    /* 清空会把段落格式一并复位(实测行距会跳回 RichEdit 的自然行距, 比我们设的松),
+     * 缩放比也可能被重置 —— 所以紧接着把这两项重新下发一次。 */
+    ui_history_parafmt(g_hHistory);
+    ui_history_zoom_apply(g_hHistory);
     append_text("(已载入历史会话, 工作目录: ");
     append_text(g_workspace);
     append_text(")\r\n");

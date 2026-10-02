@@ -63,6 +63,14 @@ static void do_append(const char *utf8, int role) {
     CHARFORMAT2W role_cf = base;
     role_cf.dwMask    |= CFM_COLOR | CFM_BOLD | CFM_ITALIC;
     role_cf.dwEffects &= ~(CFE_AUTOCOLOR | CFE_BOLD | CFE_ITALIC);
+    /* **刻意不设 CFM_SIZE / yHeight** —— 字号一律继承控件的默认字体。
+     * 踩过的两个坑, 都是"给 run 写死字号"引出来的:
+     *   ① CHARFORMAT.yHeight 是 em 高, 而 WM_SETFONT 的 CreateFontW(h) 是**字身格高**;
+     *      YaHei 的 格/em ≈ 1.27, 于是写死 yHeight 的字比默认字体大 27%,
+     *      而行距是按默认字体的 tmHeight 算的 -> 字被行距削顶(实测削掉 10px)。
+     *   ② WM_SETFONT 会让 RichEdit 丢掉 run 上的显式字号 —— 一旦跨显示器触发
+     *      WM_DPICHANGED 里那轮 ui_fonts_rebuild, 文字会从"大"跳回"默认", 看着像换了套排版。
+     * 缩放输出区字号请走 EM_SETZOOM(见 wndproc.h 的 ui_history_zoom), 它不碰字符格式。 */
     role_cf.crTextColor = RGB(0, 0, 0);            /* AI: 默认黑 */
     if (role == CAGENT_ROLE_USER) {
         role_cf.crTextColor = RGB(0, 90, 200);     /* 用户: 蓝 */

@@ -73,19 +73,25 @@ static void ui_fonts_rebuild(HWND hwnd) {
     g_hFont     = CreateFontW(dp(16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
-    /* 输出区独立字体: 比控件/标签大一档, 阅读更醒目 */
-    g_hFontHist = CreateFontW(dp(18), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    /* 输出区独立字体: 默认比控件/标签大一档, 阅读更醒目。
+     * **基准字号恒为 HIST_LPX_DEF** —— Ctrl+滚轮的缩放走 EM_SETZOOM(整体显示缩放),
+     * 不再靠改这个字体, 否则每次滚动都要重建字体+刷全部 run, 还会把 run 字号钉死。 */
+    g_hFontHist = CreateFontW(dp(HIST_LPX_DEF), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
     EnumChildWindows(hwnd, ui_font_cb, 0);
     for (int i = 0; i < 2; i++) if (old[i]) DeleteObject(old[i]);
 }
 
-/* 收紧历史框行距: 用 PARAFORMAT2 设"精确"行距为字体字身高度(physical twips), 去掉 RichEdit
- * 默认的额外行距; 按 LOGPIXELSY 换算以兼顾高 DPI。glyph 不会裁切。两个坑:
+/* 收紧历史框行距: 用 PARAFORMAT2 设"精确"行距 = 字身格高 + HIST_LINE_EXTRA,
+ * 去掉 RichEdit 默认的额外行距。三个坑:
  *   ① dyLineSpacing 是**绝对 twips**, 不随字体走 —— 字体换了(跨显示器 DPI 变化)就必须重设,
  *      否则行高按旧字号卡死, 字号变大时字会被裁切;
- *   ② 段落属性只作用于选中范围, 空选区时仅改光标所在那一段 —— 所以先全选、改完再还原选区。 */
+ *   ② 段落属性只作用于选中范围, 空选区时仅改光标所在那一段 —— 所以先全选、改完再还原选区;
+ *   ③ 用**精确(exactly)**行距时行盒小于字形就会被削顶(见 state.h 的 HIST_LINE_EXTRA),
+ *      别把值设成刚好等于字身格高。
+ * 另外: 空字符串 WM_SETTEXT 会把段落格式复位(实测行距会跳回 RichEdit 的自然行距),
+ * 所以清空历史框之后必须重新调一次本函数。 */
 static void ui_history_parafmt(HWND h) {
     if (!h) return;
     LONG sel_s = 0, sel_e = 0;
@@ -97,23 +103,74 @@ static void ui_history_parafmt(HWND h) {
     pf.cbSize = sizeof(pf);
     pf.dwMask = PFM_LINESPACING;
     pf.bLineSpacingRule = 4;          /* 精确行距 */
-    HDC hdc = GetDC(h);
-    HFONT oldf = (HFONT)SelectObject(hdc, g_hFontHist);
-    TEXTMETRICW tm;
-    if (GetTextMetricsW(hdc, &tm)) {
-        int lpy = GetDeviceCaps(hdc, LOGPIXELSY);
-        pf.dyLineSpacing = (LONG)((LONGLONG)tm.tmHeight * 1440 / (lpy ? lpy : 96));
-    } else {
-        pf.dyLineSpacing = dp(18) * 15;   /* 兜底: 18 逻辑像素 @96DPI 换算成 twips */
-    }
-    if (oldf) SelectObject(hdc, oldf);
-    ReleaseDC(h, hdc);
+    /* 行高直接由"请求的字体像素高 + 余量"换算成 twips, **单一 DPI 来源 = g_dpi**。
+     * 这里曾经用 GetTextMetricsW + GetDeviceCaps(hdc, LOGPIXELSY) 去量, 但那是错的:
+     * 在 WM_DPICHANGED 里子控件的 DPI 上下文还没跟着更新, 那个 DC 报的仍是**旧屏**的 DPI,
+     * 而 dp() 已经是新屏的 —— 两个口径混用会让行距整体偏一个 DPI 比例
+     * (实测 200%->250% 时行距从应有的 47px 变成 60px)。 */
+    pf.dyLineSpacing = (LONG)((LONGLONG)dp(HIST_LPX_DEF + HIST_LINE_EXTRA) * 1440
+                              / (g_dpi ? g_dpi : 96));
     SendMessageW(h, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
     SendMessageW(h, EM_SETSEL, sel_s, sel_e);
     SendMessageW(h, EM_SETMODIFY, FALSE, 0);
 }
 
+/* ===== 输出区字号缩放 (Ctrl + 滚轮) ===== */
+
+/* 把 g_hist_lpx 折算成 EM_SETZOOM 的比值下发。基准字号(1:1)就是 HIST_LPX_DEF,
+ * 其余尺寸全由控件自己缩放显示。
+ *
+ * 为什么用 EM_SETZOOM 而不是"重建字体 + SCF_ALL 刷 run 字号"(这两条路都实测过):
+ *   - EM_SETZOOM 只缩放**显示**, 不碰字符格式 -> 行距(精确 twips)自动等比跟随。
+ *     实测 1:1 行距 36px -> 5:4 得 45 -> 3:2 得 54, 回到 1:1 精确还原; 12:18 得 24、
+ *     40:18 得 80, 与预期一致, 两端都被接受。
+ *   - 写 run 字号会引入两个真 bug: ① yHeight 是 em 高、而默认字体是字身格高
+ *     (YaHei 差 1.27 倍), 字比行距大 -> 削顶; ② WM_SETFONT 会作废 run 字号,
+ *     跨显示器触发 ui_fonts_rebuild 后文字大小会跳变。
+ * 若将来换到不认 EM_SETZOOM 的 RichEdit, 返回 0 —— 那时再考虑别的路, 但别再写 run 字号。 */
+static void ui_history_zoom_apply(HWND hist) {
+    if (!hist) return;
+    SendMessageW(hist, EM_SETZOOM, (WPARAM)g_hist_lpx, (LPARAM)HIST_LPX_DEF);
+}
+
+/* 步进单位 1 逻辑像素。 */
+static void ui_history_zoom(HWND hist, int steps) {
+    if (!hist || !steps) return;
+    int n = g_hist_lpx + steps;
+    if (n < HIST_LPX_MIN) n = HIST_LPX_MIN;
+    if (n > HIST_LPX_MAX) n = HIST_LPX_MAX;
+    if (n == g_hist_lpx) return;                 /* 已到上下限: 不做无谓的缩放 */
+    g_hist_lpx = n;
+    ui_history_zoom_apply(hist);
+    InvalidateRect(hist, NULL, TRUE);
+}
+
+/* Ctrl+滚轮 -> 缩放输出区字号; 返回非 0 表示该消息已被消费。
+ *
+ * 三处都要挂(主窗口 / 输出框子类 / 输入框子类), 因为 Windows 是把滚轮消息发给**焦点窗口**
+ * 而不是光标下的窗口 —— 只挂输出框的话, 焦点在输入框里时就压根收不到。反过来说, 这个
+ * 手势的语义就是"整窗有效、只作用于输出区", 与浏览器里 Ctrl+滚轮缩放一致。
+ *
+ * 修饰键用消息自带的 MK_CONTROL 而不是只靠 GetKeyState: 它随消息一起送达, 不依赖当前
+ * 线程的消息队列状态(GetKeyState 取的是**调用线程**的键状态), 也让这条路径能被自动化验证。 */
+static int ui_zoom_wheel(WPARAM wp) {
+    if (!(LOWORD(wp) & MK_CONTROL) && !(GetKeyState(VK_CONTROL) & 0x8000)) return 0;
+
+    int delta = (int)(short)HIWORD(wp);
+    /* 一格 = WHEEL_DELTA(120)。高精度滚轮/触控板给出的是更小的增量, 累积满一格才走一步;
+     * 方向一变就丢弃残量, 否则来回微滚会攒出"白送的"一步。 */
+    if ((delta > 0) != (g_hist_zoom_acc > 0)) g_hist_zoom_acc = 0;
+    g_hist_zoom_acc += delta;
+    int steps = 0;
+    while (g_hist_zoom_acc >= WHEEL_DELTA)  { g_hist_zoom_acc -= WHEEL_DELTA; steps++; }
+    while (g_hist_zoom_acc <= -WHEEL_DELTA) { g_hist_zoom_acc += WHEEL_DELTA; steps--; }
+    ui_history_zoom(g_hHistory, steps);
+    return 1;   /* 攒不满一格也算消费: 否则缩放途中会同时触发控件自己的滚动 */
+}
+
 static LRESULT CALLBACK InputProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    /* Ctrl+滚轮: 缩放输出区字号(见 ui_zoom_wheel 的注释: 焦点在这里时消息只到这儿) */
+    if (msg == WM_MOUSEWHEEL && ui_zoom_wheel(wp)) return 0;
     if (msg == WM_KEYDOWN && wp == VK_RETURN) {
         if (GetKeyState(VK_SHIFT) & 0x8000) {
             return CallWindowProcW(g_oldInputProc, h, msg, wp, lp);
@@ -195,6 +252,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_HISTORY, NULL, NULL);
         SendMessageW(g_hHistory, WM_SETFONT, (WPARAM)g_hFontHist, TRUE);
         ui_history_parafmt(g_hHistory);
+        /* 输出区底色略深于输入框(见 state.h 的 HIST_BG)。必须走 EM_SETBKGNDCOLOR ——
+         * RichEdit 不是 STATIC, 不会来问 WM_CTLCOLORSTATIC, 那边返回的画刷对它无效。
+         * 颜色与 DPI 无关, 所以只在创建时设一次; WM_DPICHANGED 里不必重设。 */
+        SendMessageW(g_hHistory, EM_SETBKGNDCOLOR, 0, (LPARAM)(DWORD)HIST_BG);
 
         g_hInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL |
@@ -335,6 +396,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         layout(hwnd);
         ui_fonts_rebuild(hwnd);        /* 最后换字体: 控件按新几何重画一次即可 */
         ui_history_parafmt(g_hHistory);
+        ui_history_zoom_apply(g_hHistory);   /* 缩放比是控件属性, 这里重下一遍保险 */
 
         /* 兜底: DPI 切换期间父窗口可能有大片区域没被擦到(子控件位移留下的空档)。
          * 整棵子树擦除 + 立即重画, 保证不留旧 DPI 的残迹。 */
@@ -342,6 +404,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
         return 0;
     }
+
+    case WM_MOUSEWHEEL:
+        /* Ctrl+滚轮: 缩放输出区字号。没按 Ctrl 就交给控件自己滚动。 */
+        if (ui_zoom_wheel(wp)) return 0;
+        break;
 
     case WM_CTLCOLORSTATIC:
         /* 透明背景: 标签不擦自己的底, 底色由父窗口提供。
@@ -392,6 +459,8 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    /* Ctrl+滚轮缩放输出区字号; 其余滚轮动作照旧交回原过程(滚动)并补一次重画 */
+    if (msg == WM_MOUSEWHEEL && ui_zoom_wheel(wp)) return 0;
     if (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL ||
         msg == WM_KEYDOWN || msg == WM_KEYUP) {
         LRESULT r = CallWindowProcW(g_oldHistoryProc, h, msg, wp, lp);
