@@ -39,7 +39,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     wc.lpszClassName = L"CagentGuiWnd";
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowW(L"CagentGuiWnd", L"cagent " CAGENT_VERSION_WSTR,
+    /* 标题栏只写名字, 不带版本号: 版本在「关于」(系统菜单) 与 exe 文件属性里, 标题栏里
+     * 那串数字每次发版都要跟着改, 且对用户没有信息量。 */
+    HWND hwnd = CreateWindowW(L"CagentGuiWnd", L"cagent",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 720, 560,
         NULL, NULL, hInst, NULL);

@@ -12,6 +12,7 @@
  *   wndproc     布局 / 输入框子类 / 主窗口过程 / 历史框子类
  *   dpi         高 DPI 适配 (三级降级)
  *   session_dlg 会话选择对话框: 枚举 / 自绘列表 / 载入
+ *   about       关于对话框: 一句话功能 / 版本 / 项目地址 (文案取自 version.h)
  *   main        程序入口: 注册窗口类 / 图标 / 消息循环
  *
  * 通过钩子把核心与界面解耦:
@@ -34,4 +35,5 @@
 #include "ui/wndproc.h"
 #include "ui/dpi.h"
 #include "ui/session_dlg.h"
+#include "ui/about.h"
 #include "ui/main.h"

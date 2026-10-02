@@ -30,11 +30,15 @@ static void layout(HWND hwnd) {
     {
         int y = gap + 3 * (row_h + gap);
         HWND lbl = GetDlgItem(hwnd, ID_LBL_WS);
-        MoveWindow(lbl,           gap,         y + 4, lbl_w,             row_h, TRUE);
-        MoveWindow(g_hWorkspace,  gap + lbl_w, y,     W - lbl_w - ws_btn_w - new_w - sess_w - gap*5, row_h, TRUE);
-        MoveWindow(g_hWsBrowse,   W - gap - ws_btn_w - new_w - sess_w - gap*2, y, ws_btn_w, row_h, TRUE);
-        MoveWindow(g_hNew,        W - gap - new_w - sess_w - gap, y, new_w,           row_h, TRUE);
-        MoveWindow(g_hSess,       W - gap - sess_w, y, sess_w,             row_h, TRUE);
+        MoveWindow(lbl, gap, y + 4, lbl_w, row_h, TRUE);
+        /* 按钮从右往左依次排: 加载会话 | 新建会话 | 浏览... —— 顺序写死在这里,
+         * 加成对/删除都只动这几行, 不必再手算每个偏移。工作目录输入框吃掉剩余宽度。 */
+        int x = W - gap;
+        x -= sess_w;         MoveWindow(g_hSess,     x, y, sess_w,   row_h, TRUE);
+        x -= gap + new_w;    MoveWindow(g_hNew,      x, y, new_w,    row_h, TRUE);
+        x -= gap + ws_btn_w; MoveWindow(g_hWsBrowse, x, y, ws_btn_w, row_h, TRUE);
+        x -= gap;
+        MoveWindow(g_hWorkspace, gap + lbl_w, y, x - (gap + lbl_w), row_h, TRUE);
     }
 
     MoveWindow(g_hHistory, gap, top_h, W - gap * 2,
@@ -164,6 +168,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_SESS_BTN, NULL, NULL);
         SendMessageW(g_hSess, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
+        /* 「关于」挂到系统菜单 (标题栏图标左键 / Alt+Space / 右键标题栏)。
+         * GetSystemMenu 第二参数必须传 FALSE: 传 TRUE 会把菜单重置回默认,
+         * 我们刚加的两项会被抹掉。分隔线把自定义项与系统的 关闭 隔开。 */
+        {
+            HMENU sysm = GetSystemMenu(hwnd, FALSE);
+            if (sysm) {
+                AppendMenuW(sysm, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(sysm, MF_STRING, IDM_ABOUT, L"关于(&A)...");
+            }
+        }
+
         {
             /* 启动不自动加载历史: 全新对话, 旧会话通过"加载会话"按钮按需载入 */
             reset_conversation();
@@ -237,6 +252,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (LOWORD(wp) == ID_SESS_BTN && HIWORD(wp) == BN_CLICKED) {
             if (!g_running) show_session_dialog(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_SYSCOMMAND:
+        /* 系统菜单里我们加的自定义项。低 4 位被系统用作内部标志(如 SC_MOUSEMENU 高位),
+         * 所以比较前必须先掩掉 —— 否则鼠标点出来的命令 (0xF0x0) 匹配不上。 */
+        if ((wp & 0xFFF0) == IDM_ABOUT) {
+            show_about(hwnd);
             return 0;
         }
         break;

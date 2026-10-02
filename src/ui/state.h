@@ -23,6 +23,19 @@
 #define ID_SESS_OK  2002   /* 载入 */
 #define ID_SESS_CAN 2003   /* 取消 */
 
+/* ===== 系统菜单命令 (WM_SYSCOMMAND) =====
+ * 「关于」挂在窗口的系统菜单上 —— 主窗口没有菜单栏, 而标题栏问号按钮(WS_EX_CONTEXTHELP)
+ * 与最小化/最大化互斥(实测加了它问号根本不画), 所以系统菜单是这里放"关于"的标准位置:
+ * 点标题栏图标 / Alt+Space / 右键标题栏都能到。
+ *
+ * 取值有两处硬约束:
+ *   ① 必须避开系统预定义命令 —— SC_* 全在 0xF000 以上
+ *      (SC_SIZE=0xF000 … SC_CONTEXTHELP=0xF180, 另有 SC_SEPARATOR=0xF00F)。
+ *   ② **必须是 16 的倍数。** WM_SYSCOMMAND 的低 4 位被系统占用, 分发时要 `wp & 0xFFF0`,
+ *      若 ID 自身低 4 位非 0 (如 900 = 0x384), 掩码会把它削成别的值 —— 分支永远不命中。
+ *      GCC 会以 -Wtautological-compare 报出来, 这正是本例踩过的坑。 */
+#define IDM_ABOUT   0x0100
+
 #define WM_APP_APPEND  (WM_APP + 1)   /* wParam = role(int), lParam = UTF-8 char* (须 free) */
 #define WM_APP_STREAM  (WM_APP + 2)   /* wParam = 1: 新分段开始(清零计数); 0: 回删本分段 AI 文本
                                        * 必须与 APP_APPEND 一样按 FIFO 投递, 不能跨线程 SendMessage */
@@ -38,6 +51,7 @@ static void set_edit_utf8(HWND h, const char *utf8);
 /* ===== GUI 状态 ===== */
 static HWND g_hHistory, g_hInput, g_hSend, g_hNew, g_hSess;
 static void show_session_dialog(HWND owner);
+static void show_about(HWND owner);
 static HWND g_hCfg[3];                 /* [url, key, model] */
 static HWND g_hWorkspace, g_hWsBrowse; /* 工作目录 Edit + 浏览按钮 */
 static HFONT g_hFont;

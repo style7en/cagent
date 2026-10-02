@@ -43,6 +43,7 @@ cagent/
 │       ├── wndproc.h   # 布局 / 子类 / 主窗口过程
 │       ├── dpi.h       # 高 DPI 适配
 │       ├── session_dlg.h # 会话选择对话框 (枚举 / 自绘列表 / 载入)
+│       ├── about.h     # 关于对话框 (一句话功能 / 版本 / 两个项目地址, 地址可点)
 │       └── main.h      # 程序入口
 └── test/               # 回归测试 (与 src/ 完全分开, 产品二进制不带测试代码)
     ├── test.h          # 测试套件本体 run_all_tests + json_selftest
@@ -346,14 +347,18 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 
 ## 版本号
 
-版本号的**唯一事实来源**在 `src/core/version.h`（`CAGENT_VER_MAJOR/MINOR/PATCH` 与 `CAGENT_VERSION_STR`），改动版本只改这一处，三处同步引用：
+版本号与对外文案的**唯一事实来源**在 `src/core/version.h`（`CAGENT_VER_MAJOR/MINOR/PATCH`、`CAGENT_VERSION_STR`；另有 `CAGENT_TAGLINE` / `CAGENT_PROJECT_URL` / `CAGENT_PROJECT_URL_GITEE`），改动只改这一处，三处同步引用：
 
 - **Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.1.2.0` + 字符串 `1.1.2`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。
   - `app.rc` 里的 `#include "core/version.h"` 与 `ICON "app.ico"` 都相对自身目录解析，故 Makefile 给 windres 传了 `-I src -I res`。
   - Makefile 还给 windres 传了 `-c 65001`：`app.rc` 是 UTF-8(无 BOM)，而 windres 默认按**系统 ANSI 码页**解释源码（中文 Windows 上是 936/GBK）。漏了这个选项，非 ASCII 字符串会被按 GBK 拆成乱码写进资源 —— 表现为文件属性里出现 `C 璇█鏋佺畝缂栫▼ Agent` 这类乱码。**新增非 ASCII 文本前请确认该选项仍在。**
   - `FileDescription` 当前是纯英文（`cagent - a minimal AI coding agent in C`），一个额外的保险。
 - **命令行**：`cagent.exe --version` 打印 `cagent 1.1.2`（有父控制台则打印到终端，否则弹对话框）。
-- **窗口标题栏**：显示 `cagent 1.1.2`。
+- **「关于」**：主窗口**系统菜单**里的「关于(A)...」（点标题栏图标 / `Alt+Space` / 右键标题栏都能打开），弹出对话框显示一句话功能 + 版本 + 两个项目地址（GitHub 与 Gitee 镜像，国内访问 gitee 更稳）。文案取自 `CAGENT_TAGLINE` / `CAGENT_VERSION_STR` / `CAGENT_PROJECT_URL` / `CAGENT_PROJECT_URL_GITEE`，两个地址都可点击打开默认浏览器，正文也可用 `Ctrl+C` 整段复制。
+
+> **窗口标题栏只写 `cagent`，不带版本号** —— 版本在「关于」和 exe 文件属性里就够；标题栏那串数字每次发版都得跟着改，对用户也没有信息量。
+>
+> **为什么「关于」不放标题栏问号按钮**：`WS_EX_CONTEXTHELP` 与 `WS_MINIMIZEBOX`/`WS_MAXIMIZEBOX` 互斥（MSDN 原文）。实测在带最小化/最大化的窗口上，加了这个扩展样式**问号根本不会被绘制**（样式位却在，光看 `GetWindowLongPtr` 查不出来，必须看图）。另外问号按钮的语义是「上下文相关帮助」（点它再点某个控件才弹说明），本来就不是「关于」的入口。
 
 ---
 
