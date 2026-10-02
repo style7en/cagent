@@ -377,7 +377,12 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
   主窗口在 `wndproc.h` 里做齐了；两个对话框各有一份（`about_fonts_sync`/`about_layout`、`sess_fonts_sync`/`sess_create_list`/`sess_layout`）。
 - **`g_dpi` 只属于主窗口。** 对话框可能被拖到别的显示器上，所以各自维护 `g_about_dpi` / `g_sess_dpi` 并用 `dp_at()` 换算，**绝不能去写 `g_dpi`** —— 否则主窗口下次 `layout()` 会用错比例。对话框的字体也按自己的 DPI 从字体族直接建（`CAGENT_UI_FACE`），不克隆主窗口的 `g_hFont`。
 - 会话列表的行高由 `WM_MEASUREITEM` 一次性决定，而 ownerdraw 列表**不接受** `LB_SETITEMHEIGHT` 改行高，所以 DPI 变化时只能重建列表控件（`sess_create_list`）。
-- **感知由 `res/app.manifest` 声明，不在代码里设**。`src/ui/dpi.h` 只负责查询 DPI（`dpi_system` / `dpi_of_window`）和换算（`dp` / `dp_at`）—— 原来那条约 25 行的动态 `GetProcAddress` 降级链（`SetProcessDpiAwarenessContext` → `SetProcessDpiAwareness` → `SetProcessDPIAware`）已经删掉。清单由加载器在建进程前应用，**运行时不能再改**（这是好事）；Win8.1 起认 `dpiAware`、Win10 1703 起认 `dpiAwareness`，更早的系统不认识这两项，会退回"不感知"（尺寸对、略糊）。
+- **感知由 `res/app.manifest` 声明，不在代码里设**。`src/ui/dpi.h` 只负责查询 DPI（`dpi_system` / `dpi_of_window`）和换算（`dp` / `dp_at`）—— 原来那条约 25 行的动态 `GetProcAddress` 降级链（`SetProcessDpiAwarenessContext` → `SetProcessDpiAwareness` → `SetProcessDPIAware`）已经删掉。清单由加载器在建进程前应用，**运行时不能再改**（这是好事）。
+- **两行声明的分工**（版本门槛按官方文档，元素和"值"要分清）：
+  - `<dpiAwareness>`（2016 命名空间）**元素**从 **Windows 10 1607** 起被识别，其中的 `permonitorv2` **值**要 1703+；更早的版本按列表取下一个认得的项，所以我们写的是 `PerMonitorV2,PerMonitor` 这种降级列表。
+  - `<dpiAware>`（2005 命名空间）从 **Vista** 起就认，其中 `true/pm` 这个**值**要 **Windows 8.1**。**Windows 10 1607 及以上会忽略它**（`dpiAwareness` 覆盖 `dpiAware`）—— 它纯粹是给 Win8.1 ~ Win10 1607 那几年留的兜底。
+  - 值只能是 `true` / `false` / `true/pm` / `per monitor`。写成别的字符串，在 Vista/7/8.0 上会变成**不感知且不可运行时修改**；而 `true/pm` 在那三个系统上只是退成系统级感知。所以用 `true/pm` —— 最坏情况最轻。
+  - 实测：把 `dpiAware` 故意改成非法值后重编，进程**仍是 PMv2**、跨屏尺寸不变，证实这行在本机（Win11）完全没被读取。
 - **历史 bug**：这里原先传的是 `-5` = `DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED`，名字像"感知"实际是**不感知** —— 界面被整体位图放大，且窗口物理尺寸随所在显示器变化（同一份 `720x560` 的请求，在 200% 屏上是 `1440x1120`、250% 屏上是 `1800x1400`）。这也解释了早期"本机缩放到底是 200% 还是 250%"两次测量对不上的原因：不是测量误差，是窗口落在了不同显示器上。
 
 **实测（把窗口在 200% 主屏与 250% 副屏之间来回移动）**：

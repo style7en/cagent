@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!--
-  cagent application manifest / 应用程序清单
+  cagent application manifest
 
   Why this file exists:
   A process that does not declare the Common-Controls v6 dependency gets comctl32 v5
@@ -18,6 +18,18 @@
   in src/ui/dpi.h, which failed silently once (a wrong constant made the process unaware while
   looking like it succeeded). Declaring it in the manifest is applied by the loader before any
   code runs, so there is no failure mode to get wrong.
+
+  Why these two lines, and why these exact values:
+    dpiAwareness (SMI/2016) - the ELEMENT is recognized from Windows 10 1607; the VALUE
+      "permonitorv2" needs 1703+. Older builds take the next recognized item in the list,
+      hence the "PerMonitorV2,PerMonitor" fallback list.
+    dpiAware (SMI/2005)     - recognized since Vista; the VALUE "true/pm" needs 8.1. It is
+      IGNORED on Windows 10 1607 and later (dpiAwareness overrides it). It exists only as a
+      fallback for the Windows 8.1 -> 10 1607 window. Verified: setting it to a bogus value
+      and rebuilding still yields PerMonitorV2 here.
+    Keep "true/pm", not "true": on Vista/7/8.0 "true/pm" degrades to system-aware (usable),
+      whereas any unrecognized string degrades to UNAWARE and cannot be changed at runtime.
+      Plain "true" would also work but forfeits per-monitor on 8.1 through 1607.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity type="win32" name="cagent" version="1.0.0.0" processorArchitecture="*"/>
