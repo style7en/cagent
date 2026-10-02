@@ -49,8 +49,9 @@ cagent/
     ├── test.h          # 测试套件本体 run_all_tests + json_selftest
     └── main.c          # 控制台入口 (make test)
 └── res/                # 资源
-    ├── app.rc          # 图标 + 版本信息
-    └── app.ico
+    ├── app.rc          # 图标 + 版本信息 + 应用程序清单
+    ├── app.ico
+    └── app.manifest    # comctl32 v6 依赖声明 (控件现代视觉样式)
 ```
 
 > 拆分方式: `src/core/` 与 `src/ui/` 下的头文件全部是 `static` 实现, 由聚合头按依赖顺序
@@ -352,6 +353,15 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 - **Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.1.2.0` + 字符串 `1.1.2`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。
   - `app.rc` 里的 `#include "core/version.h"` 与 `ICON "app.ico"` 都相对自身目录解析，故 Makefile 给 windres 传了 `-I src -I res`。
   - Makefile 还给 windres 传了 `-c 65001`：`app.rc` 是 UTF-8(无 BOM)，而 windres 默认按**系统 ANSI 码页**解释源码（中文 Windows 上是 936/GBK）。漏了这个选项，非 ASCII 字符串会被按 GBK 拆成乱码写进资源 —— 表现为文件属性里出现 `C 璇█鏋佺畝缂栫▼ Agent` 这类乱码。**新增非 ASCII 文本前请确认该选项仍在。**
+
+### 控件外观与 `res/app.manifest`
+
+`res/app.rc` 里有一行 `1 24 "app.manifest"`，把清单作为 **RT_MANIFEST**（类型必须写数字 `24`，ID 必须是 `1`）嵌进 exe。
+
+- **为什么必须有**：不声明 `Microsoft.Windows.Common-Controls 6.0.0.0` 依赖的进程会拿到 comctl32 **v5**，控件就是 Windows 2000 那种经典外观（3D 凸起按钮、2px 凹陷输入框）。实测本机（Win11 build 26100）**即使 exe 完全没有清单，也碰巧加载了 `WinSxS\...\comctl32 6.0.26100`** —— 也就是说加清单前外观本来就是主题化的，但那是撞运气，换台机器可能静默退回经典外观且不报任何错。加清单是把"碰巧"变成"保证"，**视觉上零变化**。
+- **怎么验证**：`FindResourceW(exe, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24))` 能取到即为已内嵌；进程里实际加载的 `comctl32.dll` 路径含 `WinSxS` 即为 v6。
+- **⚠️ 别用 `PrintWindow` 判断外观**：它渲染控件时**不走主题引擎**，会把主题化的扁平按钮画成 v5 的 3D 凸起按钮。判断外观只能用屏幕 `BitBlt`（且必须确认窗口在最前）。首次排查这个问题时就被它误导过。
+- 清单里**刻意没有声明 DPI 感知**（见 `src/ui/dpi.h`），因为 `<dpiAwareness>PerMonitorV2</dpiAwareness>` 还必须配合处理 `WM_DPICHANGED`，否则窗口在缩放比例不同的显示器上尺寸会错。
   - `FileDescription` 当前是纯英文（`cagent - a minimal AI coding agent in C`），一个额外的保险。
 - **命令行**：`cagent.exe --version` 打印 `cagent 1.1.2`（有父控制台则打印到终端，否则弹对话框）。
 - **「关于」**：主窗口**系统菜单**里的「关于(A)...」（点标题栏图标 / `Alt+Space` / 右键标题栏都能打开），弹出对话框显示一句话功能 + 版本 + 两个项目地址（GitHub 与 Gitee 镜像，国内访问 gitee 更稳）。文案取自 `CAGENT_TAGLINE` / `CAGENT_VERSION_STR` / `CAGENT_PROJECT_URL` / `CAGENT_PROJECT_URL_GITEE`，两个地址都可点击打开默认浏览器，正文也可用 `Ctrl+C` 整段复制。

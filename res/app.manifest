@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  cagent application manifest / 应用程序清单
+
+  Why this file exists:
+  A process that does not declare the Common-Controls v6 dependency gets comctl32 v5
+  and therefore the classic (Windows 2000 style) control rendering. Windows 11 build
+  26100 happens to load v6 anyway - verified: the exe had no manifest at all and the
+  process still mapped comctl32 6.0.26100 from WinSxS. That is accidental, not a
+  guarantee, so declare it explicitly.
+
+  Embedded from res/app.rc as RT_MANIFEST (resource type 24, ID 1).
+
+  Kept ASCII-only on purpose: windres copies this file byte-for-byte and its declared
+  encoding is never re-processed, so there is nothing to get wrong here.
+
+  Note: DPI awareness is deliberately NOT declared here. The process currently uses
+  DPI_AWARENESS_SYSTEM_AWARE, set at runtime in src/ui/dpi.h. If it is ever moved into
+  the manifest, remember that <dpiAwareness>PerMonitorV2</dpiAwareness> also requires
+  handling WM_DPICHANGED, or the UI will be the wrong size on a monitor whose scale
+  differs from the primary one.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="cagent" version="1.0.0.0" processorArchitecture="*"/>
+  <description>cagent - a minimal AI coding agent in C</description>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32"
+                        name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0"
+                        processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df"
+                        language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>

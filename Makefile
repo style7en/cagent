@@ -35,7 +35,7 @@ all: $(GUI_TARGET)
 # -c 65001: res/app.rc 是 UTF-8(无 BOM), 而 windres 默认按系统 ANSI 码页解释源码 ——
 # 中文 Windows 上是 936(GBK), 于是 "语言极简编程" 的 18 个 UTF-8 字节被两两拆成 9 个
 # GBK 字写进版本资源, 文件属性里就成了 "C 璇█鏋佺畝缂栫▼ Agent"。必须显式声明 UTF-8。
-$(GUI_RES): res/app.rc res/app.ico $(CORE_HDRS)
+$(GUI_RES): res/app.rc res/app.ico res/app.manifest $(CORE_HDRS)
 	$(WINDRES) -c 65001 -I src -I res -O coff -o $@ $<
 
 $(GUI_TARGET): $(GUI_SRC) $(CORE_HDRS) $(UI_HDRS) $(GUI_RES)

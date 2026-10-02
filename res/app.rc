@@ -6,6 +6,13 @@
 
 1 ICON "app.ico"
 
+// 应用程序清单: 声明 Microsoft.Windows.Common-Controls v6 依赖, 控件才会用现代视觉样式。
+// 不声明的话进程拿到 comctl32 v5 = Windows 2000 时代的经典外观 —— 实测本机(Win11 26100)
+// 即使没有清单也碰巧加载了 v6, 但那是撞运气, 换台机器可能静默退回经典外观且不报错。
+// 资源类型必须写数字 24 (RT_MANIFEST), ID 必须是 1 (CREATEPROCESS_MANIFEST_RESOURCE_ID),
+// 否则系统不认。清单文件路径与 ICON 一样相对本文件所在目录解析。
+1 24 "app.manifest"
+
 // 版本资源: 右键 cagent.exe -> 属性 -> 详细信息 可见
 // 数值与 core/version.h 保持一致 (由宏引用, 不硬编码)
 // 注意: 资源名必须用整数 1 (即 VS_VERSION_INFO 在 winver.h 中的值),
