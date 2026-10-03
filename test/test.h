@@ -863,6 +863,32 @@ static int run_all_tests(void) {
             g_skills_suffix[0] = '\0';
         }
 
+        /* ini 手写误差: 首尾空白与成对引号剥掉; 技能目录名可含空格 */
+        {
+            char d[MAX_PATH];
+            wchar_t w[MAX_PATH];
+            snprintf(d, sizeof(d), "%s\\skills\\my skill", g_test_ws);
+            if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+        }
+        tool_write_file("skills\\my skill\\SKILL.md",
+            "---\nname: spaced\ndescription: \xe5\x90\xab\xe7\xa9\xba\xe6\xa0\xbc\n---\nSPACED-SKILL-BODY");
+        snprintf(g_skills_dir, sizeof(g_skills_dir),
+                 "  \"cagent_test_ws\\skills\"  ");
+        skills_init();
+        CHK(g_skill_count == 2);                                  /* demo + spaced */
+        {
+            Skill *k = NULL;
+            for (int i = 0; i < g_skill_count; i++)
+                if (strcmp(g_skills[i].name, "spaced") == 0) { k = &g_skills[i]; break; }
+            CHK(k != NULL);                                       /* 引号/空白不影响发现 */
+            dispatch_tool("load_skill", "{\"name\":\"spaced\"}", "");
+            CHK(strstr(tool_out, "SPACED-SKILL-BODY") != NULL);
+        }
+        test_ws_rm("skills\\my skill\\SKILL.md");
+        g_skills_dir[0] = '\0';
+        g_skill_count = 0;
+        g_skills_suffix[0] = '\0';
+
         /* 多目录: ';' 分隔, 按顺序扫描; 重名先到先得 (同一根内与跨根都去重) */
         {
             char d[MAX_PATH];

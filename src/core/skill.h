@@ -205,16 +205,27 @@ static void skills_build_suffix(void) {
 
 /* 单个技能根目录解析: 绝对路径原样使用; 相对值按 **exe 目录**解析 (与 ini 的
  * workspace= 同一规矩, 不随进程 CWD 漂移), 并做幂等归一化。
- * "C:\" 这类根形式保留结尾反斜杠 (剥成 "C:" 就成了盘符相对路径, 含义全变)。 */
-static void skills_resolve_one(const char *src, char *out, size_t cap) {
-    int absolute = (src[0] == '\\' || src[0] == '/' || (src[0] && src[1] == ':'));
+ * "C:\" 这类根形式保留结尾反斜杠 (剥成 "C:" 就成了盘符相对路径, 含义全变)。
+ * ini 手写误差容忍: 首尾空白与成对引号剥掉 —— 路径含空格直接写即可,
+ * 引号可写可不写; 分隔符是 ';', 路径里出现 ';' 无法转义 (极端路径改名绕开)。 */
+static void skills_resolve_one(const char *src0, char *out, size_t cap) {
+    const char *src = src0;
+    size_t sl = strlen(src);
+    while (sl > 0 && (src[0] == ' ' || src[0] == '\t')) { src++; sl--; }
+    while (sl > 0 && (src[sl-1] == ' ' || src[sl-1] == '\t')) sl--;
+    if (sl >= 2 && src[0] == '"' && src[sl-1] == '"') { src++; sl -= 2; }
+    char tok[MAX_PATH];
+    if (sl >= sizeof(tok)) sl = sizeof(tok) - 1;
+    memcpy(tok, src, sl);
+    tok[sl] = '\0';
+    int absolute = (tok[0] == '\\' || tok[0] == '/' || (tok[0] && tok[1] == ':'));
     if (absolute) {
-        snprintf(out, cap, "%s", src);
+        snprintf(out, cap, "%s", tok);
     } else {
         char exedir[MAX_PATH], cand[MAX_PATH];
         get_exe_dir_utf8(exedir, sizeof(exedir));
-        if (!exedir[0]) { snprintf(out, cap, "%s", src); return; }
-        snprintf(cand, sizeof(cand), "%s\\%s", exedir, src);
+        if (!exedir[0]) { snprintf(out, cap, "%s", tok); return; }
+        snprintf(cand, sizeof(cand), "%s\\%s", exedir, tok);
         wchar_t win[MAX_PATH], wout[MAX_PATH];
         if (!utf8_to_wide(cand, win, MAX_PATH) ||
             GetFullPathNameW(win, MAX_PATH, wout, NULL) == 0 ||
