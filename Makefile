@@ -1,10 +1,25 @@
 CC = gcc
 WINDRES = windres
 # -Os : 优化代码体积; -s : 链接后 strip 符号
-# -Wshadow : 局部变量/参数遮蔽同名全局即告警 —— 全局 body[BUFSZ] (HTTP 请求体)
-# 曾被 5 处同名局部/参数遮蔽 (711ea63 修), 靠人肉逮的; 开着让编译器兜住这类事故。
-CFLAGS  = -Wall -Wextra -Wshadow -Os
-LDFLAGS = -s
+# 告警组 (全部在本项目上实测零噪音, 2026-10-03):
+#   -Wshadow               局部/参数遮蔽同名全局即告警 (body[BUFSZ] 事故兜底)
+#   -Wformat=2             printf 族格式串检查 (含非常量格式串的参数核对)
+#   -Wlogical-op           疑似逻辑运算符误用 (&& 当 & 等)
+#   -Wduplicated-cond/-branches  if-else 复制粘贴分支 / 重复条件
+#   -Wnull-dereference    可能的空指针解引用 (依赖 -O 分析)
+#   -Wvla                 禁变长数组 (本项目全用定长缓冲)
+#   -Wundef               #if 里用了未定义宏
+#   -Wstrict-prototypes   无参函数必须写 (void)
+# 错误组 (GCC 14 默认, 提前升为错误):
+#   -Werror=implicit-function-declaration / incompatible-pointer-types
+# 加固组:
+#   -fstack-protector-strong  栈溢出保护; 链接端 NX/ASLR 三项见 LDFLAGS
+CFLAGS  = -Wall -Wextra -Wshadow -Wformat=2 -Wlogical-op \
+          -Wduplicated-cond -Wduplicated-branches -Wnull-dereference \
+          -Wvla -Wundef -Wstrict-prototypes \
+          -Werror=implicit-function-declaration -Werror=incompatible-pointer-types \
+          -fstack-protector-strong -Os
+LDFLAGS = -s -Wl,--nxcompat -Wl,--dynamicbase -Wl,--high-entropy-va
 
 # 源码全部在 src/, 资源在 res/, 回归测试在 test/; 编译产物留在仓库根 ——
 # 程序的"数据根"就是 exe 所在目录 (core/session.h 的 get_exe_dir_utf8 用它定位
