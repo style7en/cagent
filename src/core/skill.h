@@ -125,9 +125,9 @@ static char *skill_read_utf8(const char *path) {
 /* 递归深度上限: 纯防御 (路径受 MAX_PATH 约束实际到不了), 再深视为配置事故 */
 #define SKILL_SCAN_DEPTH_MAX 8
 
-/* 加载一个 SKILL.md 并入池 (重名只收先到的)。从 skills_scan_dir 的枚举项调用。 */
+/* 加载一个 SKILL.md 并入池 (重名只收先到的)。从 skills_scan_dir 的枚举项调用,
+ * 池满与否由调用方在枚举循环顶检查。 */
 static void skills_load_file(const char *file) {
-    if (g_skill_count >= SKILL_MAX) return;
     char *text = skill_read_utf8(file);
     if (!text) return;                            /* 超限 / 空文件 / 坏编码: 跳过 */
 
@@ -135,24 +135,17 @@ static void skills_load_file(const char *file) {
     char name[SKILL_NAME_MAX], desc[SKILL_DESC_MAX];
     skill_parse_frontmatter(text, name, sizeof(name), desc, sizeof(desc));
 
-    /* 回退名 = 直接父目录名; 回退描述 = 正文第一个非空行 */
-    const char *base = file + strlen(file);
-    const char *sep = NULL;
-    for (const char *q = file; q < base; q++)
-        if (*q == '\\') sep = q;                  /* 倒数第二个 '\\' 之前是父目录 */
-    const char *parent = NULL;
-    if (sep) {
-        const char *p2 = sep;
+    /* 回退名 = 直接父目录名 ("...\<父>\SKILL.md" 里取 <父>) */
+    char parentu8[MAX_PATH] = "";
+    const char *sep = strrchr(file, '\\');
+    if (sep && sep > file) {
+        const char *p2 = sep - 1;
         while (p2 > file && *(p2 - 1) != '\\') p2--;
-        parent = p2;
-    }
-    char parentu8[MAX_PATH];
-    if (parent) {
-        size_t pl = (size_t)(sep - parent);
+        size_t pl = (size_t)(sep - p2);
         if (pl >= sizeof(parentu8)) pl = sizeof(parentu8) - 1;
-        memcpy(parentu8, parent, pl);
+        memcpy(parentu8, p2, pl);
         parentu8[pl] = '\0';
-    } else parentu8[0] = '\0';
+    }
 
     if (name[0])     snprintf(sk->name, sizeof(sk->name), "%s", name);
     else             snprintf(sk->name, sizeof(sk->name), "%s", parentu8);
@@ -196,7 +189,6 @@ static void skills_scan_dir(const char *root, int depth) {
     do {
         if (g_skill_count >= SKILL_MAX) break;
         if (fd.cFileName[0] == L'.') continue;       /* . 与 .. 及隐藏目录 */
-        if (wcschr(fd.cFileName, L'\\')) continue;
 
         char nameu8[MAX_PATH], entry[MAX_PATH];
         if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
@@ -227,7 +219,6 @@ static void skills_build_suffix(void) {
         "当任务与下面某个技能相关时, 先调用 load_skill 获取该技能的完整说明, "
         "再严格按说明执行任务。当前可用技能:\n";
     size_t hlen = strlen(head);
-    if (hlen >= sizeof(g_skills_suffix)) return;
     memcpy(g_skills_suffix, head, hlen + 1);
     pos = hlen;
     for (int i = 0; i < g_skill_count; i++) {
@@ -346,14 +337,8 @@ static void tool_load_skill(const char *name) {
         return;
     }
     const char *body = skill_body(text);
-    size_t blen = strlen(body);
-    if (blen > SKILL_FILE_MAX) blen = utf8_trim_len(body, SKILL_FILE_MAX);
-    size_t cap = strlen(g_skills[idx].name) + blen + 160;
-    char *out = (char*)malloc(cap);
-    if (!out) { free(text); snprintf(tool_out, BUFSZ, "(内存不足, 技能未返回)"); return; }
-    snprintf(out, cap, "[技能: %s]\n\n%.*s\n\n(以上是技能说明, 请严格按它执行当前任务)",
-             g_skills[idx].name, (int)blen, body);
-    snprintf(tool_out, BUFSZ, "%s", out);   /* tool_out 是最终边界, 再截一次保安全 */
-    free(out);
+    /* tool_out (BUFSZ) 是最终边界, 直接写、超长自然截断; blen 必 ≤ 32KB (读入已限) */
+    snprintf(tool_out, BUFSZ, "[技能: %s]\n\n%.*s\n\n(以上是技能说明, 请严格按它执行当前任务)",
+             g_skills[idx].name, (int)strlen(body), body);
     free(text);
 }

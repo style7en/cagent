@@ -750,6 +750,10 @@ static int run_all_tests(void) {
         CHK(strcmp(skill_body("---\nname: x\n---\nBODY") , "BODY") == 0);
         CHK(strcmp(skill_body("BODY2"), "BODY2") == 0);
     }
+    /* 技能测试复位: 三状态 + 环境变量一起清, 不泄漏到 exe 目录的真实技能集 */
+    #define SKILLS_RESET() \
+        do { g_skills_dir[0] = '\0'; g_skill_count = 0; g_skills_suffix[0] = '\0'; \
+             _putenv("CAGENT_SKILLS_DIR="); } while (0)
     {
         /* 扫描 + 索引 + 分发: CAGENT_SKILLS_DIR 指到测试目录, 不碰 exe 目录 */
         test_ws_begin();
@@ -797,10 +801,7 @@ static int run_all_tests(void) {
             dispatch_tool("load_skill", "{}", "");
             CHK(strstr(tool_out, "参数缺失") != NULL);
 
-            /* 复位环境与状态, 不泄漏到 exe 目录的真实技能集 */
-            _putenv("CAGENT_SKILLS_DIR=");
-            g_skill_count = 0;
-            g_skills_suffix[0] = '\0';
+            SKILLS_RESET();
         }
 
         /* ini 相对路径 skills_dir: 按 exe 目录解析 (cagent_test.exe 在仓库根,
@@ -808,9 +809,7 @@ static int run_all_tests(void) {
         snprintf(g_skills_dir, sizeof(g_skills_dir), "cagent_test_ws\\skills");
         skills_init();
         CHK(g_skill_count == 1 && strcmp(g_skills[0].name, "demo") == 0);
-        g_skills_dir[0] = '\0';
-        g_skill_count = 0;
-        g_skills_suffix[0] = '\0';
+        SKILLS_RESET();
 
         /* UTF-8 BOM: 先剥 BOM 再解析, frontmatter 不受影响
          * (frontmatter name 故意与目录名不同, 证明确实来自解析而非回退) */
@@ -834,9 +833,7 @@ static int run_all_tests(void) {
         CHK(strstr(tool_out, "BOM-SKILL-BODY") != NULL);
         CHK(strstr(tool_out, "\xEF\xBB\xBF") == NULL);            /* BOM 不进正文 */
         test_ws_rm("skills\\bom\\SKILL.md");
-        g_skills_dir[0] = '\0';
-        g_skill_count = 0;
-        g_skills_suffix[0] = '\0';
+        SKILLS_RESET();
 
         /* GBK 编码的 SKILL.md: 非 UTF-8 时按系统 OEM 代码页自动转码。
          * 依赖中文代码页 (936), 其他语言的机器上跳过。 */
@@ -858,9 +855,7 @@ static int run_all_tests(void) {
             dispatch_tool("load_skill", "{\"name\":\"gbk\"}", "");
             CHK(strstr(tool_out, "GBK-SKILL-BODY") != NULL);
             test_ws_rm("skills\\gbk\\SKILL.md");
-            g_skills_dir[0] = '\0';
-            g_skill_count = 0;
-            g_skills_suffix[0] = '\0';
+            SKILLS_RESET();
         }
 
         /* ini 手写误差: 首尾空白与成对引号剥掉; 技能目录名可含空格 */
@@ -885,9 +880,7 @@ static int run_all_tests(void) {
             CHK(strstr(tool_out, "SPACED-SKILL-BODY") != NULL);
         }
         test_ws_rm("skills\\my skill\\SKILL.md");
-        g_skills_dir[0] = '\0';
-        g_skill_count = 0;
-        g_skills_suffix[0] = '\0';
+        SKILLS_RESET();
 
         /* 递归扫描: 任意深度的 SKILL.md 都发现; 根下直接放 SKILL.md 也算;
          * 根互相嵌套/重叠时同一文件被多次发现, 靠重名先到先得去重 */
@@ -923,9 +916,7 @@ static int run_all_tests(void) {
         CHK(strstr(tool_out, "DEEP-SKILL-BODY") != NULL);
         test_ws_rm("skills3\\SKILL.md");
         test_ws_rm("skills3\\a\\deep\\inner\\SKILL.md");
-        g_skills_dir[0] = '\0';
-        g_skill_count = 0;
-        g_skills_suffix[0] = '\0';
+        SKILLS_RESET();
 
         /* 多目录: ';' 分隔, 按顺序扫描; 重名先到先得 (同一根内与跨根都去重) */
         {
@@ -976,9 +967,7 @@ static int run_all_tests(void) {
         skills_init();
         CHK(g_skill_count == 2);
 
-        g_skills_dir[0] = '\0';
-        g_skill_count = 0;
-        g_skills_suffix[0] = '\0';
+        SKILLS_RESET();
 
         test_ws_rm("skills\\demo\\SKILL.md");
         test_ws_rm("skills\\demo2\\SKILL.md");
@@ -1004,6 +993,7 @@ static int run_all_tests(void) {
         }
         test_ws_end();
     }
+    #undef SKILLS_RESET
 
     #undef CHK
     if (fails == 0) printf("run_all_tests: OK\n");
