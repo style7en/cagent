@@ -85,13 +85,13 @@ static void do_append(const char *utf8, int role) {
     while (i < total) {
         BOOL emo = (wbuf[i] >= 0xD800 && wbuf[i] <= 0xDBFF &&
                     wbuf[i+1] >= 0xDC00 && wbuf[i+1] <= 0xDFFF);
-        int j = i;
+        int end = i;
         if (emo) {
-            while (j + 1 < total && wbuf[j] >= 0xD800 && wbuf[j] <= 0xDBFF &&
-                   wbuf[j+1] >= 0xDC00 && wbuf[j+1] <= 0xDFFF) j += 2;
+            while (end + 1 < total && wbuf[end] >= 0xD800 && wbuf[end] <= 0xDBFF &&
+                   wbuf[end+1] >= 0xDC00 && wbuf[end+1] <= 0xDFFF) end += 2;
         } else {
-            while (j < total && !(wbuf[j] >= 0xD800 && wbuf[j] <= 0xDBFF &&
-                                  j + 1 < total && wbuf[j+1] >= 0xDC00 && wbuf[j+1] <= 0xDFFF)) j++;
+            while (end < total && !(wbuf[end] >= 0xD800 && wbuf[end] <= 0xDBFF &&
+                                  end + 1 < total && wbuf[end+1] >= 0xDC00 && wbuf[end+1] <= 0xDFFF)) end++;
         }
 
         CHARFORMAT2W cf = role_cf;
@@ -102,10 +102,10 @@ static void do_append(const char *utf8, int role) {
         int len = GetWindowTextLengthW(g_hHistory);
         SendMessageW(g_hHistory, EM_SETSEL, len, len);
         SendMessageW(g_hHistory, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-        { WCHAR save = wbuf[j]; wbuf[j] = L'\0';
+        { WCHAR save = wbuf[end]; wbuf[end] = L'\0';
           SendMessageW(g_hHistory, EM_REPLACESEL, FALSE, (LPARAM)(wbuf + i));
-          wbuf[j] = save; }
-        i = j;
+          wbuf[end] = save; }
+        i = end;
     }
     SendMessageW(g_hHistory, EM_SCROLLCARET, 0, 0);
     SendMessageW(g_hHistory, WM_VSCROLL, SB_BOTTOM, 0);   /* 强制滚到末尾 */

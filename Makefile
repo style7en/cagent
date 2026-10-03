@@ -1,7 +1,9 @@
 CC = gcc
 WINDRES = windres
 # -Os : 优化代码体积; -s : 链接后 strip 符号
-CFLAGS  = -Wall -Wextra -Os
+# -Wshadow : 局部变量/参数遮蔽同名全局即告警 —— 全局 body[BUFSZ] (HTTP 请求体)
+# 曾被 5 处同名局部/参数遮蔽 (711ea63 修), 靠人肉逮的; 开着让编译器兜住这类事故。
+CFLAGS  = -Wall -Wextra -Wshadow -Os
 LDFLAGS = -s
 
 # 源码全部在 src/, 资源在 res/, 回归测试在 test/; 编译产物留在仓库根 ——

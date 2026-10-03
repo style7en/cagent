@@ -918,7 +918,6 @@ static int run_all_tests(void) {
          * "---" 与键值行取真正的正文首行, 不把元数据带进索引 */
         {
             char d[MAX_PATH];
-            wchar_t w[MAX_PATH];
             const char *dirs[] = { "skills4", "skills4\\broken" };
             for (int i = 0; i < 2; i++) {
                 snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
