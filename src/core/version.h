@@ -11,11 +11,11 @@
 
 #define CAGENT_VER_MAJOR 1
 #define CAGENT_VER_MINOR 2
-#define CAGENT_VER_PATCH 0
+#define CAGENT_VER_PATCH 1
 #define CAGENT_VER_BUILD 0      /* 构建序号, 非正式发布可保持 0 */
 
 /* 人类可读版本串 (窄字符串); 宽串由它派生, 不要另写一份 */
-#define CAGENT_VERSION_STR "1.2.0"
+#define CAGENT_VERSION_STR "1.2.1"
 
 /* 一句话定位 (窄字符串): "关于" 对话框等需要对外介绍的地方共用 */
 #define CAGENT_TAGLINE     "用 C 语言实现的极简 AI 编程 Agent, 零第三方依赖"

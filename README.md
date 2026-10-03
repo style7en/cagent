@@ -401,7 +401,7 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 
 版本号与对外文案的**唯一事实来源**在 `src/core/version.h`（`CAGENT_VER_MAJOR/MINOR/PATCH`、`CAGENT_VERSION_STR`；另有 `CAGENT_TAGLINE` / `CAGENT_PROJECT_URL` / `CAGENT_PROJECT_URL_GITEE`），改动只改这一处，三处同步引用：
 
-- **Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.2.0.0` + 字符串 `1.2.0`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。
+- **Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.2.1.0` + 字符串 `1.2.1`）。注意资源名必须用整数 `1`，写 `VS_VERSION_INFO` 会被 windres 当成字符串名导致读取失败（错误 1813）。
   - `app.rc` 里的 `#include "core/version.h"` 与 `ICON "app.ico"` 都相对自身目录解析，故 Makefile 给 windres 传了 `-I src -I res`。
   - Makefile 还给 windres 传了 `-c 65001`：`app.rc` 是 UTF-8(无 BOM)，而 windres 默认按**系统 ANSI 码页**解释源码（中文 Windows 上是 936/GBK）。漏了这个选项，非 ASCII 字符串会被按 GBK 拆成乱码写进资源 —— 表现为文件属性里出现 `C 璇█鏋佺畝缂栫▼ Agent` 这类乱码。**新增非 ASCII 文本前请确认该选项仍在。**
 
@@ -458,7 +458,7 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
 
 锚点与字形高都随字号等比缩放，所以 `dp(22)` 在任何 DPI 下都成立。`layout()` 里的 `row_h` 就是这个值，注释写了推导过程 —— **别随手改大**。
   - `FileDescription` 当前是纯英文（`cagent - a minimal AI coding agent in C`），一个额外的保险。
-- **命令行**：`cagent.exe --version` 打印 `cagent 1.2.0`（有父控制台则打印到终端，否则弹对话框）。
+- **命令行**：`cagent.exe --version` 打印 `cagent 1.2.1`（有父控制台则打印到终端，否则弹对话框）。
 - **「关于」**：主窗口**系统菜单**里的「关于(A)...」（点标题栏图标 / `Alt+Space` / 右键标题栏都能打开），弹出对话框显示一句话功能 + 版本 + 两个项目地址（GitHub 与 Gitee 镜像，国内访问 gitee 更稳）。文案取自 `CAGENT_TAGLINE` / `CAGENT_VERSION_STR` / `CAGENT_PROJECT_URL` / `CAGENT_PROJECT_URL_GITEE`，两个地址都可点击打开默认浏览器，正文也可用 `Ctrl+C` 整段复制。
 
 > **窗口标题栏只写 `cagent`，不带版本号** —— 版本在「关于」和 exe 文件属性里就够；标题栏那串数字每次发版都得跟着改，对用户也没有信息量。
