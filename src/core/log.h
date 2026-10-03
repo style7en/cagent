@@ -197,9 +197,9 @@ static int log_check_utf8(const char *tag, const char *buf, size_t len) {
  * 文件名必须带时间戳: 旧实现只有进程内序号 (g_fail_seq 每进程从 0), 又用 "wb" 截断写 ——
  * 重启后第一次失败就把 request_fail_1.json 覆盖回上次运行的档案, "可复现"直接落空。
  * 序号再配合存在性探测, 跨进程撞名也能自动让位。 */
-static void log_dump_request(const char *body, size_t len) {
-    if (!g_log_enabled || !body) return;
-    log_check_utf8("请求体", body, len);
+static void log_dump_request(const char *payload, size_t len) {
+    if (!g_log_enabled || !payload) return;
+    log_check_utf8("请求体", payload, len);
 
     char dir[MAX_PATH];
     get_app_path(dir, sizeof(dir), "");
@@ -217,7 +217,7 @@ static void log_dump_request(const char *body, size_t len) {
     }
     AcquireSRWLockExclusive(&g_log_lock);
     FILE *f = fopen_utf8(path, "wb");
-    if (f) { fwrite(body, 1, len, f); fclose(f); }
+    if (f) { fwrite(payload, 1, len, f); fclose(f); }
     ReleaseSRWLockExclusive(&g_log_lock);
     log_line("[http] 请求体已留档: %s (%zu bytes)", path, len);
 }

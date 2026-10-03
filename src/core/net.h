@@ -182,7 +182,7 @@ static void stream_apply_tool_calls(StreamCtx *ctx, const JValue *tcs) {
  * completed 输出参数: 是否完整收到 [DONE] (用于区分"200 但流被截断")。
  * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断)。 */
 static int http_post_stream_once(const char *url, const char *api_key,
-                                 const char *body, size_t body_len,
+                                 const char *req_body, size_t req_body_len,
                                  char *err_out, size_t err_cap,
                                  StreamCtx *ctx, int *completed) {
     if (err_cap > 0) err_out[0] = '\0';
@@ -251,8 +251,8 @@ static int http_post_stream_once(const char *url, const char *api_key,
     MultiByteToWideChar(CP_UTF8, 0, hdrs_a, -1, hdrs, 1024);
     WinHttpAddRequestHeaders(hReq, hdrs, (DWORD)wcslen(hdrs), WINHTTP_ADDREQ_FLAG_ADD);
 
-    DWORD blen = (DWORD)body_len;
-    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID)body, blen, blen, 0);
+    DWORD blen = (DWORD)req_body_len;
+    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID)req_body, blen, blen, 0);
     if (ok) ok = WinHttpReceiveResponse(hReq, NULL);
     if (!ok) { http_set_err(err_out, err_cap); WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return -1; }
 
@@ -347,7 +347,7 @@ stream_done:
  * 仅在瞬时错误时重试; 取消/成功/客户端错误直接返回。
  * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断)。 */
 static int http_post_stream(const char *url, const char *api_key,
-                            const char *body, size_t body_len,
+                            const char *req_body, size_t req_body_len,
                             char *err_out, size_t err_cap,
                             StreamCtx *ctx) {
     DWORD base = http_retry_base_ms();
@@ -362,7 +362,7 @@ static int http_post_stream(const char *url, const char *api_key,
         if (err_cap > 0) err_out[0] = '\0';
 
         int completed = 0;
-        int status = http_post_stream_once(url, api_key, body, body_len,
+        int status = http_post_stream_once(url, api_key, req_body, req_body_len,
                                           err_out, err_cap, ctx, &completed);
         last_status = status;
 

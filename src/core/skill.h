@@ -150,12 +150,27 @@ static void skills_load_file(const char *file) {
     if (name[0])     snprintf(sk->name, sizeof(sk->name), "%s", name);
     else             snprintf(sk->name, sizeof(sk->name), "%s", parentu8);
     if (!desc[0]) {
-        const char *body = skill_body(text);
-        while (*body == '\r' || *body == '\n') body++;
-        const char *eol = strchr(body, '\n');
-        size_t bl = eol ? (size_t)(eol - body) : strlen(body);
-        while (bl > 0 && (body[bl-1] == '\r' || body[bl-1] == ' ')) bl--;
-        utf8_safe_copy(body, bl, sk->desc, sizeof(sk->desc));
+        const char *body_text = skill_body(text);  /* 别叫 body: 遮蔽 state.h 的全局 body[BUFSZ] */
+        while (*body_text == '\r' || *body_text == '\n') body_text++;
+        /* frontmatter 未闭合时 skill_body 拿到的是整个文件: 回退描述跳过 "---"
+         * 行与后续键值行, 否则索引里出现 "---"/"name: x" */
+        if (strncmp(body_text, "---", 3) == 0) {
+            for (;;) {
+                if (strncmp(body_text, "---", 3) != 0) {
+                    const char *c = body_text;     /* 键值行 "key:" 继续跳, 其他行作描述 */
+                    while (*c && (isalnum((unsigned char)*c) || *c == '_' || *c == '-')) c++;
+                    if (*c != ':') break;
+                }
+                const char *eol2 = strchr(body_text, '\n');
+                if (!eol2) { body_text += strlen(body_text); break; }
+                body_text = eol2 + 1;
+                while (*body_text == '\r' || *body_text == '\n') body_text++;
+            }
+        }
+        const char *eol = strchr(body_text, '\n');
+        size_t bl = eol ? (size_t)(eol - body_text) : strlen(body_text);
+        while (bl > 0 && (body_text[bl-1] == '\r' || body_text[bl-1] == ' ')) bl--;
+        utf8_safe_copy(body_text, bl, sk->desc, sizeof(sk->desc));
     } else {
         snprintf(sk->desc, sizeof(sk->desc), "%s", desc);
     }
@@ -336,9 +351,9 @@ static void tool_load_skill(const char *name) {
         snprintf(tool_out, BUFSZ, "(技能读取失败: %s)", g_skills[idx].path);
         return;
     }
-    const char *body = skill_body(text);
+    const char *body_text = skill_body(text);      /* 别叫 body: 遮蔽 state.h 的全局 body[BUFSZ] */
     /* tool_out (BUFSZ) 是最终边界, 直接写、超长自然截断; blen 必 ≤ 32KB (读入已限) */
     snprintf(tool_out, BUFSZ, "[技能: %s]\n\n%.*s\n\n(以上是技能说明, 请严格按它执行当前任务)",
-             g_skills[idx].name, (int)strlen(body), body);
+             g_skills[idx].name, (int)strlen(body_text), body_text);
     free(text);
 }

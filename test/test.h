@@ -815,7 +815,6 @@ static int run_all_tests(void) {
          * (frontmatter name 故意与目录名不同, 证明确实来自解析而非回退) */
         {
             char d[MAX_PATH];
-            wchar_t w[MAX_PATH];
             snprintf(d, sizeof(d), "%s\\skills\\bom", g_test_ws);
             if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
         }
@@ -839,7 +838,6 @@ static int run_all_tests(void) {
          * 依赖中文代码页 (936), 其他语言的机器上跳过。 */
         if (GetOEMCP() == 936) {
             char d[MAX_PATH];
-            wchar_t w[MAX_PATH];
             snprintf(d, sizeof(d), "%s\\skills\\gbk", g_test_ws);
             if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
             tool_write_file("skills\\gbk\\SKILL.md",
@@ -861,7 +859,6 @@ static int run_all_tests(void) {
         /* ini 手写误差: 首尾空白与成对引号剥掉; 技能目录名可含空格 */
         {
             char d[MAX_PATH];
-            wchar_t w[MAX_PATH];
             snprintf(d, sizeof(d), "%s\\skills\\my skill", g_test_ws);
             if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
         }
@@ -886,7 +883,6 @@ static int run_all_tests(void) {
          * 根互相嵌套/重叠时同一文件被多次发现, 靠重名先到先得去重 */
         {
             char d[MAX_PATH];
-            wchar_t w[MAX_PATH];
             const char *dirs[] = { "skills3", "skills3\\a", "skills3\\a\\deep",
                                    "skills3\\a\\deep\\inner" };
             for (int i = 0; i < 4; i++) {
@@ -918,10 +914,33 @@ static int run_all_tests(void) {
         test_ws_rm("skills3\\a\\deep\\inner\\SKILL.md");
         SKILLS_RESET();
 
-        /* 多目录: ';' 分隔, 按顺序扫描; 重名先到先得 (同一根内与跨根都去重) */
+        /* 未闭合的 frontmatter (少收尾 ---): name 回退目录名, desc 回退跳过
+         * "---" 与键值行取真正的正文首行, 不把元数据带进索引 */
         {
             char d[MAX_PATH];
             wchar_t w[MAX_PATH];
+            const char *dirs[] = { "skills4", "skills4\\broken" };
+            for (int i = 0; i < 2; i++) {
+                snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
+                if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            }
+        }
+        tool_write_file("skills4\\broken\\SKILL.md",
+            "---\nname: brokenname\ndescription: \xe4\xb8\x8d\xe8\xaf\xa5\xe5\x87\xba\xe7\x8e\xb0\n"
+            "\xe6\xad\xa3\xe6\x96\x87\xe9\xa6\x96\xe8\xa1\x8c\n");
+        snprintf(g_skills_dir, sizeof(g_skills_dir), "cagent_test_ws\\skills4");
+        skills_init();
+        CHK(g_skill_count == 1);
+        CHK(strcmp(g_skills[0].name, "broken") == 0);             /* 目录名回退 */
+        CHK(strstr(g_skills[0].desc, "---") == NULL);
+        CHK(strstr(g_skills[0].desc, "name:") == NULL);
+        CHK(strstr(g_skills[0].desc, "\xe6\xad\xa3\xe6\x96\x87\xe9\xa6\x96\xe8\xa1\x8c") != NULL);
+        test_ws_rm("skills4\\broken\\SKILL.md");
+        SKILLS_RESET();
+
+        /* 多目录: ';' 分隔, 按顺序扫描; 重名先到先得 (同一根内与跨根都去重) */
+        {
+            char d[MAX_PATH];
             /* CreateDirectoryW 不建父级, 父目录排在子目录之前 */
             const char *dirs[] = { "skills2", "skills\\demo2", "skills\\other",
                                    "skills2\\deep", "skills2\\demo" };
@@ -976,7 +995,6 @@ static int run_all_tests(void) {
         test_ws_rm("skills2\\demo\\SKILL.md");
         {
             char d[MAX_PATH];
-            wchar_t w[MAX_PATH];
             const char *dirs[] = { "skills\\demo", "skills\\demo2", "skills\\other",
                                    "skills2\\deep", "skills2\\demo", "skills2" };
             for (int i = 0; i < 6; i++) {
