@@ -45,6 +45,8 @@ static CAGENT_MAYBE_UNUSED void config_load(void) {
             g_context_tokens = atol(val);   /* 模型上下文窗口 (token), 0=未知则按字节水位 */
         else if (strcmp(key, "workspace") == 0)
             snprintf(g_workspace, sizeof(g_workspace), "%s", val);
+        else if (strcmp(key, "skills_dir") == 0)
+            snprintf(g_skills_dir, sizeof(g_skills_dir), "%s", val);
         else if (strcmp(key, "last_session") == 0)
             snprintf(g_last_session, sizeof(g_last_session), "%s", val);
         else if (strcmp(key, "log") == 0)
@@ -74,6 +76,7 @@ static CAGENT_MAYBE_UNUSED void config_save(void) {
     fprintf(f, "skip_cert_verify=%d\r\n", g_skip_cert_verify);
     fprintf(f, "context_tokens=%ld\r\n", g_context_tokens);
     fprintf(f, "workspace=%s\r\n", g_workspace);
+    fprintf(f, "skills_dir=%s\r\n", g_skills_dir);
     fprintf(f, "last_session=%s\r\n", g_last_session);
     fprintf(f, "log=%d\r\n", g_log_enabled);
     fclose(f);

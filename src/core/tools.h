@@ -222,8 +222,12 @@ static void dispatch_tool(const char *name, const char *args_json, const char *f
             if (p && ct)  tool_write_file(p, ct);
             else if (!p)  snprintf(tool_out, BUFSZ, "(参数缺失: write_file 需要字符串参数 \"path\")");
             else          snprintf(tool_out, BUFSZ, "(参数缺失: write_file 需要字符串参数 \"content\")");
+        } else if (strcmp(nm, "load_skill") == 0) {
+            const char *sn = json_as_str(json_obj_get(argsj, "name"));
+            if (sn) tool_load_skill(sn);
+            else    snprintf(tool_out, BUFSZ, "(参数缺失: %s 需要字符串参数 \"name\")", nm);
         } else {
-            snprintf(tool_out, BUFSZ, "(未知工具: %s; 可用工具: execute_bash / read_file / write_file / edit_file)", nm);
+            snprintf(tool_out, BUFSZ, "(未知工具: %s; 可用工具: execute_bash / read_file / write_file / edit_file / load_skill)", nm);
         }
     } else if (!argsj) {
         /* 留全量取证: 长度 + finish_reason + 原文全文 (截断类 bug 看尾部即可定位) */

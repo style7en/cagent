@@ -24,6 +24,7 @@ static char g_model[128]    = "";
 static int g_key_decrypt_failed = 0;   /* DPAPI 解密失败标志, 启动后提示 */
 static int g_skip_cert_verify = 0;     /* 1=跳过 SSL 证书校验 (自签端点用) */
 static char g_workspace[MAX_PATH] = "";/* 工作目录 (文件工具限制在此目录内, 默认 exe 目录) */
+static char g_skills_dir[MAX_PATH] = ""; /* 技能根目录 (ini 的 skills_dir; 空 = 默认 <exe>\skills) */
 static char g_active_ws[MAX_PATH] = "";/* 当前已加载历史所对应的工作目录 */
 static char g_last_session[MAX_PATH] = ""; /* 最近使用的会话文件 (持久化到 ini) */
 static char g_history_file[MAX_PATH] = ""; /* 当前对话绑定的会话文件 (懒生成) */
@@ -94,5 +95,15 @@ static const char *TOOLS_JSON =
         "\"old_text\":{\"type\":\"string\","
         "\"description\":\"Exact existing snippet to replace (must be unique in the file)\"},"
         "\"new_text\":{\"type\":\"string\",\"description\":\"Replacement text; empty string deletes it\"}},"
-    "\"required\":[\"path\",\"old_text\",\"new_text\"]}}}]";
+    "\"required\":[\"path\",\"old_text\",\"new_text\"]}}},"
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"load_skill\","
+    "\"description\":\"Load the full instructions of a user-provided skill by name. "
+        "Available skills are listed in the system prompt. When the current task matches "
+        "one of them, call this tool first and then strictly follow the returned "
+        "instructions. Loading a skill returns text only - it does not execute anything.\","
+    "\"parameters\":{\"type\":\"object\","
+    "\"properties\":{\"name\":{\"type\":\"string\","
+        "\"description\":\"Skill name, exactly as listed in the system prompt\"}},"
+    "\"required\":[\"name\"]}}}]";
 

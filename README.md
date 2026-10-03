@@ -173,6 +173,7 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
   skip_cert_verify=0
   context_tokens=131072
   workspace=C:\path\to\workspace
+  skills_dir=D:\my\skills
   last_session=sessions\history_<工作目录>_<哈希>.json
   log=1
   ```
@@ -180,6 +181,9 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
   - `context_tokens`:模型上下文窗口(token 数),如 131072 (128K)、1000000 (1M)。
     配置后按服务端报告的 `prompt_tokens` 精确控制水位(到 80% 触发压缩);
     `0` 或不写 = 未知,退回按字节水位。
+  - `skills_dir`:技能根目录(见下文"技能 `skills\`"),可用 `;` 分隔配置**多个**目录
+    (同 Windows PATH 风格,按顺序扫描,重名先到先得)。相对值按 **exe 目录**解析
+    (与 `workspace` 同一规矩);不写 = 默认 `<exe>\skills`。
   - `log`:运行日志开关,默认 `1`。写 `0` 关闭;日志在 `log\` 目录按天一个文件,
     HTTP 失败时完整请求体另存为 `log\request_fail_N.json`,可直接对服务端重放复现。
 
@@ -189,6 +193,43 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
 - **内容**:纯文本,作为 system 提示词的正文;引号/换行由程序自动转义成 JSON
 - **编码**:UTF-8 优先;非 UTF-8(如中文 Windows 的 GBK/ANSI 另存)自动按系统代码页转换
 - **行为**:启动时读一次;文件不存在 / 为空 / 超过 32KB 时静默回退内置默认提示词
+
+### 技能 `skills\`
+
+把常用任务的"操作说明书"预置成技能,模型在任务匹配时自动加载并照着执行:
+
+- **位置**:默认与 `cagent.exe` 同目录的 `skills\`;可在 `cagent.ini` 里用 `skills_dir=`
+  改成任意目录(相对值按 exe 目录解析),**每个子目录一个技能**,目录内放 `SKILL.md`:
+
+  ```
+  cagent.exe
+  skills\
+    ├─ build\
+    │    └─ SKILL.md     ← 技能正文(说明/步骤/约束)
+    └─ deploy\
+         └─ SKILL.md
+  ```
+
+- **SKILL.md 格式**:正文为纯文本(会被整体转义进上下文);可选 frontmatter 声明元数据:
+
+  ```markdown
+  ---
+  name: build
+description: 编译并测试本项目
+  ---
+  1. 先跑 make clean && make
+  2. ...
+  ```
+
+  缺 `name` 时用目录名,缺 `description` 时用正文第一个非空行。
+- **生效方式**:启动时扫描一次并生成索引,**追加到 system 提示词尾部**(外置 SYSTEM_PROMPT
+  同样会拼上),告诉模型有哪些技能、何时该用 `load_skill`;模型调用 `load_skill(name)`
+  后返回完整正文。未知名会返回可用列表,由模型自行纠正。`skills_dir` 可配 `;` 分隔的
+  多个根目录,按顺序扫描、重名先到先得(同一技能名全局唯一,先扫到的生效)。
+- **上限**:最多 32 个技能;单个 `SKILL.md` 不超过 32KB(超限不加载);编码 UTF-8 优先,
+  非 UTF-8 自动按系统代码页转换(中文 Windows 即 GBK),UTF-8 BOM 自动剥除。技能集进程内固定,新增技能**重启生效**。
+- 环境变量 `CAGENT_SKILLS_DIR` 可把技能根目录指到别处(优先级低于 ini 的 `skills_dir`;
+  测试/临时切换用)。
 
 ### 操作
 
@@ -225,7 +266,7 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
 
 ### 工具
 
-目前内置(对齐 pi.dev 的极简理念,核心只保留 4 个工具):
+目前内置(对齐 pi.dev 的极简理念,核心只保留 4 个基础工具 + 1 个技能加载工具):
 
 - `execute_bash(command)` — 执行 shell 命令并捕获输出(不拦截,由用户自担风险);
   默认超时 60s(超时杀掉整个进程树),输出超限自动截断并附提示;
@@ -238,6 +279,8 @@ make test          # 编译 cagent_test.exe 并运行, 退出码 = 失败数 (0 
   必须与原文完全一致且在文件中**唯一出现**(按非重叠出现计数),否则不改动文件并说明原因;
   改一行无需重写全文,非 UTF-8(GBK)文件会被拒绝并提示改用 `write_file`
 - `write_file(path, content)` — 写入文件(直接覆盖,无确认);父目录需已存在
+- `load_skill(name)` — 按名称加载用户预置的技能说明(见上文"技能 `skills\`"),
+  返回文本不执行任何东西;任务与某个技能相关时由模型主动调用并照说明执行
 
 > 没有专门的列目录/搜索工具:查看目录用 `dir`,递归搜索内容用 `findstr /s /i "关键词" *.*`,都走 `execute_bash`。
 

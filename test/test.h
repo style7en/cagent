@@ -719,6 +719,228 @@ static int run_all_tests(void) {
         CHK(g_system_prompt == def);
     }
 
+    /* ---- 技能: frontmatter 解析 / 目录扫描 / load_skill 分发 ---- */
+    {
+        char nm[SKILL_NAME_MAX], ds[SKILL_DESC_MAX];
+
+        /* 标准 frontmatter: name + description 各取其值 */
+        skill_parse_frontmatter("---\nname: demo\ndescription: \xe6\xbc\x94\xe7\xa4\xba\xe6\x8a\x80\xe8\x83\xbd\n---\n\xe6\xad\xa3\xe6\x96\x87",
+                                nm, sizeof(nm), ds, sizeof(ds));
+        CHK(strcmp(nm, "demo") == 0);
+        CHK(strcmp(ds, "\xe6\xbc\x94\xe7\xa4\xba\xe6\x8a\x80\xe8\x83\xbd") == 0);   /* 演示技能 */
+
+        /* CRLF 行尾同样识别 */
+        skill_parse_frontmatter("---\r\nname: crlf\r\ndescription: d\r\n---\r\nbody",
+                                nm, sizeof(nm), ds, sizeof(ds));
+        CHK(strcmp(nm, "crlf") == 0 && strcmp(ds, "d") == 0);
+
+        /* 无 frontmatter: 两个都为空, 由调用方回退目录名/正文首行 */
+        skill_parse_frontmatter("plain text", nm, sizeof(nm), ds, sizeof(ds));
+        CHK(nm[0] == '\0' && ds[0] == '\0');
+
+        /* 只有 name: desc 为空 (frontmatter 合法收尾, 不吃进正文) */
+        skill_parse_frontmatter("---\nname: only\n---\nbody line", nm, sizeof(nm), ds, sizeof(ds));
+        CHK(strcmp(nm, "only") == 0 && ds[0] == '\0');
+
+        /* 收尾 --- 缺失: 整体视为无 frontmatter (否则会吞掉正文) */
+        skill_parse_frontmatter("---\nname: unclosed\nbody", nm, sizeof(nm), ds, sizeof(ds));
+        CHK(nm[0] == '\0');
+
+        /* 正文定位: 跳过 frontmatter, 无 frontmatter 原样返回 */
+        CHK(strcmp(skill_body("---\nname: x\n---\nBODY") , "BODY") == 0);
+        CHK(strcmp(skill_body("BODY2"), "BODY2") == 0);
+    }
+    {
+        /* 扫描 + 索引 + 分发: CAGENT_SKILLS_DIR 指到测试目录, 不碰 exe 目录 */
+        test_ws_begin();
+        char sdir[MAX_PATH];
+        snprintf(sdir, sizeof(sdir), "%s\\skills", g_test_ws);
+        wchar_t w[MAX_PATH];
+        {
+            char d2[MAX_PATH];
+            snprintf(d2, sizeof(d2), "%s\\demo", sdir);
+            if (utf8_to_wide(sdir, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            if (utf8_to_wide(d2, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+        }
+        /* 技能文件落在工作目录内, 用 write_file 写 (注意它会记账, 无妨) */
+        tool_write_file("skills\\demo\\SKILL.md",
+            "---\nname: demo\ndescription: \xe6\xbc\x94\xe7\xa4\xba\n---\nDEMO-SKILL-BODY \xe6\xad\xa5\xe9\xaa\xa4");
+
+        {
+            char env[512];
+            snprintf(env, sizeof(env), "CAGENT_SKILLS_DIR=%s", sdir);
+            _putenv(env);
+            skills_init();
+            CHK(g_skill_count == 1);
+            CHK(strcmp(g_skills[0].name, "demo") == 0);
+            CHK(strstr(g_skills[0].desc, "\xe6\xbc\x94\xe7\xa4\xba") != NULL);   /* 演示 */
+            CHK(strstr(g_skills_suffix, "load_skill") != NULL);
+            CHK(strstr(g_skills_suffix, "demo") != NULL);
+            /* 索引拼进 system 消息: 换行被转义, 中文原样透传 */
+            CHK(system_prompt_set_raw("base") == 1);
+            CHK(strstr(g_system_prompt, "\\n\\n## ") != NULL);
+            CHK(strstr(g_system_prompt, "load_skill") != NULL);
+            CHK(strstr(g_system_prompt, "可用技能") != NULL);
+            g_system_prompt = SYSTEM_PROMPT_DEFAULT;   /* 复位, 免得泄漏到后续用例 */
+
+            /* load_skill: 正常加载 (正文 + 执行指示) */
+            dispatch_tool("load_skill", "{\"name\":\"demo\"}", "");
+            CHK(strstr(tool_out, "[技能: demo]") != NULL);
+            CHK(strstr(tool_out, "DEMO-SKILL-BODY") != NULL);
+            CHK(strstr(tool_out, "严格按") != NULL);
+
+            /* 未知名: 列出可用技能, 模型可自行纠正 */
+            dispatch_tool("load_skill", "{\"name\":\"nope\"}", "");
+            CHK(strstr(tool_out, "未找到技能") != NULL && strstr(tool_out, "demo") != NULL);
+
+            /* 参数缺失 */
+            dispatch_tool("load_skill", "{}", "");
+            CHK(strstr(tool_out, "参数缺失") != NULL);
+
+            /* 复位环境与状态, 不泄漏到 exe 目录的真实技能集 */
+            _putenv("CAGENT_SKILLS_DIR=");
+            g_skill_count = 0;
+            g_skills_suffix[0] = '\0';
+        }
+
+        /* ini 相对路径 skills_dir: 按 exe 目录解析 (cagent_test.exe 在仓库根,
+         * 与 test_ws_begin 建的 g_test_ws 同锚点), 不随 CWD 漂移 */
+        snprintf(g_skills_dir, sizeof(g_skills_dir), "cagent_test_ws\\skills");
+        skills_init();
+        CHK(g_skill_count == 1 && strcmp(g_skills[0].name, "demo") == 0);
+        g_skills_dir[0] = '\0';
+        g_skill_count = 0;
+        g_skills_suffix[0] = '\0';
+
+        /* UTF-8 BOM: 先剥 BOM 再解析, frontmatter 不受影响
+         * (frontmatter name 故意与目录名不同, 证明确实来自解析而非回退) */
+        {
+            char d[MAX_PATH];
+            wchar_t w[MAX_PATH];
+            snprintf(d, sizeof(d), "%s\\skills\\bom", g_test_ws);
+            if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+        }
+        tool_write_file("skills\\bom\\SKILL.md",
+            "\xEF\xBB\xBF---\nname: bomskill\ndescription: BOM \xe6\xb5\x8b\xe8\xaf\x95\n---\nBOM-SKILL-BODY");
+        snprintf(g_skills_dir, sizeof(g_skills_dir), "cagent_test_ws\\skills");
+        skills_init();
+        CHK(g_skill_count == 2);                                  /* demo + bom */
+        {   /* 枚举按字母序, 不硬编码下标 */
+            Skill *b = (strcmp(g_skills[0].name, "bomskill") == 0) ? &g_skills[0] : &g_skills[1];
+            CHK(strcmp(b->name, "bomskill") == 0);                /* frontmatter 生效 */
+            CHK(strstr(b->desc, "BOM") != NULL);
+        }
+        dispatch_tool("load_skill", "{\"name\":\"bomskill\"}", "");
+        CHK(strstr(tool_out, "BOM-SKILL-BODY") != NULL);
+        CHK(strstr(tool_out, "\xEF\xBB\xBF") == NULL);            /* BOM 不进正文 */
+        test_ws_rm("skills\\bom\\SKILL.md");
+        g_skills_dir[0] = '\0';
+        g_skill_count = 0;
+        g_skills_suffix[0] = '\0';
+
+        /* GBK 编码的 SKILL.md: 非 UTF-8 时按系统 OEM 代码页自动转码。
+         * 依赖中文代码页 (936), 其他语言的机器上跳过。 */
+        if (GetOEMCP() == 936) {
+            char d[MAX_PATH];
+            wchar_t w[MAX_PATH];
+            snprintf(d, sizeof(d), "%s\\skills\\gbk", g_test_ws);
+            if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            tool_write_file("skills\\gbk\\SKILL.md",
+                "---\nname: gbk\ndescription: \xd1\xdd\xca\xbe\n---\nGBK-SKILL-BODY");
+            snprintf(g_skills_dir, sizeof(g_skills_dir), "cagent_test_ws\\skills");
+            skills_init();
+            CHK(g_skill_count == 2);                              /* demo + gbk */
+            {
+                Skill *k = (strcmp(g_skills[0].name, "gbk") == 0) ? &g_skills[0] : &g_skills[1];
+                CHK(strcmp(k->name, "gbk") == 0);
+                CHK(strstr(k->desc, "\xe6\xbc\x94\xe7\xa4\xba") != NULL);  /* 转码后的 "演示" */
+            }
+            dispatch_tool("load_skill", "{\"name\":\"gbk\"}", "");
+            CHK(strstr(tool_out, "GBK-SKILL-BODY") != NULL);
+            test_ws_rm("skills\\gbk\\SKILL.md");
+            g_skills_dir[0] = '\0';
+            g_skill_count = 0;
+            g_skills_suffix[0] = '\0';
+        }
+
+        /* 多目录: ';' 分隔, 按顺序扫描; 重名先到先得 (同一根内与跨根都去重) */
+        {
+            char d[MAX_PATH];
+            wchar_t w[MAX_PATH];
+            /* CreateDirectoryW 不建父级, 父目录排在子目录之前 */
+            const char *dirs[] = { "skills2", "skills\\demo2", "skills\\other",
+                                   "skills2\\deep", "skills2\\demo" };
+            for (int i = 0; i < 4; i++) {
+                snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
+                if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            }
+        }
+        tool_write_file("skills\\demo2\\SKILL.md",
+            "---\nname: demo\ndescription: \xe5\x90\x8c\xe6\xa0\xb9\xe9\x87\x8d\xe5\x90\x8d\n---\nSECOND-SKILL-BODY");
+        tool_write_file("skills\\other\\SKILL.md",
+            "---\nname: other\ndescription: \xe5\x8f\xa6\xe4\xb8\x80\xe4\xb8\xaa\n---\nOTHER-SKILL-BODY");
+        tool_write_file("skills2\\deep\\SKILL.md",
+            "---\nname: deep\ndescription: \xe7\xac\xac\xe4\xba\x8c\xe6\xa0\xb9\n---\nDEEP-SKILL-BODY");
+        tool_write_file("skills2\\demo\\SKILL.md",
+            "---\nname: demo\ndescription: \xe8\xb7\xa8\xe6\xa0\xb9\xe9\x87\x8d\xe5\x90\x8d\n---\nTHIRD-SKILL-BODY");
+
+        /* 单根: demo(demo 目录) + other; 同根内重名的 demo2 被跳过 */
+        snprintf(g_skills_dir, sizeof(g_skills_dir), "cagent_test_ws\\skills");
+        skills_init();
+        CHK(g_skill_count == 2);
+        CHK(strcmp(g_skills[0].name, "demo") == 0);
+        CHK(strcmp(g_skills[1].name, "other") == 0);
+
+        /* 双根: 第二根贡献 deep; 跨根重名的 demo 仍是第一根的 */
+        snprintf(g_skills_dir, sizeof(g_skills_dir),
+                 "cagent_test_ws\\skills;cagent_test_ws\\skills2");
+        skills_init();
+        CHK(g_skill_count == 3);
+        CHK(strcmp(g_skills[2].name, "deep") == 0);
+        dispatch_tool("load_skill", "{\"name\":\"demo\"}", "");
+        CHK(strstr(tool_out, "DEMO-SKILL-BODY") != NULL);
+        CHK(strstr(tool_out, "THIRD-SKILL-BODY") == NULL);
+
+        /* 同一根重复出现: 去重, 不重复计数 */
+        snprintf(g_skills_dir, sizeof(g_skills_dir),
+                 "cagent_test_ws\\skills;cagent_test_ws\\skills");
+        skills_init();
+        CHK(g_skill_count == 2);
+
+        /* 空段与尾分号容忍 */
+        snprintf(g_skills_dir, sizeof(g_skills_dir), ";cagent_test_ws\\skills;");
+        skills_init();
+        CHK(g_skill_count == 2);
+
+        g_skills_dir[0] = '\0';
+        g_skill_count = 0;
+        g_skills_suffix[0] = '\0';
+
+        test_ws_rm("skills\\demo\\SKILL.md");
+        test_ws_rm("skills\\demo2\\SKILL.md");
+        test_ws_rm("skills\\other\\SKILL.md");
+        test_ws_rm("skills2\\deep\\SKILL.md");
+        test_ws_rm("skills2\\demo\\SKILL.md");
+        {
+            char d[MAX_PATH];
+            wchar_t w[MAX_PATH];
+            const char *dirs[] = { "skills\\demo", "skills\\demo2", "skills\\other",
+                                   "skills2\\deep", "skills2\\demo", "skills2" };
+            for (int i = 0; i < 6; i++) {
+                snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
+                if (utf8_to_wide(d, w, MAX_PATH)) RemoveDirectoryW(w);
+            }
+        }
+        {
+            char d2[MAX_PATH];
+            wchar_t w2[MAX_PATH];
+            snprintf(d2, sizeof(d2), "%s\\demo", sdir);
+            if (utf8_to_wide(d2, w2, MAX_PATH)) RemoveDirectoryW(w2);
+            if (utf8_to_wide(sdir, w2, MAX_PATH)) RemoveDirectoryW(w2);
+        }
+        test_ws_end();
+    }
+
     #undef CHK
     if (fails == 0) printf("run_all_tests: OK\n");
     else printf("run_all_tests: %d FAIL(s)\n", fails);

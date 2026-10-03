@@ -15,9 +15,11 @@ typedef struct {
     int too_big;   /* arguments 超上限: 不执行, 回填占位 "{}" + 原因交回模型 */
 } AgentToolCall;
 
-/* 内置默认系统提示词: 外置 SYSTEM_PROMPT 文件缺失或无效时的兜底。 */
-#define SYSTEM_PROMPT_DEFAULT \
-    "{\"role\":\"system\",\"content\":\"你是 cagent,一个极简的编程 Agent。" \
+/* 内置默认系统提示词正文 (单行原文)。内容不含引号与反斜杠, 可直接作为 JSON 字符串值,
+ * SYSTEM_PROMPT_DEFAULT 由它拼出 —— 保证"无外置文件也无技能"时与静态默认逐字节一致,
+ * 测试二进制不调 system_prompt_init 也拿得到同样的提示词。 */
+#define SYSTEM_PROMPT_CONTENT_DEFAULT \
+    "你是 cagent,一个极简的编程 Agent。" \
     "你有四个工具: execute_bash(执行命令)、read_file(读文件)、write_file(写文件)、edit_file(定点替换编辑)。" \
     "改已有文件的局部内容,优先用 edit_file: old_text 必须与文件中的原文完全一致(含空白与换行)且在文件中唯一, 只出现一次才会替换。" \
     "edit_file 报告未找到匹配或匹配到多处时, 先 read_file 看清原文, 再调整 old_text 重试。" \
@@ -30,12 +32,20 @@ typedef struct {
     "用户同意后执行一次即可,同类操作不必反复询问;用户拒绝则放弃该做法并换一个更安全的方案。" \
     "任务不明确时,先向用户澄清。" \
     "任务完成后,停止并简要总结你做了什么。" \
-    "始终用中文回答。回答简洁。\"}"
+    "始终用中文回答。回答简洁。"
+
+/* 内置默认系统提示词 (完整 system 消息 JSON): 外置 SYSTEM_PROMPT 文件缺失或无效时的兜底。 */
+#define SYSTEM_PROMPT_DEFAULT \
+    "{\"role\":\"system\",\"content\":\"" SYSTEM_PROMPT_CONTENT_DEFAULT "\"}"
+
+/* 默认串的静态指针 (与字符串字面量比较是未指定行为, 判定一律走这个指针)。 */
+static const char *const g_prompt_default = SYSTEM_PROMPT_DEFAULT;
 
 /* 实际生效的 system 消息 JSON。默认指向内置默认串; 启动时 exe 同目录存在
  * SYSTEM_PROMPT 文件的话, system_prompt_init() 替换为外置文件包装后的堆串
- * (进程生命周期内最多替换一次, 不释放)。所有 messages 偏移都按它计算。 */
-static const char *g_system_prompt = SYSTEM_PROMPT_DEFAULT;
+ * (进程生命周期内最多替换一次, 不释放)。所有 messages 偏移都按它计算。
+ * 有技能时正文尾部会拼上技能索引 (skill.h 的 g_skills_suffix)。 */
+static const char *g_system_prompt = g_prompt_default;
 
 /* messages 缓冲水位线: 接近上限时触发压缩, 防止越界. */
 #define MESSAGES_WATERMARK  ((BUFSZ * 3) / 4)
@@ -65,10 +75,21 @@ static void reset_conversation(void) {
 static void get_app_path(char *out, size_t cap, const char *filename);   /* 定义在 session.h */
 
 /* 把提示词原文包装成 system 消息 JSON 并提交 (转义由 json_escape 负责,
- * 引号/换行/CRLF 都安全)。空原文或超限返回 0, g_system_prompt 保持原值。 */
+ * 引号/换行/CRLF 都安全)。正文尾部拼上技能索引 (g_skills_suffix, 无技能时为空)。
+ * 空原文或超限返回 0, g_system_prompt 保持原值。 */
 static int system_prompt_set_raw(const char *raw) {
     if (!raw || !raw[0] || strlen(raw) > SYSTEM_PROMPT_MAX_RAW) return 0;
-    char *esc = json_escape_alloc(raw);
+    char *cat = NULL;
+    size_t slen = strlen(g_skills_suffix);
+    if (slen > 0) {
+        size_t rlen = strlen(raw);
+        cat = (char*)malloc(rlen + slen + 1);
+        if (!cat) return 0;
+        memcpy(cat, raw, rlen);
+        memcpy(cat + rlen, g_skills_suffix, slen + 1);
+    }
+    char *esc = json_escape_alloc(cat ? cat : raw);
+    free(cat);
     if (!esc) return 0;
     size_t need = strlen(esc) + 64;   /* 转义串 + 包装前后缀 + '\0' */
     char *buf = (char*)malloc(need);
@@ -80,6 +101,13 @@ static int system_prompt_set_raw(const char *raw) {
     return 1;
 }
 
+/* 无外置提示词时的兜底: 有技能索引则把内置默认正文 + 索引重新包装;
+ * 无技能则保持静态默认 (零开销, 字节相同)。 */
+static void system_prompt_apply_default(void) {
+    if (g_skills_suffix[0] && g_system_prompt == g_prompt_default)
+        system_prompt_set_raw(SYSTEM_PROMPT_CONTENT_DEFAULT);
+}
+
 /* 启动时读取 exe 同目录的 SYSTEM_PROMPT 外置提示词。
  * 文件不存在 / 空 / 超限 / 转码后为空 -> 静默保持内置默认。 */
 static void system_prompt_init(void) CAGENT_MAYBE_UNUSED;   /* 测试二进制不调用 (保持默认指针) */
@@ -87,13 +115,14 @@ static void system_prompt_init(void) {
     char path[MAX_PATH];
     get_app_path(path, sizeof(path), "SYSTEM_PROMPT");
     FILE *f = fopen_utf8(path, "rb");
-    if (!f) { log_line("[prompt] 未找到外置提示词, 使用内置默认: %s", path); return; }
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); log_line("[prompt] 外置提示词读取失败: %s", path); return; }
+    if (!f) { log_line("[prompt] 未找到外置提示词, 使用内置默认: %s", path); system_prompt_apply_default(); return; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); log_line("[prompt] 外置提示词读取失败: %s", path); system_prompt_apply_default(); return; }
     long fsz = ftell(f);
     if (fsz <= 0 || fsz > SYSTEM_PROMPT_MAX_RAW) {
         fclose(f);
         log_line("[prompt] 外置提示词无效 (%ld bytes, 上限 %d), 回退默认: %s",
              fsz, SYSTEM_PROMPT_MAX_RAW, path);
+        system_prompt_apply_default();
         return;
     }
     rewind(f);
@@ -111,12 +140,15 @@ static void system_prompt_init(void) {
     if (n == 0 || !is_valid_utf8((const unsigned char*)buf, n)) {
         free(buf);
         log_line("[prompt] 外置提示词转码后为空/仍非法 UTF-8, 回退默认: %s", path);
+        system_prompt_apply_default();
         return;
     }
     if (system_prompt_set_raw(buf))
         log_line("[prompt] 使用外置提示词 %s (%zu bytes)", path, n);
-    else
+    else {
         log_line("[prompt] 外置提示词包装失败, 回退默认: %s", path);
+        system_prompt_apply_default();
+    }
     free(buf);
 }
 
