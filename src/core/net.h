@@ -39,7 +39,7 @@ static int http_max_retries(void) {
 
 static DWORD http_retry_base_ms(void) {
     char *e = getenv("CAGENT_HTTP_RETRY_MS");
-    long v = (e && atol(e) > 0) ? atol(e) : 800;   /* 首次退避 */
+    long v = (e && atol(e) > 0) ? atol(e) : 2000;  /* 首次退避 (原 800ms 实测太密) */
     if (v > 30000) v = 30000;
     return (DWORD)v;
 }
@@ -56,13 +56,74 @@ static int http_should_retry(int status) {
 }
 
 /* 429 限流窗口通常远长于普通网络抖动: 实测 3 次 (约 7 秒) 不够, 会白白回滚整轮。
- * 给 429 单独提到 6 次 (800→1.6→3.2→6.4→12.8→25.6s ≈ 50 秒窗口); 其余错误维持默认。
+ * 给 429 单独提到 6 次 (5→10→20→40→60→60s ≈ 3.2 分钟窗口); 其余错误维持默认。
  * 环境变量 CAGENT_HTTP_RETRIES 显式调高时以较大者为准。 */
 #define HTTP_RATE_RETRIES 6
+/* 429 的退避基数: 与网络抖动 (200ms*2^n) 分开, 限流窗口以几十秒计 */
+#define HTTP_RATE_BASE_MS 5000
+
 static int http_max_retries_for(int status) {
     int n = http_max_retries();
     if (status == 429 && n < HTTP_RATE_RETRIES) n = HTTP_RATE_RETRIES;
     return n;
+}
+
+/* ===== 错误分类 ===== */
+
+/* ASCII 大小写不敏感子串搜索 (字节级, 对 UTF-8 中文关键字同样安全) */
+static int ascii_icontains(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return 1;
+    for (const char *p = hay; *p; p++) {
+        size_t k = 0;
+        while (k < nl && p[k]) {
+            char a = p[k], b = needle[k];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+            k++;
+        }
+        if (k == nl) return 1;
+    }
+    return 0;
+}
+
+/* 是否"额度用完"类错误: 402 欠费 (DeepSeek 等), 403/429 携带配额报文。
+ * 刻意用窄关键字列表, 不搜裸 "quota" —— 普通限流的报文里也常带这个词。
+ * 额度问题重试无益 (等再久也不会恢复), 必须与限流分开对待。 */
+static int http_is_quota_error(int status, const char *resp_body) {
+    if (status != 402 && status != 403 && status != 429) return 0;
+    if (status == 402) return 1;   /* Payment Required 本身即欠费语义, 无需看报文 */
+    if (!resp_body || !resp_body[0]) return 0;
+    static const char *kw[] = {
+        "insufficient balance", "insufficient_quota", "arrearage",
+        "billing hard limit", "plan quota exceeded",
+        "\xe4\xbd\x99\xe9\xa2\x9d\xe4\xb8\x8d\xe8\xb6\xb3",             /* 余额不足 */
+        "\xe6\xac\xa0\xe8\xb4\xb9",                                     /* 欠费   */
+        "\xe9\xa2\x9d\xe5\xba\xa6\xe5\xb7\xb2\xe7\x94\xa8\xe5\xae\x8c", /* 额度已用完 */
+        NULL
+    };
+    for (int i = 0; kw[i]; i++)
+        if (ascii_icontains(resp_body, kw[i])) return 1;
+    return 0;
+}
+
+/* 面向界面的友好错误消息 (命中返回 1 并写 out; 未命中返回 0, 调用方展示原始报文)。
+ * 原始报文始终进日志, 界面只给人看的结论。 */
+static int http_friendly_error(int status, const char *resp_body, char *out, size_t cap) {
+    if (status == 401) {
+        snprintf(out, cap, "[鉴权失败] API Key 无效或已过期 (HTTP 401), 请检查 cagent.ini 里的 api_key");
+        return 1;
+    }
+    if (http_is_quota_error(status, resp_body)) {
+        snprintf(out, cap, "[额度用完] 账户余额不足或配额耗尽 (HTTP %d), 请充值或更换 API Key 后重试", status);
+        return 1;
+    }
+    if (status == 429) {
+        snprintf(out, cap, "[请求过于频繁] 已多轮退避重试仍被限流 (HTTP 429), 请稍等片刻再发");
+        return 1;
+    }
+    return 0;
 }
 
 /* 可中断睡眠: 期间若被取消则提前返回, 避免卡在退避里 */
@@ -180,13 +241,16 @@ static void stream_apply_tool_calls(StreamCtx *ctx, const JValue *tcs) {
 
 /* 单次请求尝试 (无重试): 建立连接、发送、流式读取 SSE、解析 tool_calls。
  * completed 输出参数: 是否完整收到 [DONE] (用于区分"200 但流被截断")。
+ * retry_after_sec 输出参数: 服务端 Retry-After 头 (秒; 无或非数字为 0)。
  * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断)。 */
 static int http_post_stream_once(const char *url, const char *api_key,
                                  const char *req_body, size_t req_body_len,
                                  char *err_out, size_t err_cap,
-                                 StreamCtx *ctx, int *completed) {
+                                 StreamCtx *ctx, int *completed,
+                                 int *retry_after_sec) {
     if (err_cap > 0) err_out[0] = '\0';
     if (completed) *completed = 0;
+    if (retry_after_sec) *retry_after_sec = 0;
 
     const char *p = url;
     int https = 0;
@@ -262,6 +326,20 @@ static int http_post_stream_once(const char *url, const char *api_key,
     int status = (int)st;
 
     if (status != 200) {
+        /* 限流/服务端错误时读服务端告知的等待时长 (Retry-After: 秒数)。
+         * HTTP-date 形式的值 atoi 得 0, 自动忽略。 */
+        if ((status == 429 || status == 503) && retry_after_sec) {
+            WCHAR wra[64], rav[32];
+            DWORD ras = sizeof(rav);
+            if (utf8_to_wide("Retry-After", wra, 64) &&
+                WinHttpQueryHeaders(hReq, WINHTTP_QUERY_CUSTOM, wra, rav, &ras, WINHTTP_NO_HEADER_INDEX)) {
+                char ra[32];
+                if (WideCharToMultiByte(CP_UTF8, 0, rav, -1, ra, sizeof(ra), NULL, NULL) > 0) {
+                    int s = atoi(ra);
+                    if (s > 0 && s <= 3600) *retry_after_sec = s;
+                }
+            }
+        }
         size_t pos = 0;
         char tmp[8192];
         DWORD nread;
@@ -361,34 +439,56 @@ static int http_post_stream(const char *url, const char *api_key,
         memset(ctx, 0, sizeof(*ctx));
         if (err_cap > 0) err_out[0] = '\0';
 
-        int completed = 0;
+        int completed = 0, retry_after_sec = 0;
         int status = http_post_stream_once(url, api_key, req_body, req_body_len,
-                                          err_out, err_cap, ctx, &completed);
+                                          err_out, err_cap, ctx, &completed,
+                                          &retry_after_sec);
         last_status = status;
 
         if (status == -2) return -2;                  /* 取消 */
         if (status == 200 && completed) return 200;   /* 成功且流完整 */
 
+        /* 额度用完 (402/403/429+欠费报文): 等再久也不会恢复, 一次都不重试 */
+        if (http_is_quota_error(status, err_out)) break;
+
         /* 判断是否值得重试: 瞬时错误, 或 200 但流被截断 (需重取) */
         int retryable = http_should_retry(status) || (status == 200 && !completed);
         if (!retryable) break;
-        if (attempt >= http_max_retries_for(status)) break;
+        int nmax = http_max_retries_for(status);
+        if (attempt >= nmax) break;
 
         /* 本分段已上屏的半截回复必须先回删, 否则重试后界面会拼出两段重复内容 */
         if (ctx->emitted && cagent_stream_undo) cagent_stream_undo();
-        if (cagent_emit) append_text("(网络瞬时错误, 正在重试...)\r\n");
-        /* 指数退避: base, 2*base, 4*base ... (累计可在长链路上叠加)。
-         * 移位前夹紧指数: 目前 http_max_retries() 已把次数夹在 ≤8, 所以 1u<<attempt 不会溢出,
-         * 但这个循环不该依赖别处的夹紧 —— 那个上限一旦被放宽, 移位就是 UB。
-         * 单次等待再给 60s 上限, 免得长链路叠加出十几分钟的静默 (默认基数下不会触及)。 */
+
+        /* 退避计算: 网络/服务端错误 base*2^n (上限 60s); 429 用更长的基数
+         * (5s*2^n, 上限 60s), 若服务端 Retry-After 更长则以服务端为准 (上限 120s)。
+         * 移位前夹紧指数: 重试次数上限 8 保证 1u<<attempt 不溢出, 这里仍显式夹紧,
+         * 不依赖别处的夹紧 —— 那个上限一旦被放宽, 移位就是 UB。 */
         int sh = (attempt > 16) ? 16 : attempt;
-        DWORD wait = base * (1u << sh);
+        DWORD wait = (status == 429 ? HTTP_RATE_BASE_MS : base) * (1u << sh);
         if (wait > 60000) wait = 60000;
+        if (status == 429 && retry_after_sec > 0) {
+            DWORD ra = (DWORD)retry_after_sec * 1000u;
+            if (ra > wait) wait = ra;
+            if (wait > 120000) wait = 120000;
+        }
+
+        /* 按错误类别给界面不同的提示 (不再一律"网络瞬时错误") */
+        if (cagent_emit) {
+            if (status == -1)
+                append_text("(网络瞬时错误, 等待后重试...)\r\n");
+            else if (status == 429)
+                append_text("(请求限流, 等待后重试...)\r\n");
+            else if (status == 200 && !completed)
+                append_text("(响应流中断, 重试...)\r\n");
+            else
+                append_text("(服务端错误, 等待后重试...)\r\n");
+        }
         /* err 按字符边界截取: %.300s 会切半汉字, 日志自己先变成非法 UTF-8 */
         char eprev[304];
         utf8_safe_copy(err_out, 300, eprev, sizeof(eprev));
-        log_line("[http] 瞬时错误重试 attempt=%d status=%d wait=%lu ms err=%s",
-             attempt + 1, status, (unsigned long)wait, eprev);
+        log_line("[http] 瞬时错误重试 attempt=%d/%d status=%d wait=%lu ms ra=%d err=%s",
+             attempt + 1, nmax, status, (unsigned long)wait, retry_after_sec, eprev);
         cancelable_sleep_ms(wait);
     }
     return last_status;

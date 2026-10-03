@@ -1012,6 +1012,40 @@ static int run_all_tests(void) {
     }
     #undef SKILLS_RESET
 
+    /* ===== HTTP 错误分类: 额度识别 / 友好消息 ===== */
+    {
+        /* 额度错误: 402 一律算; 403/429 只在报文命中关键字时算 */
+        CHK(http_is_quota_error(402, "") == 1);
+        CHK(http_is_quota_error(402, NULL) == 1);
+        CHK(http_is_quota_error(403, "Insufficient Balance in account") == 1);
+        CHK(http_is_quota_error(429, "{\"error\":{\"code\":\"insufficient_quota\"}}") == 1);
+        CHK(http_is_quota_error(429, "Arrearage: account in debt") == 1);
+        CHK(http_is_quota_error(429, "\xe4\xbd\x99\xe9\xa2\x9d\xe4\xb8\x8d\xe8\xb6\xb3") == 1);  /* 余额不足 */
+        /* 普通限流/无关错误不算: 裸 "quota" 与 rate limit 不误判 */
+        CHK(http_is_quota_error(429, "Too many requests, rate limit exceeded") == 0);
+        CHK(http_is_quota_error(429, "This model's maximum context length is 8192 tokens") == 0);
+        CHK(http_is_quota_error(400, "insufficient_quota") == 0);   /* 非 402/403/429 */
+        CHK(http_is_quota_error(500, "Insufficient Balance") == 0);
+        /* 大小写不敏感 */
+        CHK(http_is_quota_error(403, "INSUFFICIENT BALANCE") == 1);
+
+        /* 友好消息: 命中写 out 返回 1; 未命中返回 0 (调用方展示原始报文) */
+        char fr[512];
+        CHK(http_friendly_error(401, "", fr, sizeof(fr)) == 1);
+        CHK(strstr(fr, "API Key") != NULL);
+        CHK(http_friendly_error(402, "any", fr, sizeof(fr)) == 1);
+        CHK(strstr(fr, "\xe9\xa2\x9d\xe5\xba\xa6\xe7\x94\xa8\xe5\xae\x8c") != NULL);   /* 额度用完 */
+        CHK(http_friendly_error(429, "rate limited", fr, sizeof(fr)) == 1);
+        CHK(strstr(fr, "429") != NULL);
+        CHK(http_friendly_error(400, "bad request", fr, sizeof(fr)) == 0);   /* 未命中 */
+        CHK(http_friendly_error(500, "server error", fr, sizeof(fr)) == 0);
+
+        /* ascii_icontains 基础行为 */
+        CHK(ascii_icontains("hello World", "world") == 1);
+        CHK(ascii_icontains("hello", "hello!") == 0);
+        CHK(ascii_icontains("abc", "") == 1);
+    }
+
     #undef CHK
     if (fails == 0) printf("run_all_tests: OK\n");
     else printf("run_all_tests: %d FAIL(s)\n", fails);

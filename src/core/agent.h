@@ -638,7 +638,10 @@ static void agent_turn(const char *user_msg) {
                 log_line("[compact] 400超限触发 -> 失败");
                 append_text("(压缩失败)\r\n");
             }
-            append_text(resp);
+            /* 界面给人看的结论 (额度/鉴权/限流有友好文案), 原始报文已在上面进日志 */
+            char fr[512];
+            if (http_friendly_error(status, resp, fr, sizeof(fr))) append_text(fr);
+            else append_text(resp);
             /* 请求阶段失败 = 没收到任何响应内容, messages 状态完整 (此前所有工具往返
              * 都已闭合): 保留已完成步骤, 只结束本轮 —— 学压缩失败的处理, 不让 429/网络
              * 抖动白白吃掉整轮 (文件改动本来也不回滚)。用户取消在上面另行回滚。 */
