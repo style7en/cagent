@@ -4,8 +4,9 @@
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  *
  * 设计 (与 SYSTEM_PROMPT 外置提示词同一套路):
- *   - 启动时扫描 <exe>\skills\ 下的一级子目录, 每个子目录里的 SKILL.md 是一个技能;
- *     环境变量 CAGENT_SKILLS_DIR 可指向别的技能根目录 (测试用)。
+ *   - 启动时递归扫描 <exe>\skills\ 树, 任意深度的 SKILL.md 都算一个技能 (标准
+ *     agent 的技能布局: 目录里放 SKILL.md 即成, 不要求固定层级); 回退名取
+ *     SKILL.md 所在目录名。环境变量 CAGENT_SKILLS_DIR 可指向别的技能根 (测试用)。
  *   - SKILL.md 可带 frontmatter (--- 包住的 name:/description:), 缺省回退
  *     目录名 / 正文第一个非空行。
  *   - 技能索引拼进系统提示词 (g_skills_suffix, 由 agent.h 的 system_prompt_set_raw
@@ -121,8 +122,69 @@ static char *skill_read_utf8(const char *path) {
 
 /* ===== 扫描与索引 ===== */
 
-/* 扫描 root 下的一级子目录, 读每个 <子目录>\SKILL.md。重名只收先到的。 */
-static void skills_scan_dir(const char *root) {
+/* 递归深度上限: 纯防御 (路径受 MAX_PATH 约束实际到不了), 再深视为配置事故 */
+#define SKILL_SCAN_DEPTH_MAX 8
+
+/* 加载一个 SKILL.md 并入池 (重名只收先到的)。从 skills_scan_dir 的枚举项调用。 */
+static void skills_load_file(const char *file) {
+    if (g_skill_count >= SKILL_MAX) return;
+    char *text = skill_read_utf8(file);
+    if (!text) return;                            /* 超限 / 空文件 / 坏编码: 跳过 */
+
+    Skill *sk = &g_skills[g_skill_count];
+    char name[SKILL_NAME_MAX], desc[SKILL_DESC_MAX];
+    skill_parse_frontmatter(text, name, sizeof(name), desc, sizeof(desc));
+
+    /* 回退名 = 直接父目录名; 回退描述 = 正文第一个非空行 */
+    const char *base = file + strlen(file);
+    const char *sep = NULL;
+    for (const char *q = file; q < base; q++)
+        if (*q == '\\') sep = q;                  /* 倒数第二个 '\\' 之前是父目录 */
+    const char *parent = NULL;
+    if (sep) {
+        const char *p2 = sep;
+        while (p2 > file && *(p2 - 1) != '\\') p2--;
+        parent = p2;
+    }
+    char parentu8[MAX_PATH];
+    if (parent) {
+        size_t pl = (size_t)(sep - parent);
+        if (pl >= sizeof(parentu8)) pl = sizeof(parentu8) - 1;
+        memcpy(parentu8, parent, pl);
+        parentu8[pl] = '\0';
+    } else parentu8[0] = '\0';
+
+    if (name[0])     snprintf(sk->name, sizeof(sk->name), "%s", name);
+    else             snprintf(sk->name, sizeof(sk->name), "%s", parentu8);
+    if (!desc[0]) {
+        const char *body = skill_body(text);
+        while (*body == '\r' || *body == '\n') body++;
+        const char *eol = strchr(body, '\n');
+        size_t bl = eol ? (size_t)(eol - body) : strlen(body);
+        while (bl > 0 && (body[bl-1] == '\r' || body[bl-1] == ' ')) bl--;
+        utf8_safe_copy(body, bl, sk->desc, sizeof(sk->desc));
+    } else {
+        snprintf(sk->desc, sizeof(sk->desc), "%s", desc);
+    }
+    snprintf(sk->path, sizeof(sk->path), "%s", file);
+
+    int dup = 0;
+    for (int i = 0; i < g_skill_count; i++)
+        if (strcmp(g_skills[i].name, sk->name) == 0) { dup = 1; break; }
+    if (dup) { free(text); return; }
+
+    g_skill_count++;
+    char dprev[160];
+    utf8_safe_copy(sk->desc, 120, dprev, sizeof(dprev));
+    log_line("[skill] 已加载: %s (%s) <- %s", sk->name, dprev, file);
+    free(text);
+}
+
+/* 递归扫描 root 树, 发现任意深度的 SKILL.md (与标准 agent 的技能布局一致:
+ * 目录里放 SKILL.md 即成技能, 不要求固定层级)。回退名取 SKILL.md 所在目录名。
+ * 重名 (含跨根与根互相嵌套导致的重复发现) 先到先得。
+ * 跳过: 点开头目录、junction/符号链接 (防环)。 */
+static void skills_scan_dir(const char *root, int depth) {
     wchar_t wroot[MAX_PATH];
     if (!utf8_to_wide(root, wroot, MAX_PATH)) return;
     wchar_t pattern[MAX_PATH];
@@ -133,48 +195,23 @@ static void skills_scan_dir(const char *root) {
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (g_skill_count >= SKILL_MAX) break;
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if (fd.cFileName[0] == L'.') continue;       /* . 与 .. 及隐藏目录 */
         if (wcschr(fd.cFileName, L'\\')) continue;
 
-        char sub[MAX_PATH], file[MAX_PATH], diru8[MAX_PATH];
+        char nameu8[MAX_PATH], entry[MAX_PATH];
         if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
-                                diru8, sizeof(diru8), NULL, NULL) <= 0) continue;
-        int m1 = snprintf(sub, sizeof(sub), "%s\\%s", root, diru8);
-        int m2 = snprintf(file, sizeof(file), "%s\\SKILL.md", sub);
-        if (m1 < 0 || (size_t)m1 >= sizeof(sub) ||
-            m2 < 0 || (size_t)m2 >= sizeof(file)) continue;
+                                nameu8, sizeof(nameu8), NULL, NULL) <= 0) continue;
+        int m1 = snprintf(entry, sizeof(entry), "%s\\%s", root, nameu8);
+        if (m1 < 0 || (size_t)m1 >= sizeof(entry)) continue;
 
-        char *text = skill_read_utf8(file);
-        if (!text) continue;                          /* 无 SKILL.md / 超限 / 空文件: 跳过 */
-
-        Skill *sk = &g_skills[g_skill_count];
-        char name[SKILL_NAME_MAX], desc[SKILL_DESC_MAX];
-        skill_parse_frontmatter(text, name, sizeof(name), desc, sizeof(desc));
-        if (!name[0]) snprintf(sk->name, sizeof(sk->name), "%s", diru8);
-        else          snprintf(sk->name, sizeof(sk->name), "%s", name);
-        if (!desc[0]) {
-            const char *body = skill_body(text);      /* 回退: 正文第一个非空行 */
-            while (*body == '\r' || *body == '\n') body++;
-            const char *eol = strchr(body, '\n');
-            size_t bl = eol ? (size_t)(eol - body) : strlen(body);
-            while (bl > 0 && (body[bl-1] == '\r' || body[bl-1] == ' ')) bl--;
-            utf8_safe_copy(body, bl, sk->desc, sizeof(sk->desc));
-        } else {
-            snprintf(sk->desc, sizeof(sk->desc), "%s", desc);
+        if (wcsicmp(fd.cFileName, L"SKILL.md") == 0) {
+            skills_load_file(entry);
+            continue;
         }
-        snprintf(sk->path, sizeof(sk->path), "%s", file);
-
-        int dup = 0;
-        for (int i = 0; i < g_skill_count; i++)
-            if (strcmp(g_skills[i].name, sk->name) == 0) { dup = 1; break; }
-        if (dup) { free(text); continue; }
-
-        g_skill_count++;
-        char dprev[160];
-        utf8_safe_copy(sk->desc, 120, dprev, sizeof(dprev));
-        log_line("[skill] 已加载: %s (%s) <- %s", sk->name, dprev, file);
-        free(text);
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (depth >= SKILL_SCAN_DEPTH_MAX) continue;
+        skills_scan_dir(entry, depth + 1);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -258,7 +295,7 @@ static void skills_init(void) {
                 tok[len] = '\0';
                 skills_resolve_one(tok, root, sizeof(root));
                 int before = g_skill_count;
-                skills_scan_dir(root);
+                skills_scan_dir(root, 0);
                 log_line("[skill] 技能根目录: %s (+%d)", root, g_skill_count - before);
             }
             if (!semi) break;
@@ -266,7 +303,7 @@ static void skills_init(void) {
         }
     } else {
         get_app_path(root, sizeof(root), "skills");
-        skills_scan_dir(root);
+        skills_scan_dir(root, 0);
         log_line("[skill] 技能根目录: %s", root);
     }
     skills_build_suffix();

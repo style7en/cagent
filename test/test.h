@@ -889,6 +889,44 @@ static int run_all_tests(void) {
         g_skill_count = 0;
         g_skills_suffix[0] = '\0';
 
+        /* 递归扫描: 任意深度的 SKILL.md 都发现; 根下直接放 SKILL.md 也算;
+         * 根互相嵌套/重叠时同一文件被多次发现, 靠重名先到先得去重 */
+        {
+            char d[MAX_PATH];
+            wchar_t w[MAX_PATH];
+            const char *dirs[] = { "skills3", "skills3\\a", "skills3\\a\\deep",
+                                   "skills3\\a\\deep\\inner" };
+            for (int i = 0; i < 4; i++) {
+                snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
+                if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            }
+        }
+        tool_write_file("skills3\\SKILL.md",
+            "ROOT-LEVEL-SKILL-BODY");   /* 无 frontmatter: 回退名 = 所在目录名 */
+        tool_write_file("skills3\\a\\deep\\inner\\SKILL.md",
+            "---\nname: deepskill\ndescription: \xe6\xb7\xb1\xe5\xb1\x82\xe6\x8a\x80\xe8\x83\xbd\n---\nDEEP-SKILL-BODY");
+        /* 双根且后者嵌套在前者里: inner 的 SKILL.md 被发现两次, 不重复计数 */
+        snprintf(g_skills_dir, sizeof(g_skills_dir),
+                 "cagent_test_ws\\skills3;cagent_test_ws\\skills3\\a");
+        skills_init();
+        CHK(g_skill_count == 2);
+        {
+            Skill *r = NULL, *d2 = NULL;
+            for (int i = 0; i < g_skill_count; i++) {
+                if (strcmp(g_skills[i].name, "skills3") == 0) r = &g_skills[i];
+                if (strcmp(g_skills[i].name, "deepskill") == 0) d2 = &g_skills[i];
+            }
+            CHK(r != NULL && d2 != NULL);         /* 根下 SKILL.md 回退名 = 根目录名 */
+            CHK(strstr(d2->desc, "\xe6\xb7\xb1\xe5\xb1\x82") != NULL);
+        }
+        dispatch_tool("load_skill", "{\"name\":\"deepskill\"}", "");
+        CHK(strstr(tool_out, "DEEP-SKILL-BODY") != NULL);
+        test_ws_rm("skills3\\SKILL.md");
+        test_ws_rm("skills3\\a\\deep\\inner\\SKILL.md");
+        g_skills_dir[0] = '\0';
+        g_skill_count = 0;
+        g_skills_suffix[0] = '\0';
+
         /* 多目录: ';' 分隔, 按顺序扫描; 重名先到先得 (同一根内与跨根都去重) */
         {
             char d[MAX_PATH];
