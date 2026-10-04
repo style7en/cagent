@@ -30,3 +30,6 @@ SYSTEM_PROMPT
 
 # 计划/设计文档 (superpowers 流程产物, 不入库)
 docs/
+
+# E2E UI 测试运行物证 (每次运行生成, 不入库)
+test/e2e_artifacts/
