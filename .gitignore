@@ -33,3 +33,6 @@ docs/
 
 # E2E UI 测试运行物证 (每次运行生成, 不入库)
 test/e2e_artifacts/
+
+# UT 测试隔离工作区 (make test 运行时生成)
+cagent_test_ws/
