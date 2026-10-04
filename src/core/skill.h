@@ -147,8 +147,9 @@ static void skills_load_file(const char *file) {
         parentu8[pl] = '\0';
     }
 
-    if (name[0])     snprintf(sk->name, sizeof(sk->name), "%s", name);
-    else             snprintf(sk->name, sizeof(sk->name), "%s", parentu8);
+    /* 回退名 (父目录名) 可能长于 SKILL_NAME_MAX: 这里就是要它的前 N 字符做索引, 截断是预期的 */
+    if (name[0]) str_copy_into(sk->name, sizeof(sk->name), name);
+    else         str_copy_into(sk->name, sizeof(sk->name), parentu8);
     if (!desc[0]) {
         const char *body_text = skill_body(text);  /* 别叫 body: 遮蔽 state.h 的全局 body[BUFSZ] */
         while (*body_text == '\r' || *body_text == '\n') body_text++;
@@ -263,17 +264,19 @@ static void skills_resolve_one(const char *src0, char *out, size_t cap) {
     tok[sl] = '\0';
     int absolute = (tok[0] == '\\' || tok[0] == '/' || (tok[0] && tok[1] == ':'));
     if (absolute) {
-        snprintf(out, cap, "%s", tok);
+        path_copy(out, cap, tok);
     } else {
-        char exedir[MAX_PATH], cand[MAX_PATH];
+        char exedir[MAX_PATH], cand[PATHSZ];
         get_exe_dir_utf8(exedir, sizeof(exedir));
-        if (!exedir[0]) { snprintf(out, cap, "%s", tok); return; }
-        snprintf(cand, sizeof(cand), "%s\\%s", exedir, tok);
-        wchar_t win[MAX_PATH], wout[MAX_PATH];
-        if (!utf8_to_wide(cand, win, MAX_PATH) ||
-            GetFullPathNameW(win, MAX_PATH, wout, NULL) == 0 ||
+        if (!exedir[0]) { path_copy(out, cap, tok); return; }
+        path_copy(cand, sizeof(cand), exedir);
+        path_append(cand, sizeof(cand), "\\");
+        path_append(cand, sizeof(cand), tok);
+        wchar_t win[PATHSZ], wout[PATHSZ];
+        if (!utf8_to_wide(cand, win, (int)sizeof(win)) ||
+            GetFullPathNameW(win, PATHSZ, wout, NULL) == 0 ||
             WideCharToMultiByte(CP_UTF8, 0, wout, -1, out, (int)cap, NULL, NULL) <= 0)
-            snprintf(out, cap, "%s", cand);          /* 归一化失败: 用未规整的候选值 */
+            path_copy(out, cap, cand);          /* 归一化失败: 用未规整的候选值 */
     }
     size_t len = strlen(out);
     while (len > 2 && (out[len-1] == '\\' || out[len-1] == '/') && out[len-2] != ':')

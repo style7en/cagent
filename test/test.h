@@ -23,24 +23,25 @@ static char g_test_ws[MAX_PATH];
 static void test_ws_begin(void) {
     char exedir[MAX_PATH];
     get_exe_dir_utf8(exedir, sizeof(exedir));
-    snprintf(g_test_ws, sizeof(g_test_ws), "%s\\cagent_test_ws", exedir);
-    wchar_t wd[MAX_PATH];
-    if (utf8_to_wide(g_test_ws, wd, MAX_PATH)) CreateDirectoryW(wd, NULL);
-    snprintf(g_workspace, sizeof(g_workspace), "%s", g_test_ws);
+    path_copy(g_test_ws, sizeof(g_test_ws), exedir);
+    path_append(g_test_ws, sizeof(g_test_ws), "\\cagent_test_ws");
+    wchar_t wd[PATHSZ];
+    if (utf8_to_wide(g_test_ws, wd, (int)sizeof(wd))) CreateDirectoryW(wd, NULL);
+    path_copy(g_workspace, sizeof(g_workspace), g_test_ws);
     g_touched_files[0] = '\0';
 }
 
 /* 删掉测试工作目录里的一个文件 (走绝对路径, 不受 CWD 影响) */
 static void test_ws_rm(const char *name) {
-    char p[MAX_PATH];
-    wchar_t w[MAX_PATH];
+    char p[PATHSZ];
+    wchar_t w[PATHSZ];
     snprintf(p, sizeof(p), "%s\\%s", g_test_ws, name);
-    if (utf8_to_wide(p, w, MAX_PATH)) DeleteFileW(w);
+    if (utf8_to_wide(p, w, (int)sizeof(w))) DeleteFileW(w);
 }
 
 static void test_ws_end(void) {
-    wchar_t w[MAX_PATH];
-    if (utf8_to_wide(g_test_ws, w, MAX_PATH)) RemoveDirectoryW(w);
+    wchar_t w[PATHSZ];
+    if (utf8_to_wide(g_test_ws, w, (int)sizeof(w))) RemoveDirectoryW(w);
     g_workspace[0] = '\0';
 }
 
@@ -414,11 +415,11 @@ static int run_all_tests(void) {
 
     /* ---- 会话文件落点: 必须在 sessions\ 下, 不污染根目录 ---- */
     {
-        char sdir[MAX_PATH];
-        wchar_t wtmp[MAX_PATH];
+        char sdir[PATHSZ];
+        wchar_t wtmp[PATHSZ];
         sessions_dir(sdir, sizeof(sdir));
         CHK(strlen(sdir) > 9 && _stricmp(sdir + strlen(sdir) - 9, "sessions\\") == 0);
-        CHK(utf8_to_wide(sdir, wtmp, MAX_PATH));                    /* 目录已创建 */
+        CHK(utf8_to_wide(sdir, wtmp, (int)sizeof(wtmp)));                    /* 目录已创建 */
         {
             DWORD wa = GetFileAttributesW(wtmp);
             CHK(wa != INVALID_FILE_ATTRIBUTES && (wa & FILE_ATTRIBUTE_DIRECTORY) != 0);
@@ -467,12 +468,12 @@ static int run_all_tests(void) {
      * 验证旧内容完好 —— 这正是原子写相对直接覆盖的核心保证。 */
     {
         test_ws_begin();
-        char atomic[MAX_PATH], atomictmp[MAX_PATH];
+        char atomic[PATHSZ], atomictmp[PATHSZ];
         snprintf(atomic,    sizeof(atomic),    "%s\\atomic.json",     g_test_ws);
         snprintf(atomictmp, sizeof(atomictmp), "%s\\atomic.json.tmp", g_test_ws);
-        wchar_t wdst[MAX_PATH], wtmp[MAX_PATH];
-        CHK(utf8_to_wide(atomic, wdst, MAX_PATH));
-        CHK(utf8_to_wide(atomictmp, wtmp, MAX_PATH));
+        wchar_t wdst[PATHSZ], wtmp[PATHSZ];
+        CHK(utf8_to_wide(atomic, wdst, (int)sizeof(wdst)));
+        CHK(utf8_to_wide(atomictmp, wtmp, (int)sizeof(wtmp)));
 
         char buf[256];
 
@@ -757,22 +758,24 @@ static int run_all_tests(void) {
     {
         /* 扫描 + 索引 + 分发: CAGENT_SKILLS_DIR 指到测试目录, 不碰 exe 目录 */
         test_ws_begin();
-        char sdir[MAX_PATH];
+        char sdir[PATHSZ];
         snprintf(sdir, sizeof(sdir), "%s\\skills", g_test_ws);
-        wchar_t w[MAX_PATH];
+        wchar_t w[PATHSZ];
         {
-            char d2[MAX_PATH];
-            snprintf(d2, sizeof(d2), "%s\\demo", sdir);
-            if (utf8_to_wide(sdir, w, MAX_PATH)) CreateDirectoryW(w, NULL);
-            if (utf8_to_wide(d2, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            char d2[PATHSZ];
+            path_copy(d2, sizeof(d2), sdir);
+            path_append(d2, sizeof(d2), "\\demo");
+            if (utf8_to_wide(sdir, w, (int)sizeof(w))) CreateDirectoryW(w, NULL);
+            if (utf8_to_wide(d2, w, (int)sizeof(w))) CreateDirectoryW(w, NULL);
         }
         /* 技能文件落在工作目录内, 用 write_file 写 (注意它会记账, 无妨) */
         tool_write_file("skills\\demo\\SKILL.md",
             "---\nname: demo\ndescription: \xe6\xbc\x94\xe7\xa4\xba\n---\nDEMO-SKILL-BODY \xe6\xad\xa5\xe9\xaa\xa4");
 
         {
-            char env[512];
-            snprintf(env, sizeof(env), "CAGENT_SKILLS_DIR=%s", sdir);
+            char env[PATHSZ + 32];
+            path_copy(env, sizeof(env), "CAGENT_SKILLS_DIR=");
+            path_append(env, sizeof(env), sdir);
             _putenv(env);
             skills_init();
             CHK(g_skill_count == 1);
@@ -814,9 +817,9 @@ static int run_all_tests(void) {
         /* UTF-8 BOM: 先剥 BOM 再解析, frontmatter 不受影响
          * (frontmatter name 故意与目录名不同, 证明确实来自解析而非回退) */
         {
-            char d[MAX_PATH];
+            char d[PATHSZ];
             snprintf(d, sizeof(d), "%s\\skills\\bom", g_test_ws);
-            if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            if (utf8_to_wide(d, w, (int)sizeof(w))) CreateDirectoryW(w, NULL);
         }
         tool_write_file("skills\\bom\\SKILL.md",
             "\xEF\xBB\xBF---\nname: bomskill\ndescription: BOM \xe6\xb5\x8b\xe8\xaf\x95\n---\nBOM-SKILL-BODY");
@@ -837,9 +840,9 @@ static int run_all_tests(void) {
         /* GBK 编码的 SKILL.md: 非 UTF-8 时按系统 OEM 代码页自动转码。
          * 依赖中文代码页 (936), 其他语言的机器上跳过。 */
         if (GetOEMCP() == 936) {
-            char d[MAX_PATH];
+            char d[PATHSZ];
             snprintf(d, sizeof(d), "%s\\skills\\gbk", g_test_ws);
-            if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            if (utf8_to_wide(d, w, (int)sizeof(w))) CreateDirectoryW(w, NULL);
             tool_write_file("skills\\gbk\\SKILL.md",
                 "---\nname: gbk\ndescription: \xd1\xdd\xca\xbe\n---\nGBK-SKILL-BODY");
             snprintf(g_skills_dir, sizeof(g_skills_dir), "cagent_test_ws\\skills");
@@ -858,9 +861,9 @@ static int run_all_tests(void) {
 
         /* ini 手写误差: 首尾空白与成对引号剥掉; 技能目录名可含空格 */
         {
-            char d[MAX_PATH];
+            char d[PATHSZ];
             snprintf(d, sizeof(d), "%s\\skills\\my skill", g_test_ws);
-            if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+            if (utf8_to_wide(d, w, (int)sizeof(w))) CreateDirectoryW(w, NULL);
         }
         tool_write_file("skills\\my skill\\SKILL.md",
             "---\nname: spaced\ndescription: \xe5\x90\xab\xe7\xa9\xba\xe6\xa0\xbc\n---\nSPACED-SKILL-BODY");
@@ -882,12 +885,12 @@ static int run_all_tests(void) {
         /* 递归扫描: 任意深度的 SKILL.md 都发现; 根下直接放 SKILL.md 也算;
          * 根互相嵌套/重叠时同一文件被多次发现, 靠重名先到先得去重 */
         {
-            char d[MAX_PATH];
+            char d[PATHSZ];
             const char *dirs[] = { "skills3", "skills3\\a", "skills3\\a\\deep",
                                    "skills3\\a\\deep\\inner" };
             for (int i = 0; i < 4; i++) {
                 snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
-                if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+                if (utf8_to_wide(d, w, (int)sizeof(w))) CreateDirectoryW(w, NULL);
             }
         }
         tool_write_file("skills3\\SKILL.md",
@@ -917,11 +920,11 @@ static int run_all_tests(void) {
         /* 未闭合的 frontmatter (少收尾 ---): name 回退目录名, desc 回退跳过
          * "---" 与键值行取真正的正文首行, 不把元数据带进索引 */
         {
-            char d[MAX_PATH];
+            char d[PATHSZ];
             const char *dirs[] = { "skills4", "skills4\\broken" };
             for (int i = 0; i < 2; i++) {
                 snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
-                if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+                if (utf8_to_wide(d, w, (int)sizeof(w))) CreateDirectoryW(w, NULL);
             }
         }
         tool_write_file("skills4\\broken\\SKILL.md",
@@ -939,13 +942,13 @@ static int run_all_tests(void) {
 
         /* 多目录: ';' 分隔, 按顺序扫描; 重名先到先得 (同一根内与跨根都去重) */
         {
-            char d[MAX_PATH];
+            char d[PATHSZ];
             /* CreateDirectoryW 不建父级, 父目录排在子目录之前 */
             const char *dirs[] = { "skills2", "skills\\demo2", "skills\\other",
                                    "skills2\\deep", "skills2\\demo" };
             for (int i = 0; i < 4; i++) {
                 snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
-                if (utf8_to_wide(d, w, MAX_PATH)) CreateDirectoryW(w, NULL);
+                if (utf8_to_wide(d, w, (int)sizeof(w))) CreateDirectoryW(w, NULL);
             }
         }
         tool_write_file("skills\\demo2\\SKILL.md",
@@ -993,20 +996,21 @@ static int run_all_tests(void) {
         test_ws_rm("skills2\\deep\\SKILL.md");
         test_ws_rm("skills2\\demo\\SKILL.md");
         {
-            char d[MAX_PATH];
+            char d[PATHSZ];
             const char *dirs[] = { "skills\\demo", "skills\\demo2", "skills\\other",
                                    "skills2\\deep", "skills2\\demo", "skills2" };
             for (int i = 0; i < 6; i++) {
                 snprintf(d, sizeof(d), "%s\\%s", g_test_ws, dirs[i]);
-                if (utf8_to_wide(d, w, MAX_PATH)) RemoveDirectoryW(w);
+                if (utf8_to_wide(d, w, (int)sizeof(w))) RemoveDirectoryW(w);
             }
         }
         {
-            char d2[MAX_PATH];
-            wchar_t w2[MAX_PATH];
-            snprintf(d2, sizeof(d2), "%s\\demo", sdir);
-            if (utf8_to_wide(d2, w2, MAX_PATH)) RemoveDirectoryW(w2);
-            if (utf8_to_wide(sdir, w2, MAX_PATH)) RemoveDirectoryW(w2);
+            char d2[PATHSZ];
+            wchar_t w2[PATHSZ];
+            path_copy(d2, sizeof(d2), sdir);
+            path_append(d2, sizeof(d2), "\\demo");
+            if (utf8_to_wide(d2, w2, (int)sizeof(w2))) RemoveDirectoryW(w2);
+            if (utf8_to_wide(sdir, w2, (int)sizeof(w2))) RemoveDirectoryW(w2);
         }
         test_ws_end();
     }

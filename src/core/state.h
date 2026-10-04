@@ -16,6 +16,55 @@
 #define ARGS_DISPLAY_MAX 8192        /* 界面 [Tool] 行 arguments 展示上限 (执行与回传不受影响) */
 #define TOOL_OUTPUT_CAP (16 * 1024)  /* 单个工具结果进入上下文的上限, 超出即截断 */
 #define EDIT_MAX_BYTES  (2 * 1024 * 1024) /* edit_file 可处理的最大文件体积 */
+/* 请求体缓冲: 内容是 messages(<= BUFSZ) 再套一层 JSON 框架并拼上 model 与 TOOLS_JSON,
+ * 所以必须**大于** BUFSZ —— 用 BUFSZ 装会触发 -Wformat-truncation, 而且真截断时
+ * 发出去的是半截 JSON (服务端只会回 400 invariant), 属于"静默失败"里最糟的一种。
+ * 8KB 余量远大于框架+工具表的实际长度, 使截断在数学上不可能发生。 */
+#define BODY_SZ         (BUFSZ + 8192)
+
+/* 路径缓冲尺寸约定 —— 消除 -Wformat-truncation 的根因:
+ * MAX_PATH(260) 是 Windows **单个路径分量**的上限, 但代码里到处在做
+ * "<目录> + <子目录/文件名>" 的二次拼接, 结果天然可能超过 260。用 260 的缓冲去接,
+ * 一是 GCC -Wformat-truncation=2 会告警 (它按声明大小估算源串长度, 259+259 > 259),
+ * 二是真超长时 snprintf 只静静截断, 留下一条"看起来合法"的半截路径, 后续
+ * CreateFile/DeleteFile 会操作到错误的目录 —— 这比报错更危险。故约定:
+ *   - 输入侧 (exe 目录、FindFirst 文件名等天然 <= MAX_PATH 的) 仍用 MAX_PATH;
+ *   - 拼接结果一律用 PATHSZ: 259 + 259 + 1 装得下, snprintf 的输出长度有证可依。
+ * 代价只是栈上多 260 字节 (函数内局部) / 全局表多几十 KB, 可忽略。 */
+#define PATHSZ (MAX_PATH * 2)
+
+/* ===== 路径拼接 (不用 snprintf("%s%s")) =====
+ * 两种场景 snprintf 都不合适:
+ *   - 目标是运行时 cap 的参数缓冲时, GCC 无法证明放得下, 只能告警;
+ *   - 截断后留下的是半截路径, 看起来合法, 比显式失败更危险。
+ * 这里先算长度再拷: 放不下就返回 0 并把 out 置空 —— 空路径转宽字符 / 打开文件
+ * 都会失败, 调用方自然跳过该项, 不会误伤真实文件。 */
+static int path_copy(char *out, size_t cap, const char *s) {
+    size_t n = strlen(s);
+    if (cap == 0) return 0;
+    if (n + 1 > cap) { out[0] = '\0'; return 0; }
+    memcpy(out, s, n + 1);
+    return 1;
+}
+
+/* 在上一段之后继续追加 (out 需已有内容; 失败同样置空) */
+static int path_append(char *out, size_t cap, const char *s) {
+    size_t lo = strlen(out), ls = strlen(s);
+    if (cap == 0) return 0;
+    if (lo + ls + 1 > cap) { out[0] = '\0'; return 0; }
+    memcpy(out + lo, s, ls + 1);
+    return 1;
+}
+
+/* 定长拷贝并**允许**截断: 用于"目标本就比源短"的刻意截断 (如技能名索引只取前 N 字符)。
+ * 总是 NUL 结尾, 不返回失败 —— 调用方要的就是截断后的前缀。 */
+static void str_copy_into(char *out, size_t cap, const char *s) {
+    size_t n = strlen(s);
+    if (cap == 0) return;
+    if (n + 1 > cap) n = cap - 1;
+    memcpy(out, s, n);
+    out[n] = '\0';
+}
 
 /* ===== 全局状态 ===== */
 static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
@@ -34,7 +83,7 @@ static char g_touched_files[1024] = "";
 
 /* Agent 工作缓冲(只在工作线程使用,主线程不碰) */
 static char messages[BUFSZ];
-static char body[BUFSZ];
+static char body[BODY_SZ];      /* 请求体: 见 BODY_SZ, 比其它三块多 8KB 的 JSON 框架余量 */
 static char resp[BUFSZ];
 static char tool_out[BUFSZ];
 

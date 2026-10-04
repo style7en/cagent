@@ -51,7 +51,7 @@ static void get_exe_dir_utf8(char *out, size_t cap) {
 static void normalize_workspace(void) {
     if (!g_workspace[0]) return;
 
-    char cand[MAX_PATH];
+    char cand[PATHSZ];
     int absolute = (g_workspace[0] == '\\' || g_workspace[0] == '/' ||
                     (g_workspace[0] && g_workspace[1] == ':'));
     if (absolute) {
@@ -63,12 +63,12 @@ static void normalize_workspace(void) {
         snprintf(cand, sizeof(cand), "%s\\%s", exedir, g_workspace);
     }
 
-    wchar_t win[MAX_PATH], wout[MAX_PATH];
-    if (!utf8_to_wide(cand, win, MAX_PATH)) return;
-    DWORD n = GetFullPathNameW(win, MAX_PATH, wout, NULL);
-    if (n == 0 || n >= MAX_PATH) return;
+    wchar_t win[PATHSZ], wout[PATHSZ];
+    if (!utf8_to_wide(cand, win, (int)sizeof(win))) return;
+    DWORD n = GetFullPathNameW(win, PATHSZ, wout, NULL);
+    if (n == 0 || n >= PATHSZ) return;
 
-    char out[MAX_PATH];
+    char out[PATHSZ];
     if (WideCharToMultiByte(CP_UTF8, 0, wout, -1, out, sizeof(out), NULL, NULL) <= 0) return;
 
     /* 去掉结尾反斜杠, 与 get_exe_dir_utf8 保持一致。但 "C:\" 不能剥成 "C:" ——
@@ -78,7 +78,7 @@ static void normalize_workspace(void) {
 
     if (strcmp(out, g_workspace) != 0) {           /* 只在真的变了时记一次 (归一化后即幂等) */
         log_line("[ws] workspace 归一化: %s -> %s", g_workspace, out);
-        snprintf(g_workspace, sizeof(g_workspace), "%s", out);
+        path_copy(g_workspace, sizeof(g_workspace), out);
     }
 }
 

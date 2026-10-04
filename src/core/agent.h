@@ -553,9 +553,17 @@ static void agent_turn(const char *user_msg) {
         }
         iter++;
 
-        snprintf(body, BUFSZ,
+        int blen = snprintf(body, sizeof(body),
             "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true}",
             g_model, messages, TOOLS_JSON);
+        if (blen < 0 || (size_t)blen >= sizeof(body)) {
+            /* BODY_SZ 的余量让这在数学上不可能发生; 真发生了也绝不能把半截 JSON
+             * 发出去 —— 服务端只会回一个看不懂的 400。停本轮并留痕, 由用户压缩会话。 */
+            log_line("[http] 请求体需要 %d 字节 > 上限 %d, 本轮中止", blen, (int)sizeof(body));
+            append_text("(请求体超出上限, 本轮已中止; 请压缩或另开会话)\r\n");
+            reason = "请求体超出上限 (未发送)";
+            goto done;
+        }
         if (log_check_utf8("请求体", body, strlen(body))) {
             /* 本地预检发现非法 UTF-8: 拦截不发送 —— 发出去也只会被服务端 400
              * invalid unicode 拒掉。坏字节偏移/消息序号在上面的 [utf8] 行里,

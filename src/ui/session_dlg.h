@@ -8,7 +8,7 @@
 
 static HWND g_sess_dlg   = NULL;
 static HWND g_sess_owner = NULL;
-static char g_sess_paths[64][MAX_PATH];
+static char g_sess_paths[64][PATHSZ];   /* 会话目录 + 文件名, 见 state.h 的 PATHSZ 说明 */
 static char g_sess_ws[64][200];      /* 第一行: 工作目录 */
 static char g_sess_sub[64][300];     /* 第二行: N 条消息 · 时间 · 预览 */
 static int  g_sess_n = 0;
@@ -48,10 +48,10 @@ static void ws_from_filename(const char *path, char *out, size_t cap) {
  * dir 需以 \ 结尾。 */
 static int sess_enumerate(const char *dir) {
     g_sess_n = 0;
-    char pat[MAX_PATH];
+    char pat[PATHSZ];
     snprintf(pat, sizeof(pat), "%shistory_*.json", dir);
-    wchar_t wpat[MAX_PATH];
-    if (!utf8_to_wide(pat, wpat, MAX_PATH)) return 0;
+    wchar_t wpat[PATHSZ];
+    if (!utf8_to_wide(pat, wpat, (int)sizeof(wpat))) return 0;
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wpat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -59,7 +59,8 @@ static int sess_enumerate(const char *dir) {
         if (g_sess_n >= 64) break;
         char name[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof(name), NULL, NULL);
-        snprintf(g_sess_paths[g_sess_n], MAX_PATH, "%s%s", dir, name);
+        path_copy(g_sess_paths[g_sess_n], sizeof(g_sess_paths[g_sess_n]), dir);
+        path_append(g_sess_paths[g_sess_n], sizeof(g_sess_paths[g_sess_n]), name);
 
         char ws[160], prev[200];
         int cnt = 0;

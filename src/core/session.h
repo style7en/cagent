@@ -10,8 +10,9 @@
 static void get_app_path(char *out, size_t cap, const char *filename) {
     char dir[MAX_PATH];
     get_exe_dir_utf8(dir, sizeof(dir));
-    if (dir[0]) snprintf(out, cap, "%s\\%s", dir, filename);
-    else        snprintf(out, cap, "%s", filename);
+    if (!dir[0]) { path_copy(out, cap, filename); return; }
+    if (path_copy(out, cap, dir) && path_append(out, cap, "\\"))
+        path_append(out, cap, filename);
 }
 
 static void get_ini_path(char *out, size_t cap)     { get_app_path(out, cap, "cagent.ini"); }
@@ -21,17 +22,17 @@ static void get_ini_path(char *out, size_t cap)     { get_app_path(out, cap, "ca
 static void sessions_dir(char *out, size_t cap) {
     char base[MAX_PATH];
     get_app_path(base, sizeof(base), "");
-    char dir[MAX_PATH];
-    snprintf(dir, sizeof(dir), "%ssessions", base);
+    char dir[PATHSZ];
+    snprintf(dir, sizeof(dir), "%ssessions", base);   /* base <= 259 + 8 -> 267 < PATHSZ */
 
     int ok = 0;
-    wchar_t wdir[MAX_PATH];
-    if (utf8_to_wide(dir, wdir, MAX_PATH)) {
+    wchar_t wdir[PATHSZ];
+    if (utf8_to_wide(dir, wdir, (int)sizeof(wdir))) {
         CreateDirectoryW(wdir, NULL);                 /* 已存在会失败, 忽略 */
         DWORD attr = GetFileAttributesW(wdir);
         ok = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
     }
-    snprintf(out, cap, "%s", ok ? dir : base);
+    path_copy(out, cap, ok ? dir : base);
 
     size_t n = strlen(out);
     if (n > 0 && out[n - 1] != '\\' && n + 1 < cap) { out[n] = '\\'; out[n + 1] = '\0'; }
@@ -40,14 +41,14 @@ static void sessions_dir(char *out, size_t cap) {
 /* 把散落在 exe 目录的旧会话 (history_*.json) 一次性搬进 sessions\。
  * 只移动不改内容; 目标已存在则跳过 (不覆盖); 同步更新 ini 里记录的 last_session。 */
 static CAGENT_MAYBE_UNUSED void migrate_legacy_sessions(void) {
-    char root[MAX_PATH], dstdir[MAX_PATH], pat[MAX_PATH];
+    char root[MAX_PATH], dstdir[MAX_PATH], pat[PATHSZ];
     get_app_path(root, sizeof(root), "");
     sessions_dir(dstdir, sizeof(dstdir));
     if (strcmp(root, dstdir) == 0) return;            /* 退回模式: 无处可搬 */
 
     snprintf(pat, sizeof(pat), "%shistory_*.json", root);
-    wchar_t wpat[MAX_PATH];
-    if (!utf8_to_wide(pat, wpat, MAX_PATH)) return;
+    wchar_t wpat[PATHSZ];
+    if (!utf8_to_wide(pat, wpat, (int)sizeof(wpat))) return;
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wpat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -55,15 +56,16 @@ static CAGENT_MAYBE_UNUSED void migrate_legacy_sessions(void) {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         char name[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof(name), NULL, NULL);
-        char src[MAX_PATH], dst[MAX_PATH];
+        char src[PATHSZ], dst[PATHSZ];
         snprintf(src, sizeof(src), "%s%s", root, name);
         snprintf(dst, sizeof(dst), "%s%s", dstdir, name);
-        wchar_t wsrc[MAX_PATH], wdst[MAX_PATH];
-        if (!utf8_to_wide(src, wsrc, MAX_PATH) || !utf8_to_wide(dst, wdst, MAX_PATH)) continue;
+        wchar_t wsrc[PATHSZ], wdst[PATHSZ];
+        if (!utf8_to_wide(src, wsrc, (int)sizeof(wsrc)) ||
+            !utf8_to_wide(dst, wdst, (int)sizeof(wdst))) continue;
         if (GetFileAttributesW(wdst) != INVALID_FILE_ATTRIBUTES) continue;   /* 已搬过 */
         if (!MoveFileW(wsrc, wdst)) continue;                                  /* 没权限等, 留在原地 */
         if (g_last_session[0] && strcmp(g_last_session, src) == 0)
-            snprintf(g_last_session, sizeof(g_last_session), "%s", dst);
+            path_copy(g_last_session, sizeof(g_last_session), dst);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -74,10 +76,10 @@ static CAGENT_MAYBE_UNUSED void migrate_legacy_sessions(void) {
 static CAGENT_MAYBE_UNUSED void cleanup_orphan_session_backups(void) {
     char dir[MAX_PATH];
     sessions_dir(dir, sizeof(dir));                    /* 含结尾 \ */
-    char pat[MAX_PATH];
+    char pat[PATHSZ];
     snprintf(pat, sizeof(pat), "%shistory_*", dir);    /* 主文件与两种备份都落在这个前缀下 */
-    wchar_t wpat[MAX_PATH];
-    if (!utf8_to_wide(pat, wpat, MAX_PATH)) return;
+    wchar_t wpat[PATHSZ];
+    if (!utf8_to_wide(pat, wpat, (int)sizeof(wpat))) return;
 
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wpat, &fd);
@@ -95,16 +97,16 @@ static CAGENT_MAYBE_UNUSED void cleanup_orphan_session_backups(void) {
         else if (nl > 12 && strcmp(name + nl - 12, ".pre_compact") == 0) suffix = ".pre_compact";
         if (!suffix) continue;                         /* .json 主文件本身, 不动 */
 
-        char base[MAX_PATH];
+        char base[PATHSZ];
         snprintf(base, sizeof(base), "%s%.*s", dir, (int)(nl - strlen(suffix)), name);
-        wchar_t wbase[MAX_PATH];
-        if (!utf8_to_wide(base, wbase, MAX_PATH)) continue;
+        wchar_t wbase[PATHSZ];
+        if (!utf8_to_wide(base, wbase, (int)sizeof(wbase))) continue;
         if (GetFileAttributesW(wbase) != INVALID_FILE_ATTRIBUTES) continue;   /* 主文件还在 */
 
-        char victim[MAX_PATH];
+        char victim[PATHSZ];
         snprintf(victim, sizeof(victim), "%s%s", dir, name);
-        wchar_t wv[MAX_PATH];
-        if (utf8_to_wide(victim, wv, MAX_PATH) && DeleteFileW(wv)) removed++;
+        wchar_t wv[PATHSZ];
+        if (utf8_to_wide(victim, wv, (int)sizeof(wv)) && DeleteFileW(wv)) removed++;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     if (removed) log_line("[session] 已清理 %d 个孤儿备份 (对应的会话文件已不存在)", removed);
@@ -149,7 +151,9 @@ static void build_new_session_path(char *out, size_t cap) {
             snprintf(name, sizeof(name), "%s_%lld.json", base, (long long)time(NULL));
         else
             snprintf(name, sizeof(name), "%s_%lld_%d.json", base, (long long)time(NULL), n);
-        snprintf(out, cap, "%s%s", dir, name);
+        /* out 的 cap 由调用方决定, 用拼接助手: 放不下时 out 置空, 下面 fopen 失败即退出 */
+        path_copy(out, cap, dir);
+        path_append(out, cap, name);
         FILE *test = fopen_utf8(out, "rb");
         if (!test) return;                     /* 不存在 -> 可用 */
         fclose(test);

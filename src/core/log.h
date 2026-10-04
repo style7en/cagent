@@ -34,10 +34,11 @@ static int utf8_to_wide(const char *u8, wchar_t *out, int cap);         /* 定�
  * dirlog 形如 "<exe目录>\log\" (已含结尾反斜杠)。全程走宽字符: 非 ASCII 安装路径
  * (中文目录) 下 ANSI 版 API 会静默失败, 与项目其余部分 (utf8_to_wide/fopen_utf8) 不一致。 */
 static int log_purge(const char *dirlog, const char *pattern, const FILETIME *cutoff) {
-    char pat[MAX_PATH];
-    snprintf(pat, sizeof(pat), "%s%s", dirlog, pattern);
-    wchar_t wpat[MAX_PATH];
-    if (!utf8_to_wide(pat, wpat, MAX_PATH)) return 0;
+    char pat[PATHSZ];
+    path_copy(pat, sizeof(pat), dirlog);
+    path_append(pat, sizeof(pat), pattern);
+    wchar_t wpat[PATHSZ];
+    if (!utf8_to_wide(pat, wpat, (int)sizeof(wpat))) return 0;
 
     ULARGE_INTEGER co;
     co.LowPart = cutoff->dwLowDateTime; co.HighPart = cutoff->dwHighDateTime;
@@ -55,9 +56,9 @@ static int log_purge(const char *dirlog, const char *pattern, const FILETIME *cu
 
         char name[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof(name), NULL, NULL);
-        char victim[MAX_PATH];
+        char victim[PATHSZ];
         snprintf(victim, sizeof(victim), "%s%s", dirlog, name);
-        wchar_t wvictim[MAX_PATH];
+        wchar_t wvictim[PATHSZ];
         if (utf8_to_wide(victim, wvictim, MAX_PATH) && DeleteFileW(wvictim)) removed++;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -68,8 +69,8 @@ static int log_purge(const char *dirlog, const char *pattern, const FILETIME *cu
  * 留档只为近期排查, 而日志默认开启且永不轮转, 不清会无限增长。按写入时间判定,
  * 不解析文件名 (文件名日期一旦改格式就不该连带失效)。 */
 static int log_housekeep(const char *dir) {
-    char dirlog[MAX_PATH];
-    snprintf(dirlog, sizeof(dirlog), "%slog\\", dir);
+    char dirlog[PATHSZ];
+    snprintf(dirlog, sizeof(dirlog), "%slog\\", dir);   /* dir <= 259 + 4 -> 263 < PATHSZ */
 
     FILETIME nowft;
     GetSystemTimeAsFileTime(&nowft);                       /* 与 FindFirstFile 同为 UTC */
@@ -90,10 +91,10 @@ static void log_line(const char *fmt, ...) {
     char dir[MAX_PATH];
     get_app_path(dir, sizeof(dir), "");
     if (!g_log_dir_ok) {
-        char d[MAX_PATH];
+        char d[PATHSZ];
         snprintf(d, sizeof(d), "%slog", dir);
-        wchar_t wd[MAX_PATH];
-        if (utf8_to_wide(d, wd, MAX_PATH) &&
+        wchar_t wd[PATHSZ];
+        if (utf8_to_wide(d, wd, (int)sizeof(wd)) &&
             (CreateDirectoryW(wd, NULL) || GetLastError() == ERROR_ALREADY_EXISTS))
             g_log_dir_ok = 1;
         else
@@ -107,7 +108,7 @@ static void log_line(const char *fmt, ...) {
     }
     SYSTEMTIME st;
     GetLocalTime(&st);
-    char path[MAX_PATH];
+    char path[PATHSZ];
     snprintf(path, sizeof(path), "%slog\\cagent_%04d%02d%02d.log",
              dir, st.wYear, st.wMonth, st.wDay);
 
@@ -205,7 +206,7 @@ static void log_dump_request(const char *payload, size_t len) {
     get_app_path(dir, sizeof(dir), "");
     SYSTEMTIME st;
     GetLocalTime(&st);
-    char path[MAX_PATH];
+    char path[PATHSZ];
     for (int attempt = 0; attempt < 1000; attempt++) {
         snprintf(path, sizeof(path),
                  "%slog\\request_fail_%04d%02d%02d_%02d%02d%02d_%ld.json",
