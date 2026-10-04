@@ -39,6 +39,8 @@ static CAGENT_MAYBE_UNUSED void config_load(void) {
         }
         else if (strcmp(key, "model") == 0)
             snprintf(g_model, sizeof(g_model), "%s", val);
+        else if (strcmp(key, "max_tokens") == 0)
+            g_max_tokens = atoi(val);   /* 单次回复输出预算 (token); 默认见 state.h, 0=不下发 */
         else if (strcmp(key, "skip_cert_verify") == 0)
             g_skip_cert_verify = (atoi(val) != 0);
         else if (strcmp(key, "context_tokens") == 0)
@@ -73,6 +75,7 @@ static CAGENT_MAYBE_UNUSED void config_save(void) {
         if (enc) { fprintf(f, "api_key=%s\r\n", enc); free(enc); }
     }
     fprintf(f, "model=%s\r\n",    g_model);
+    fprintf(f, "max_tokens=%d\r\n", g_max_tokens);
     fprintf(f, "skip_cert_verify=%d\r\n", g_skip_cert_verify);
     fprintf(f, "context_tokens=%ld\r\n", g_context_tokens);
     fprintf(f, "workspace=%s\r\n", g_workspace);

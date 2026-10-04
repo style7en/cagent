@@ -70,6 +70,8 @@ static void str_copy_into(char *out, size_t cap, const char *s) {
 static char g_api_url[1024] = "";      /* 例: https://token.sensenova.cn/v1 */
 static char g_api_key[512]  = "";
 static char g_model[128]    = "";
+static int  g_max_tokens    = 65536; /* 单次回复输出预算 (ini: max_tokens); 0 = 不下发该字段。
+                                      * 默认按 agnes-2.5-flash 规格: 最大输出 64K token */
 static int g_key_decrypt_failed = 0;   /* DPAPI 解密失败标志, 启动后提示 */
 static int g_skip_cert_verify = 0;     /* 1=跳过 SSL 证书校验 (自签端点用) */
 static char g_workspace[MAX_PATH] = "";/* 工作目录 (文件工具限制在此目录内, 默认 exe 目录) */

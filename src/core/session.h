@@ -317,6 +317,65 @@ static void history_save(void) {
     snprintf(g_last_session, sizeof(g_last_session), "%s", path);
 }
 
+/* 就地净化 messages 里 tool_calls 的非法 arguments。旧版 BUG-1 (截断的 tool_call
+ * 原样写回) 曾把 "arguments":"" / 半截 JSON 存进会话文件; 服务端要求历史里
+ * tool_calls.arguments 必须是合法 JSON, 坏值会让恢复后的每轮请求都 400, 而
+ * 请求失败不回滚 —— 会话永久卡死。与 utf8_sanitize_inplace 同理: 载入即净化。
+ * 扫描结构级的 "arguments":" 字面量 (转义文本中的 \" 形式不会被误匹配),
+ * 反转义后用 json_parse 校验, 非法者把字面量内容替换为 "{}"。返回修复个数。 */
+static CAGENT_MAYBE_UNUSED size_t heal_bad_tool_args(char *msgs) {
+    size_t healed = 0;
+    char *p = msgs;
+    while ((p = strstr(p, "\"arguments\":\"")) != NULL) {
+        char *val = p + strlen("\"arguments\":\"");
+        char *q = val;                       /* 找字面量收尾: 跳过转义对, 首个裸 " 结束 */
+        while (*q && *q != '"') {
+            if (*q == '\\' && q[1]) q += 2; else q++;
+        }
+        if (*q != '"') { p = val; continue; }/* 未闭合: 留给上层 JSON 校验报错 */
+        size_t rlen = (size_t)(q - val);     /* 转义形式长度 */
+        char *tmp = (char*)malloc(rlen + 1); /* 反转义只会变短, 上限即 rlen */
+        if (!tmp) break;
+        size_t w = 0;
+        for (size_t r = 0; r < rlen; ) {
+            if (val[r] == '\\' && r + 1 < rlen) {
+                char e = val[r + 1]; r += 2;
+                switch (e) {
+                case '"':  tmp[w++] = '"';  break;
+                case '\\': tmp[w++] = '\\'; break;
+                case '/':  tmp[w++] = '/';  break;
+                case 'b':  tmp[w++] = '\b'; break;
+                case 'f':  tmp[w++] = '\f'; break;
+                case 'n':  tmp[w++] = '\n'; break;
+                case 'r':  tmp[w++] = '\r'; break;
+                case 't':  tmp[w++] = '\t'; break;
+                case 'u':                    /* 校验用途无需真转码, 跳过 4 位十六进制 */
+                    if (r + 4 <= rlen) r += 4;
+                    tmp[w++] = '?';
+                    break;
+                default:   tmp[w++] = e;    break;
+                }
+            } else tmp[w++] = val[r++];
+        }
+        tmp[w] = '\0';
+        JValue *aj = json_parse(tmp);
+        if (!aj || aj->type != J_OBJ) {
+            /* 非法: "..." 内容替换为 "{}"。闭引号 (q 处) 必须随尾部一起搬到 val+2,
+             * 搬运源从 q 开始 (含引号); 从 q+1 开始会丢引号, 结构直接损坏。 */
+            memmove(val + 2, q, strlen(q) + 1);
+            memcpy(val, "{}", 2);
+            healed++;
+            p = val + 2;                     /* 从替换点之后继续扫 */
+            log_line("[session] 净化非法 tool_call arguments (原 %zu 字节 -> {})", rlen);
+        } else {
+            p = q + 1;
+        }
+        json_free(aj);
+        free(tmp);
+    }
+    return healed;
+}
+
 /* 读取单个历史文件并重建 messages + 工作目录。返回 1 成功。 */
 static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
     FILE *f = fopen_utf8(path, "rb");
@@ -340,6 +399,10 @@ static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
         size_t healed = utf8_sanitize_inplace(messages);
         if (healed)
             log_line("[utf8] 载入的会话含非法 UTF-8: 已就地净化 %zu 字节 (%s)", healed, path);
+        size_t fixed_args = heal_bad_tool_args(messages);
+        if (fixed_args)
+            log_line("[session] 载入的会话含 %zu 处非法 tool_call arguments, 已净化 (%s)",
+                     fixed_args, path);
         snprintf(g_history_file, sizeof(g_history_file), "%s", path); /* 绑定本对话到该文件 */
         snprintf(g_last_session, sizeof(g_last_session), "%s", path);
     }

@@ -13,6 +13,7 @@ typedef struct { char user_msg[BUFSZ]; } AgentTask;
 typedef struct {
     char id[256]; char name[64]; char args[ARGS_MAX]; char *output;
     int too_big;   /* arguments 超上限: 不执行, 回填占位 "{}" + 原因交回模型 */
+    int bad_json;  /* arguments 非合法 JSON (疑似被长度上限截断): 不执行, 降级占位 "{}" + 原因 */
 } AgentToolCall;
 
 /* 内置默认系统提示词正文 (单行原文)。内容不含引号与反斜杠, 可直接作为 JSON 字符串值,
@@ -160,6 +161,16 @@ static void chat_completions_url(char *out, size_t cap) {
     size_t nurl = strlen(g_api_url);
     snprintf(out, cap, "%s%schat/completions", g_api_url,
              (nurl > 0 && g_api_url[nurl - 1] == '/') ? "" : "/");
+}
+
+/* 请求体的 max_tokens 片段 (agent_turn 与上下文压缩共用)。
+ * 必须显式下发: 缺省时服务端/中转自用保守默认 (常见 1024-4096), 而本模型是
+ * 推理模型, 思考 token 又先消耗输出预算 —— 模型刚开始内联大文件就被
+ * finish=length 掐断, 这是截断问题的根源。g_max_tokens<=0 时输出空串,
+ * 不发该字段, 保持旧行为。 */
+static void max_tokens_frag(char *out, size_t cap) {
+    if (g_max_tokens > 0) snprintf(out, cap, ",\"max_tokens\":%d", g_max_tokens);
+    else out[0] = '\0';
 }
 
 /* ===== messages 遍历辅助 (压缩按"整条消息"操作, 避免拆散 assistant/tool 配对) =====
@@ -366,11 +377,13 @@ static int compact_via_summary(int halve) {
     free(esc_ask);
     if (rn <= 0 || (size_t)rn >= rcap) { free(req_msgs); return 0; }
 
-    size_t bcap = (size_t)rn + strlen(g_model) + 128;
+    size_t bcap = (size_t)rn + strlen(g_model) + 192;   /* 192 含 ,"max_tokens":N 余量 */
     char *bodybuf = (char*)malloc(bcap);
     if (!bodybuf) { free(req_msgs); return 0; }
-    snprintf(bodybuf, bcap, "{\"model\":\"%s\",\"messages\":[%s],\"stream\":true}",
-             g_model, req_msgs);
+    char mt_frag[48];
+    max_tokens_frag(mt_frag, sizeof(mt_frag));
+    snprintf(bodybuf, bcap, "{\"model\":\"%s\",\"messages\":[%s],\"stream\":true%s}",
+             g_model, req_msgs, mt_frag);
     free(req_msgs);
 
     char url[1280];
@@ -553,9 +566,11 @@ static void agent_turn(const char *user_msg) {
         }
         iter++;
 
+        char mt_frag[48];
+        max_tokens_frag(mt_frag, sizeof(mt_frag));
         int blen = snprintf(body, sizeof(body),
-            "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true}",
-            g_model, messages, TOOLS_JSON);
+            "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true%s}",
+            g_model, messages, TOOLS_JSON, mt_frag);
         if (blen < 0 || (size_t)blen >= sizeof(body)) {
             /* BODY_SZ 的余量让这在数学上不可能发生; 真发生了也绝不能把半截 JSON
              * 发出去 —— 服务端只会回一个看不懂的 400。停本轮并留痕, 由用户压缩会话。 */
@@ -733,10 +748,26 @@ static void agent_turn(const char *user_msg) {
             snprintf(c->id,   sizeof(c->id),   "%s", ctx->calls[i].id);
             snprintf(c->name, sizeof(c->name), "%s", ctx->calls[i].name);
             c->too_big = ctx->calls[i].args_overflow;
-            if (c->too_big)
+            if (c->too_big) {
                 snprintf(c->args, sizeof(c->args), "{}");                    /* 残缺 JSON 不回传, 用占位 */
-            else
-                snprintf(c->args, sizeof(c->args), "%s", ctx->calls[i].args);/* 旧的写法先整段拷 256KB 再被覆盖 */
+            } else {
+                /* BUG-1 修复: arguments 若不是合法 JSON 对象 (典型为 finish=length 截断成
+                 * 空串/半截), 不能原样写回 messages —— 服务端会校验历史 tool_calls.arguments
+                 * 必须为合法 JSON, 否则下一轮请求直接 400。降级为"未执行"占位。 */
+                const char *raw = ctx->calls[i].args;
+                JValue *aj = json_parse(raw);   /* 空串/NULL 解析失败 -> 走 bad_json 降级 */
+                if (aj && aj->type == J_OBJ) {
+                    snprintf(c->args, sizeof(c->args), "%s", raw);           /* 合法: 原样保留 */
+                } else {
+                    c->bad_json = 1;
+                    snprintf(c->args, sizeof(c->args), "{}");                /* 占位, 避免把坏串写进历史 */
+                    log_line("[tool] arguments 非法 JSON: name=%s finish=%s len=%zu 疑似截断=%d",
+                             c->name, ctx->finish[0] ? ctx->finish : "-",
+                             strlen(raw), strcmp(ctx->finish, "length") == 0);
+                    log_line("[tool] arguments 原文: %s", raw[0] ? raw : "(空)");
+                }
+                json_free(aj);
+            }
         }
         if (n_calls == 0 && ctx->n_dropped == 0) {
             log_line("[http] 200 但 tool_calls 无法还原: finish=%s iter=%d data_lines=%d bad_json=%d sse_head=%s",
@@ -768,6 +799,22 @@ static void agent_turn(const char *user_msg) {
                          "分段修改, 或用 execute_bash 分批写入)", (int)(ARGS_MAX / 1024));
                 log_line("[tool] 拒绝执行: name=%s arguments 超过 %dKB 上限",
                          c->name, (int)(ARGS_MAX / 1024));
+            } else if (c->bad_json) {
+                /* BUG-1 修复: arguments 非合法 JSON (典型 finish=length 截断成空串/半截),
+                 * 拒绝执行, 把原因交回模型让它重新生成; arguments 已降级为占位 "{}", 不污染历史。 */
+                int truncated = (strcmp(ctx->finish, "length") == 0);
+                char msg[512];
+                snprintf(msg, sizeof(msg),
+                         "[Tool] %s -> 未执行 (arguments 不是合法 JSON%s)\r\n",
+                         c->name, truncated ? " (疑似被长度上限截断)" : "");
+                append_text(msg);
+                snprintf(tool_out, sizeof(tool_out),
+                         "(未执行: %s 的 arguments 不是合法 JSON%s, 已拒绝; 请完整重新发出该调用 "
+                         "(包含全部必需参数, 不要省略或发空对象); 参数过大就分段写, "
+                         "改大文件优先用 edit_file 定点补全)",
+                         c->name, truncated ? " (疑似被长度上限截断)" : "");
+                log_line("[tool] 拒绝执行: name=%s arguments 非法 JSON (疑似截断=%d)",
+                         c->name, truncated);
             } else {
                 /* [Tool] 提示行按展示上限堆分配, 不占栈; 执行与回传仍是完整参数。
                  * 摘要必须按字符边界截取 (utf8_safe_copy): 旧的 %.8192s 会切半汉字,
