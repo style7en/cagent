@@ -19,7 +19,11 @@ CFLAGS  = -Wall -Wextra -Wshadow -Wformat=2 -Wlogical-op \
           -Wvla -Wundef -Wstrict-prototypes \
           -Werror=implicit-function-declaration -Werror=incompatible-pointer-types \
           -fstack-protector-strong -Os
-LDFLAGS = -s -Wl,--nxcompat -Wl,--dynamicbase -Wl,--high-entropy-va
+# -Wl,-Bstatic -lssp ... : -fstack-protector-strong 在 MinGW 上会链到 libssp-0.dll,
+#   导致 exe 脱离编译环境后报 "找不到 libssp-0.dll" (本项目的 exe 需单文件可分发)。
+#   工具链自带静态 libssp.a, 显式优先静态链接即可去掉这个运行时依赖。
+LDFLAGS = -s -Wl,--nxcompat -Wl,--dynamicbase -Wl,--high-entropy-va \
+          -Wl,-Bstatic -lssp -Wl,-Bdynamic
 
 # 源码全部在 src/, 资源在 res/, 回归测试在 test/; 编译产物留在仓库根 ——
 # 程序的"数据根"就是 exe 所在目录 (core/session.h 的 get_exe_dir_utf8 用它定位
