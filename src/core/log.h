@@ -35,8 +35,8 @@ static int utf8_to_wide(const char *u8, wchar_t *out, int cap);         /* 定�
  * (中文目录) 下 ANSI 版 API 会静默失败, 与项目其余部分 (utf8_to_wide/fopen_utf8) 不一致。 */
 static int log_purge(const char *dirlog, const char *pattern, const FILETIME *cutoff) {
     char pat[PATHSZ];
-    path_copy(pat, sizeof(pat), dirlog);
-    path_append(pat, sizeof(pat), pattern);
+    if (!path_copy(pat, sizeof(pat), dirlog) ||
+        !path_append(pat, sizeof(pat), pattern)) return 0;   /* 拼不上就放弃清理, 不静默用半截 pattern */
     wchar_t wpat[PATHSZ];
     if (!utf8_to_wide(pat, wpat, (int)sizeof(wpat))) return 0;
 
@@ -59,7 +59,7 @@ static int log_purge(const char *dirlog, const char *pattern, const FILETIME *cu
         char victim[PATHSZ];
         snprintf(victim, sizeof(victim), "%s%s", dirlog, name);
         wchar_t wvictim[PATHSZ];
-        if (utf8_to_wide(victim, wvictim, MAX_PATH) && DeleteFileW(wvictim)) removed++;
+        if (utf8_to_wide(victim, wvictim, (int)sizeof(wvictim)) && DeleteFileW(wvictim)) removed++;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     return removed;

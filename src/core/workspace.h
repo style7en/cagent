@@ -77,6 +77,11 @@ static void normalize_workspace(void) {
     while (len > 2 && (out[len-1] == '\\' || out[len-1] == '/')) out[--len] = '\0';
 
     if (strcmp(out, g_workspace) != 0) {           /* 只在真的变了时记一次 (归一化后即幂等) */
+        if (len >= sizeof(g_workspace)) {          /* 归一化结果放不下: 保留原值, 不清空配置 */
+            log_line("[ws] workspace 归一化结果超出缓冲上限 (%d 字符), 保留原值: %s",
+                     (int)sizeof(g_workspace) - 1, g_workspace);
+            return;
+        }
         log_line("[ws] workspace 归一化: %s -> %s", g_workspace, out);
         path_copy(g_workspace, sizeof(g_workspace), out);
     }
