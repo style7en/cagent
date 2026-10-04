@@ -57,6 +57,23 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
 
     g_oldHistoryProc = (WNDPROC)SetWindowLongPtrW(g_hHistory, GWLP_WNDPROC, (LONG_PTR)HistoryProc);
 
+    /* 测试钩子: CAGENT_SIMULATE_DPI=<dpi> —— 启动时给自己发一次 WM_DPICHANGED。
+     * 真实"拖到另一块缩放率不同的屏"无法脚本化, 而跨进程注入此消息会被 user32
+     * 静默拦截 (Send/Post 均拒, E2E 实测) —— 只能由进程自发送驱动同一条处理链路。 */
+    {
+        const char *sd = getenv("CAGENT_SIMULATE_DPI");
+        if (sd && sd[0]) {
+            int nd = atoi(sd);
+            if (nd > 0 && nd != (int)g_dpi) {
+                RECT sug;
+                GetWindowRect(hwnd, &sug);
+                sug.right  = sug.left + (sug.right - sug.left) * nd / (int)g_dpi;
+                sug.bottom = sug.top  + (sug.bottom - sug.top) * nd / (int)g_dpi;
+                SendMessageW(hwnd, WM_DPICHANGED, MAKEWPARAM(0, nd), (LPARAM)&sug);
+            }
+        }
+    }
+
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
     /* 不在此 SetFocus(输入框): 启动时窗口未必是前台, 焦点会先于光标进入半初始化

@@ -313,6 +313,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         layout(hwnd);
         return 0;
 
+    case WM_GETMINMAXINFO: {
+        /* 最小跟踪尺寸: 下方 layout() 没有对极小窗口做钳制, 不设下限的话用户把窗口
+         * 拖到几十像素高时输入框/历史区会算出负坐标溢出窗口。560x400 逻辑像素足够
+         * 放下头部三行配置 + 输入区。 */
+        MINMAXINFO *mmi = (MINMAXINFO *)lp;
+        RECT r = { 0, 0, dp(560), dp(400) };
+        dpi_adjust_rect(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, g_dpi);
+        mmi->ptMinTrackSize.x = r.right - r.left;
+        mmi->ptMinTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
+
     case WM_COMMAND:
         if (LOWORD(wp) == ID_SEND && HIWORD(wp) == BN_CLICKED) {
             if (g_running) {
@@ -385,6 +397,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * 随后的位移擦掉就会留在原位 —— 实测: 主屏(200%)拖到副屏(250%)后, "工作目录:" 上方
          * 出现一排残留的笔画尖(屏幕上看得到, PrintWindow 重画时看不到, 因为它是残迹不是绘制错)。 */
         UINT nd = (UINT)HIWORD(wp);
+        log_line("[ui] DPI 切换: %u -> %u", g_dpi, nd ? nd : dpi_of_window(hwnd));
         g_dpi = nd ? nd : dpi_of_window(hwnd);
 
         {
