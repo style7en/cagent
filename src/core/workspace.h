@@ -24,6 +24,35 @@ static FILE *fopen_utf8(const char *path, const char *mode) {
     return _wfopen(wp, wm);
 }
 
+/* 读整个文件到堆缓冲 (NUL 结尾)。会话文件、技能正文、元信息三处曾各写一份完全相同的
+ * fseek/ftell/malloc/fread 样板, 收敛到这里。
+ * path 需为**绝对路径** (内部走 fopen_utf8, 不做工作目录解析 —— 现有调用方传的都是
+ * sessions\ 或 skills\ 下的绝对路径)。
+ * 失败返回 NULL: 打不开 / 取长失败 / 空文件 / 超过 max_bytes (>0 时)。
+ * grow_2x: 额外预留一倍容量 (cap = 2*fsz+1), 供后续 GBK->UTF-8 原地转码膨胀用 (最坏 1.5x)。
+ * out_len 收到实际读入字节数; out_cap 收到分配的容量 (两者可为 NULL)。 */
+static char *read_file_alloc(const char *path, long max_bytes, int grow_2x,
+                             size_t *out_len, size_t *out_cap) {
+    if (out_len) *out_len = 0;
+    if (out_cap) *out_cap = 0;
+    FILE *f = fopen_utf8(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long fsz = ftell(f);
+    if (fsz <= 0 || (max_bytes > 0 && fsz > max_bytes)) { fclose(f); return NULL; }
+    rewind(f);
+    size_t cap = (size_t)fsz * (grow_2x ? 2u : 1u) + 1;
+    char *buf = (char*)malloc(cap);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n = fread(buf, 1, (size_t)fsz, f);
+    fclose(f);
+    if (n == 0) { free(buf); return NULL; }
+    buf[n] = '\0';
+    if (out_len) *out_len = n;
+    if (out_cap) *out_cap = cap;
+    return buf;
+}
+
 /* 取 exe 所在目录 (UTF-8, 无结尾反斜杠); 失败回退当前目录 */
 static void get_exe_dir_utf8(char *out, size_t cap) {
     wchar_t wexe[MAX_PATH];
@@ -94,23 +123,25 @@ static void ensure_workspace(void) {
     normalize_workspace();
 }
 
-/* 检查 path 规范化后是否在 g_workspace 内。返回 1 合法, 0 非法。 */
+/* 检查 path 规范化后是否在 g_workspace 内。返回 1 合法, 0 非法。
+ * 缓冲用 PATHSZ: 工作目录内较深的子路径 (g_workspace + 相对段) 长度可超过 MAX_PATH,
+ * 用 MAX_PATH 承接 GetFullPathNameW 会失败, 把合法路径误判为越界。 */
 static int path_in_workspace(const char *path) {
     ensure_workspace();
-    wchar_t wbase[MAX_PATH], wabs[MAX_PATH], wws[MAX_PATH], wwsfull[MAX_PATH];
+    wchar_t wbase[PATHSZ], wabs[PATHSZ], wws[PATHSZ], wwsfull[PATHSZ];
     if (path[0] == '\\' || path[0] == '/' || (path[0] && path[1] == ':')) {
-        if (!utf8_to_wide(path, wbase, MAX_PATH)) return 0;
+        if (!utf8_to_wide(path, wbase, PATHSZ)) return 0;
     } else {
-        char base[MAX_PATH];
+        char base[PATHSZ];
         int m = snprintf(base, sizeof(base), "%s\\%s", g_workspace, path);
         if (m < 0 || (size_t)m >= sizeof(base)) return 0;
-        if (!utf8_to_wide(base, wbase, MAX_PATH)) return 0;
+        if (!utf8_to_wide(base, wbase, PATHSZ)) return 0;
     }
-    DWORD n = GetFullPathNameW(wbase, MAX_PATH, wabs, NULL);
-    if (n == 0 || n >= MAX_PATH) return 0;
-    if (!utf8_to_wide(g_workspace, wws, MAX_PATH)) return 0;
-    n = GetFullPathNameW(wws, MAX_PATH, wwsfull, NULL);
-    if (n == 0 || n >= MAX_PATH) return 0;
+    DWORD n = GetFullPathNameW(wbase, PATHSZ, wabs, NULL);
+    if (n == 0 || n >= PATHSZ) return 0;
+    if (!utf8_to_wide(g_workspace, wws, PATHSZ)) return 0;
+    n = GetFullPathNameW(wws, PATHSZ, wwsfull, NULL);
+    if (n == 0 || n >= PATHSZ) return 0;
     size_t wl = wcslen(wwsfull);
     if (_wcsnicmp(wabs, wwsfull, wl) != 0) return 0;   /* 大小写不敏感, 避免盘符大小写不同被误拒 */
     if (wabs[wl] != L'\\' && wabs[wl] != L'\0') return 0;
@@ -125,7 +156,7 @@ static int resolve_in_workspace(const char *path, wchar_t *out, int cap) {
     if (path[0] == '\\' || path[0] == '/' || (path[0] && path[1] == ':')) {
         return utf8_to_wide(path, out, cap);
     }
-    char full[MAX_PATH];
+    char full[PATHSZ];
     int m = snprintf(full, sizeof(full), "%s\\%s", g_workspace, path);
     if (m < 0 || (size_t)m >= sizeof(full)) return 0;
     return utf8_to_wide(full, out, cap);

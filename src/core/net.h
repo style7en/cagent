@@ -423,13 +423,15 @@ stream_done:
 
 /* 流式 SSE POST (对外入口): 在单次尝试之上叠加指数退避重试。
  * 仅在瞬时错误时重试; 取消/成功/客户端错误直接返回。
- * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断)。 */
+ * 返回 HTTP 状态码; -2=取消; -1=网络错误 (err_out 写诊断);
+ * -3=重试耗尽后仍是"200 但流未收完整" (区别于完整的 200, 上层据此提示而非当成功)。 */
 static int http_post_stream(const char *url, const char *api_key,
                             const char *req_body, size_t req_body_len,
                             char *err_out, size_t err_cap,
                             StreamCtx *ctx) {
     DWORD base = http_retry_base_ms();
     int last_status = -1;
+    int last_incomplete = 0;   /* 最后一次尝试是否"200 但流被截断" */
 
     for (int attempt = 0; ; attempt++) {
         /* 取消优先: 任何阶段被取消都直接退出, 不重试 */
@@ -444,6 +446,7 @@ static int http_post_stream(const char *url, const char *api_key,
                                           err_out, err_cap, ctx, &completed,
                                           &retry_after_sec);
         last_status = status;
+        last_incomplete = (status == 200 && !completed);
 
         if (status == -2) return -2;                  /* 取消 */
         if (status == 200 && completed) return 200;   /* 成功且流完整 */
@@ -491,5 +494,6 @@ static int http_post_stream(const char *url, const char *api_key,
              attempt + 1, nmax, status, (unsigned long)wait, retry_after_sec, eprev);
         cancelable_sleep_ms(wait);
     }
-    return last_status;
+    /* 重试耗尽仍"200 但流未收完整": 返回 -3, 不让上层把半截流当完整成功处理 */
+    return last_incomplete ? -3 : last_status;
 }

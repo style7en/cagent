@@ -7,19 +7,26 @@
 /* ===== UI 辅助 ===== */
 
 static void read_edit_utf8(HWND h, char *out, size_t cap) {
+    if (cap == 0) return;
     int wlen = GetWindowTextLengthW(h);
-    if (wlen <= 0) return;
+    /* 空输入必须显式把 out 清空: 否则用户把某个配置框清空后, 全局仍保留旧值 ——
+     * 表现为"清空 Model/Key/工作目录 后仍按旧配置发送", 且退出保存时把旧值又写回。 */
+    if (wlen <= 0) { out[0] = '\0'; return; }
     WCHAR *wbuf = (WCHAR*)malloc((size_t)(wlen + 1) * sizeof(WCHAR));
+    if (!wbuf) { out[0] = '\0'; return; }
     GetWindowTextW(h, wbuf, wlen + 1);
+    out[0] = '\0';
     WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)cap, NULL, NULL);
     free(wbuf);
 }
 
 static void set_edit_utf8(HWND h, const char *utf8) {
-    if (!utf8 || !*utf8) return;
+    /* 空值也要下发: 与 read_edit_utf8 对称, 否则界面无法反映"已清空"的真实状态 */
+    if (!utf8 || !*utf8) { SetWindowTextW(h, L""); return; }
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
-    if (wlen <= 0) return;
+    if (wlen <= 0) { SetWindowTextW(h, L""); return; }
     WCHAR *wbuf = (WCHAR*)malloc((size_t)wlen * sizeof(WCHAR));
+    if (!wbuf) return;
     MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wbuf, wlen);
     SetWindowTextW(h, wbuf);
     free(wbuf);

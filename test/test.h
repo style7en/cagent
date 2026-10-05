@@ -221,6 +221,63 @@ static int run_all_tests(void) {
         test_ws_end();
     }
 
+    /* ---- read_file_alloc: 整文件读入助手 (会话/技能样板收敛点) ---- */
+    {
+        test_ws_begin();
+        tool_write_file("rfa.txt", "hello\nworld\n");   /* 12 字节 */
+        char abs[PATHSZ];
+        snprintf(abs, sizeof(abs), "%s\\rfa.txt", g_test_ws);   /* 助手需绝对路径 */
+
+        size_t len = 0, cap = 0;
+        char *buf = read_file_alloc(abs, 0, 0, &len, &cap);
+        CHK(buf != NULL);
+        CHK(len == 12);
+        CHK(cap == 13);                                 /* fsz + 1 */
+        CHK(buf && strcmp(buf, "hello\nworld\n") == 0);
+        free(buf);
+
+        /* grow_2x: 容量翻倍 (GBK 转码膨胀余量) */
+        buf = read_file_alloc(abs, 0, 1, &len, &cap);
+        CHK(buf != NULL && len == 12 && cap == 25);     /* 2*fsz + 1 */
+        free(buf);
+
+        /* 超过 max_bytes -> NULL; 等于上限 -> 放行; 不存在的文件 -> NULL */
+        CHK(read_file_alloc(abs, 4, 0, NULL, NULL) == NULL);
+        {
+            char *b2 = read_file_alloc(abs, 12, 0, NULL, NULL);
+            CHK(b2 != NULL);
+            free(b2);
+        }
+        {
+            char missing[PATHSZ];
+            snprintf(missing, sizeof(missing), "%s\\__no_such_file__.txt", g_test_ws);
+            CHK(read_file_alloc(missing, 0, 0, NULL, NULL) == NULL);
+        }
+
+        test_ws_rm("rfa.txt");
+        test_ws_end();
+    }
+
+    /* ---- heal_bad_tool_args: 载入即净化非法 tool_call arguments ---- */
+    {
+        char msgs[256];
+
+        /* 合法 arguments: 原样保留, 返回 0 */
+        strcpy(msgs, "{\"arguments\":\"{\\\"a\\\":1}\"}");
+        CHK(heal_bad_tool_args(msgs) == 0);
+        CHK(strcmp(msgs, "{\"arguments\":\"{\\\"a\\\":1}\"}") == 0);
+
+        /* 空 arguments -> 替换为 {} */
+        strcpy(msgs, "{\"arguments\":\"\"}");
+        CHK(heal_bad_tool_args(msgs) == 1);
+        CHK(strcmp(msgs, "{\"arguments\":\"{}\"}") == 0);
+
+        /* 半截 JSON (finish=length 截断) -> 替换为 {} */
+        strcpy(msgs, "{\"arguments\":\"{\\\"a\\\":\"}");
+        CHK(heal_bad_tool_args(msgs) == 1);
+        CHK(strcmp(msgs, "{\"arguments\":\"{}\"}") == 0);
+    }
+
     /* ---- 命令执行: 退出码 ---- */
     {
         /* 无输出的命令也要能看到退出码, 否则模型只能靠猜命令是否成功 */

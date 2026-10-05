@@ -19,7 +19,7 @@ cagent/
 ├── src/                # 全部源码
 │   ├── main_gui.c      # 界面聚合入口 (仅按依赖顺序 include ui/)
 │   ├── cagent_core.h   # 核心聚合入口 (仅按依赖顺序 include core/)
-│   ├── core/           # 平台无关核心, 按子功能拆分 (单 TU, 全 static)
+│   ├── core/           # 与界面解耦的 Windows 核心, 按子功能拆分 (单 TU, 全 static)
 │   │   ├── version.h   # 版本号单一事实来源 (RC / --version / 标题栏引用)
 │   │   ├── base.h      # 平台头 / 角色常量 / 宿主钩子 / 输出封装
 │   │   ├── utf8.h      # UTF-8 解码与字符边界 (全项目唯一实现)

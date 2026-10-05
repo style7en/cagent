@@ -217,7 +217,11 @@ static void msg_role(const char *obj, size_t len, char *out, size_t cap) {
     const size_t keylen = sizeof(key) - 1;
     out[0] = '\0';
     if (len < keylen) return;
-    size_t scan = (len < 96) ? len - keylen : 96;   /* role 总在对象开头不远处 */
+    /* 只在对象开头 96 字节内找 (role 恒在最前), 且保证 memcmp 不越过对象尾部:
+     * 上限取 len-keylen, 与 96 取小。旧写法 scan 固定 96, 当 len∈[96,104] 时会读到
+     * 对象尾部之外最多 9 字节 (对象位于 messages 尾部时即越界读)。 */
+    size_t scan = len - keylen;
+    if (scan > 96) scan = 96;
     for (size_t i = 0; i <= scan; i++) {
         if (memcmp(obj + i, key, keylen) == 0) {
             const char *r = obj + i + keylen;
@@ -246,29 +250,17 @@ static int msg_append(const char *fmt, ...) {
 
 /* ===== 超限识别 ===== */
 
-/* 大小写不敏感子串查找 (strcasestr 非标准, 自带一份); 找到返回命中位置, 否则 NULL */
-static const char *contains_ci(const char *hay, const char *needle) {
-    size_t nl = strlen(needle);
-    if (nl == 0) return hay;
-    for (; *hay; hay++) {
-        size_t i = 0;
-        while (i < nl && hay[i] &&
-               tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i])) i++;
-        if (i == nl) return hay;
-    }
-    return NULL;
-}
-
-/* 服务端 400 是否为"上下文超限": 各家措辞不一, 宽松匹配常见写法 */
+/* 服务端 400 是否为"上下文超限": 各家措辞不一, 宽松匹配常见写法。
+ * 大小写不敏感子串查找统一走 net.h 的 ascii_icontains (本文件不再另写一份)。 */
 static int is_context_overflow_error(const char *err) {
     if (!err) return 0;
-    return contains_ci(err, "context length") != NULL
-        || contains_ci(err, "context_length") != NULL
-        || contains_ci(err, "maximum context") != NULL
-        || contains_ci(err, "too many tokens") != NULL
-        || contains_ci(err, "prompt is too long") != NULL
-        || contains_ci(err, "input length exceeds") != NULL
-        || contains_ci(err, "reduce the length") != NULL;
+    return ascii_icontains(err, "context length")
+        || ascii_icontains(err, "context_length")
+        || ascii_icontains(err, "maximum context")
+        || ascii_icontains(err, "too many tokens")
+        || ascii_icontains(err, "prompt is too long")
+        || ascii_icontains(err, "input length exceeds")
+        || ascii_icontains(err, "reduce the length");
 }
 
 /* ===== 上下文水位 (token 优先, 字节兜底) ===== */
@@ -463,11 +455,20 @@ static int compact_drop_oldest(void) {
     size_t ks, ke;
     if (!msg_bounds(conv, cut, &ks, &ke)) return 0;
 
-    reset_conversation();
-    if (!msg_append(",%.*s", (int)(total - ks), conv + ks)) {
-        reset_conversation();   /* 理论不可达 (只丢不加必能装下), 兜底回到安全空态 */
-        return 0;
-    }
+    /* 先在堆上拼好新内容再一次性提交。旧写法先 reset_conversation() 再读 conv 保留段,
+     * 而 conv 正指向 messages 内部 —— reset 会覆写 messages 头部, 只因保留段起点 ks>=1
+     * 才没踩到源数据, 属隐式不变量。改成"堆上拼装"后与 compact_via_summary 一致, 不再依赖它。 */
+    size_t plen = strlen(g_system_prompt);
+    size_t tail = total - ks;
+    if (plen + 1 + tail + 1 > BUFSZ) return 0;
+    char *newbuf = (char*)malloc(plen + 1 + tail + 1);
+    if (!newbuf) return 0;
+    memcpy(newbuf, g_system_prompt, plen);
+    newbuf[plen] = ',';
+    memcpy(newbuf + plen + 1, conv + ks, tail);
+    newbuf[plen + 1 + tail] = '\0';
+    memcpy(messages, newbuf, plen + 1 + tail + 1);
+    free(newbuf);
     char note[160];
     snprintf(note, sizeof(note),
              "(摘要压缩失败, 已按整条消息丢弃最早的 %d 条; 早期细节不再在上下文中)\r\n",
@@ -636,6 +637,15 @@ static void agent_turn(const char *user_msg) {
             append_text("(已取消)\r\n");
             reason = "用户取消 (流式请求进行中)";
             rolled_back = 1;
+            goto done;
+        }
+        if (status == -3) {
+            /* 200 但流未收完整 (重试耗尽): 不能当成功处理半截回复, 也不能当网络失败。
+             * 保留已完成步骤、不回滚 —— 与 HTTP 失败路径同一语义, 用户可直接重发。 */
+            log_line("[http] 响应流不完整 (重试耗尽) iter=%d data_lines=%d bad_json=%d",
+                     iter, ctx->n_data_lines, ctx->n_bad_json);
+            append_text("(响应流中断, 重试后仍未收完整; 本轮未完成, 可直接重发)\r\n");
+            reason = "响应流不完整 (重试耗尽, 非完整 200)";
             goto done;
         }
         if (status != 200) {

@@ -90,4 +90,15 @@ static void start_task(HWND hwnd) {
     SetWindowTextW(g_hSend, L"停止");
     EnableWindow(g_hSend, TRUE);
     g_hThread = CreateThread(NULL, 0, agent_thread, task, 0, NULL);
+    if (!g_hThread) {
+        /* 线程创建失败: 必须把 UI 状态回滚, 否则 g_running 恒为 1、按钮停在"停止",
+         * agent_thread 永不执行 -> gui_on_done 永不回调, 界面卡死在"运行中"。
+         * task 由 agent_thread 释放, 这里失败只能自己释放, 否则泄漏。 */
+        free(task);
+        InterlockedExchange(&g_running, 0);
+        SetWindowTextW(g_hSend, L"发送");
+        EnableWindow(g_hSend, TRUE);
+        SetFocus(g_hInput);
+        append_text("(启动后台线程失败, 请重试)\r\n");
+    }
 }

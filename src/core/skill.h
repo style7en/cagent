@@ -93,18 +93,10 @@ static const char *skill_body(const char *text) {
 /* 读文本文件并保证 UTF-8 (非法时按 GBK/ANSI 转码, 与外置提示词同一策略)。
  * 成功返回堆串 (调用方 free), 失败/超限/空文件返回 NULL。 */
 static char *skill_read_utf8(const char *path) {
-    FILE *f = fopen_utf8(path, "rb");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long fsz = ftell(f);
-    if (fsz <= 0 || fsz > SKILL_FILE_MAX) { fclose(f); return NULL; }
-    rewind(f);
-    char *buf = (char*)malloc((size_t)fsz * 2 + 1);  /* 2x: GBK 转码膨胀余量 */
-    if (!buf) { fclose(f); return NULL; }
-    size_t n = fread(buf, 1, (size_t)fsz, f);
-    fclose(f);
-    if (n == 0) { free(buf); return NULL; }
-    buf[n] = '\0';
+    size_t n = 0, cap = 0;
+    /* 2x 容量: GBK -> UTF-8 转码膨胀余量 (最坏 1.5 倍) */
+    char *buf = read_file_alloc(path, SKILL_FILE_MAX, 1, &n, &cap);
+    if (!buf) return NULL;
     /* UTF-8 BOM 先剥掉: 不剥的话 strncmp("---",3) 会因 EF BB BF 前缀失配,
      * frontmatter 被静默当成普通正文。GBK 文件不会有这个前缀, 顺序无关。 */
     if (n >= 3 && (unsigned char)buf[0] == 0xEF &&
@@ -114,7 +106,7 @@ static char *skill_read_utf8(const char *path) {
         n -= 3;
     }
     if (!is_valid_utf8((const unsigned char*)buf, n)) {
-        oem_to_utf8(buf, (size_t)fsz * 2 + 1);
+        oem_to_utf8(buf, cap);
     }
     if (!is_valid_utf8((const unsigned char*)buf, strlen(buf))) { free(buf); return NULL; }
     return buf;

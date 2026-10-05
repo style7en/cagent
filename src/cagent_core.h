@@ -1,5 +1,5 @@
 /*
- * cagent_core.h - cagent 平台无关核心 (零依赖, Windows 平台)
+ * cagent_core.h - cagent 核心 (与界面解耦, 零第三方依赖, Windows 平台)
  *
  * 本文件只做聚合: 按依赖顺序包含 core/ 下的各子模块。
  * 全部实现为 static, 仍是单编译单元, 无需改动构建方式。

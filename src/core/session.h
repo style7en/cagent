@@ -361,7 +361,11 @@ static CAGENT_MAYBE_UNUSED size_t heal_bad_tool_args(char *msgs) {
         JValue *aj = json_parse(tmp);
         if (!aj || aj->type != J_OBJ) {
             /* 非法: "..." 内容替换为 "{}"。闭引号 (q 处) 必须随尾部一起搬到 val+2,
-             * 搬运源从 q 开始 (含引号); 从 q+1 开始会丢引号, 结构直接损坏。 */
+             * 搬运源从 q 开始 (含引号); 从 q+1 开始会丢引号, 结构直接损坏。
+             * 内容短于 2 字节时替换会让整段变长 (最多 +2), 先确认 messages 还装得下,
+             * 否则停在半途, 不越界写。 */
+            size_t grow = (rlen < 2) ? (2 - rlen) : 0;
+            if (strlen(msgs) + grow + 1 > BUFSZ) { json_free(aj); free(tmp); break; }
             memmove(val + 2, q, strlen(q) + 1);
             memcpy(val, "{}", 2);
             healed++;
@@ -378,19 +382,9 @@ static CAGENT_MAYBE_UNUSED size_t heal_bad_tool_args(char *msgs) {
 
 /* 读取单个历史文件并重建 messages + 工作目录。返回 1 成功。 */
 static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
-    FILE *f = fopen_utf8(path, "rb");
-    if (!f) return 0;
     /* 读全文件到堆缓冲: 会话可能超过 256KB, 栈缓冲截断会导致历史永久丢失 */
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
-    long fsz = ftell(f);
-    if (fsz < 0) { fclose(f); return 0; }
-    char *buf = (char*)malloc((size_t)fsz + 1);
-    if (!buf) { fclose(f); return 0; }
-    rewind(f);
-    size_t n = fread(buf, 1, (size_t)fsz, f);
-    fclose(f);
-    if (n == 0) { free(buf); return 0; }
-    buf[n] = '\0';
+    char *buf = read_file_alloc(path, 0, 0, NULL, NULL);
+    if (!buf) return 0;
     int ok = load_messages_from_text(buf);
     free(buf);
     if (ok) {
@@ -491,19 +485,9 @@ static CAGENT_MAYBE_UNUSED int session_read_meta(const char *path, char *ws_out,
                              char *prev_out, size_t prev_cap, int *cnt_out) {
     ws_out[0] = prev_out[0] = '\0';
     if (cnt_out) *cnt_out = 0;
-    FILE *f = fopen_utf8(path, "rb");
-    if (!f) return 0;
     /* 读全文件到堆: 会话可达 1MB+, 截断读取会让消息条数偏小 */
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
-    long fsz = ftell(f);
-    if (fsz <= 0) { fclose(f); return 0; }
-    rewind(f);
-    char *buf = (char*)malloc((size_t)fsz + 1);
-    if (!buf) { fclose(f); return 0; }
-    size_t n = fread(buf, 1, (size_t)fsz, f);
-    fclose(f);
-    if (n == 0) { free(buf); return 0; }
-    buf[n] = '\0';
+    char *buf = read_file_alloc(path, 0, 0, NULL, NULL);
+    if (!buf) return 0;
 
     JValue *root = json_parse(buf);
     if (root && root->type == J_OBJ) {

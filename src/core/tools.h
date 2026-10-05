@@ -34,8 +34,8 @@ static void execute_bash(const char *command) {
 
 static void tool_read_file(const char *path, long long offset) {
     if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
-    wchar_t wpath[MAX_PATH];
-    if (!resolve_in_workspace(path, wpath, MAX_PATH)) { snprintf(tool_out, BUFSZ, "(读取失败: 路径过长)"); return; }
+    wchar_t wpath[PATHSZ];
+    if (!resolve_in_workspace(path, wpath, PATHSZ)) { snprintf(tool_out, BUFSZ, "(读取失败: 路径过长)"); return; }
     FILE *f = _wfopen(wpath, L"rb");
     if (!f) { snprintf(tool_out, BUFSZ, "(读取失败: 无法打开 %s)", path); return; }
     /* offset 续读: 大文件不必反复整读, 按 note 里给的 next offset 分块取 */
@@ -98,8 +98,8 @@ static void tool_read_file(const char *path, long long offset) {
 static void tool_edit_file(const char *path, const char *old_text, const char *new_text) {
     if (!path_in_workspace(path)) { snprintf(tool_out, BUFSZ, "(拒绝: 路径在工作目录外)"); return; }
     if (!old_text || !old_text[0]) { strcpy(tool_out, "(编辑失败: old_text 不能为空)"); return; }
-    wchar_t wpath[MAX_PATH];
-    if (!resolve_in_workspace(path, wpath, MAX_PATH)) { strcpy(tool_out, "(编辑失败: 路径过长)"); return; }
+    wchar_t wpath[PATHSZ];
+    if (!resolve_in_workspace(path, wpath, PATHSZ)) { strcpy(tool_out, "(编辑失败: 路径过长)"); return; }
 
     FILE *f = _wfopen(wpath, L"rb");
     if (!f) { snprintf(tool_out, BUFSZ, "(编辑失败: 无法打开 %s)", path); return; }
@@ -168,8 +168,8 @@ static void tool_edit_file(const char *path, const char *old_text, const char *n
 
 static void tool_write_file(const char *path, const char *content) {
     if (!path_in_workspace(path)) { strcpy(tool_out, "(拒绝: 路径在工作目录外)"); return; }
-    wchar_t wpath[MAX_PATH];
-    if (!resolve_in_workspace(path, wpath, MAX_PATH)) { strcpy(tool_out, "(写入失败: 路径过长)"); return; }
+    wchar_t wpath[PATHSZ];
+    if (!resolve_in_workspace(path, wpath, PATHSZ)) { strcpy(tool_out, "(写入失败: 路径过长)"); return; }
     FILE *f = _wfopen(wpath, L"wb");
     if (!f) { strcpy(tool_out, "(写入失败)"); return; }
     size_t len = strlen(content);

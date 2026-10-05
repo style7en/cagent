@@ -13,12 +13,21 @@ static CAGENT_MAYBE_UNUSED void config_load(void) {
     if (!f) return;
 
     char line[2048];
+    int first_line = 1;
     while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == ';' || line[0] == '\n' || line[0] == '\r') continue;
-        char *eq = strchr(line, '=');
+        char *lp = line;
+        /* 剥 UTF-8 BOM: 用户用编辑器另存为"带 BOM 的 UTF-8"时, 首行键会带 EF BB BF
+         * 前缀, strcmp 失配 -> 第一个配置项被静默忽略。程序自身写出的 ini 无 BOM。 */
+        if (first_line) {
+            first_line = 0;
+            if ((unsigned char)lp[0] == 0xEF && (unsigned char)lp[1] == 0xBB &&
+                (unsigned char)lp[2] == 0xBF) lp += 3;
+        }
+        if (lp[0] == '#' || lp[0] == ';' || lp[0] == '\n' || lp[0] == '\r') continue;
+        char *eq = strchr(lp, '=');
         if (!eq) continue;
         *eq = '\0';
-        char *key = line, *val = eq + 1;
+        char *key = lp, *val = eq + 1;
 
         size_t vlen = strlen(val);
         while (vlen > 0 && (val[vlen-1] == '\n' || val[vlen-1] == '\r')) {
@@ -101,6 +110,10 @@ static CAGENT_MAYBE_UNUSED void config_save(void) {
     {
         char *enc = dpapi_protect(g_api_key);
         if (enc) { fprintf(f, "api_key=%s\r\n", enc); free(enc); }
+        else if (g_api_key[0]) {
+            /* 加密失败: 写明文会泄漏 Key, 只能不写; 但必须留痕, 否则重启后 Key 静默丢失 */
+            log_line("[config] api_key 加密失败, 本次未写入 ini (重启后 Key 将丢失, 请重新填写)");
+        }
     }
     fprintf(f, "model=%s\r\n",    g_model);
     fprintf(f, "workspace=%s\r\n", g_workspace);
