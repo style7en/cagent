@@ -23,6 +23,13 @@
 #define ID_SESS_OK  2002   /* 载入 */
 #define ID_SESS_CAN 2003   /* 取消 */
 
+/* ===== 主窗口样式 =====
+ * CreateWindowW 与三处 dpi_adjust_rect(按客户区反推外框) 共用同一份, 免得两处各写一遍
+ * 后走样。WS_CLIPCHILDREN 是**窗口**样式(WS_*), 只属于 CreateWindowW 的 dwStyle ——
+ * 不要写进 WNDCLASSW.style, 那里只认 CS_* 类样式(如 CS_HREDRAW/CS_VREDRAW, 见 main.h)。
+ * AdjustWindowRectEx 只看影响外框的样式, WS_CLIPCHILDREN 不影响计算结果, 故三处共用安全。 */
+#define CAGENT_WND_STYLE (WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN)
+
 /* ===== 系统菜单命令 (WM_SYSCOMMAND) =====
  * 「关于」挂在窗口的系统菜单上 —— 主窗口没有菜单栏, 而标题栏问号按钮(WS_EX_CONTEXTHELP)
  * 与最小化/最大化互斥(实测加了它问号根本不画), 所以系统菜单是这里放"关于"的标准位置:

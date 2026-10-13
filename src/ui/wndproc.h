@@ -196,7 +196,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* 按 DPI 修正外框, 让客户区正好是 720x560 逻辑像素 */
         {
             RECT r = { 0, 0, dp(720), dp(560) };
-            dpi_adjust_rect(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, g_dpi);
+            dpi_adjust_rect(&r, CAGENT_WND_STYLE, FALSE, 0, g_dpi);
             SetWindowPos(hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -319,7 +319,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * 放下头部三行配置 + 输入区。 */
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
         RECT r = { 0, 0, dp(560), dp(400) };
-        dpi_adjust_rect(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, g_dpi);
+        dpi_adjust_rect(&r, CAGENT_WND_STYLE, FALSE, 0, g_dpi);
         mmi->ptMinTrackSize.x = r.right - r.left;
         mmi->ptMinTrackSize.y = r.bottom - r.top;
         return 0;
@@ -403,7 +403,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             const RECT *pr = (const RECT*)lp;
             RECT r = { 0, 0, dp(720), dp(560) };
-            dpi_adjust_rect(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, g_dpi);
+            dpi_adjust_rect(&r, CAGENT_WND_STYLE, FALSE, 0, g_dpi);
             SetWindowPos(hwnd, NULL, pr->left, pr->top, r.right - r.left, r.bottom - r.top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }

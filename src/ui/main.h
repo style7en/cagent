@@ -37,13 +37,22 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));   /* app.rc: 1 ICON app.ico */
     wc.lpszClassName = L"CagentGuiWnd";
+    /* CS_HREDRAW | CS_VREDRAW: 窗口宽/高变化时**整个客户区**都作废重画。
+     * 不加这两位的后果就是 issue #2 —— 水平拖动缩放时只有"新露出来"的那条区域被作废,
+     * 而三个右侧对齐的按钮(浏览/新建会话/加载会话)是**整体左移**的: 它们让出的那几像素
+     * 宽的老像素没人擦, 于是和按钮新位置拼在一起, 看着就像三个按钮叠在一起。松手后
+     * (或任何一次整窗重绘)老像素被盖掉, 又"恢复正常", 正是用户描述的"重绘窗口后正常"。
+     *
+     * 注意 CS_* 是**窗口类**样式, 只能写进 wc.style; 而 WS_CLIPCHILDREN 是**窗口**样式,
+     * 必须写在 CreateWindowW 的 dwStyle 里(见下) —— 两者字段不同, 不能混放。 */
+    wc.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClassW(&wc);
 
     /* 标题栏只写名字, 不带版本号: 版本在「关于」(系统菜单) 与 exe 文件属性里, 标题栏里
      * 那串数字每次发版都要跟着改, 且对用户没有信息量。 */
     /* 初次创建用系统 DPI 估个尺寸即可 —— WM_CREATE 里会按窗口真正落在的那块屏重算 */
     HWND hwnd = CreateWindowW(L"CagentGuiWnd", L"cagent",
-        WS_OVERLAPPEDWINDOW,
+        CAGENT_WND_STYLE,
         CW_USEDEFAULT, CW_USEDEFAULT, dp(720), dp(560),
         NULL, NULL, hInst, NULL);
 
