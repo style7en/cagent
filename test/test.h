@@ -14,6 +14,8 @@
  * 设计取向: 不依赖 LLM/网络, 直接调用各 static 函数并断言行为, 作为"改动即回归"的护栏。
  */
 
+#include <malloc.h>   /* _msize: 校验 malloc 返回块的真实大小 (issue #3 的 DPAPI 收尾测试) */
+
 /* ---- 测试用的隔离工作目录 ----
  * 必须是**绝对路径**: g_workspace 的相对值现在按 exe 目录解析 (见 workspace.h 的
  * normalize_workspace), 若沿用"塞个相对路径、靠 CWD 规范化"的旧写法, 测试结果就会随
@@ -121,6 +123,62 @@ static int json_selftest(void) {
         char *dec2 = dpapi_unprotect("sk-plain-key");
         CHK(dec2 != NULL && strcmp(dec2, "sk-plain-key") == 0);
         free(dec2);
+    }
+
+    /* issue #3 回归: 返回串必须在**自己的分配块内**以 NUL 收尾, 且 "dpapi:" 之后只能出现
+     * 合法 base64 字符。旧实现 malloc(6 + b64len) 只够放内容、放不下 NUL —— 因为
+     * CryptBinaryToStringA 的"尺寸查询"把 NUL 算进返回长度、"实际写入"却不含, 两者差 1;
+     * 于是 config_save 的 fprintf("%s") 会一路读过堆尾, 把垃圾字节写进 cagent.ini。
+     * 用 _msize 取块的真实大小(本工具链实测与请求值一致)来判定, 比"看 %s 有没有多出字符"
+     * 确定得多 —— 旧实现里 strlen(enc) 会等于甚至大于块大小。多组长度覆盖 base64 的
+     * 有填充/无填充两种形态。 */
+    {
+        static const char *samples[] = {
+            "k", "short", "sk-test-key-123",
+            "0123456789012345678901234567890123456789",
+            "极简 Agent 中文 Key 测试 1234567890"
+        };
+        for (size_t i = 0; i < sizeof(samples)/sizeof(samples[0]); i++) {
+            char *enc = dpapi_protect(samples[i]);
+            CHK(enc != NULL);
+            if (!enc) continue;
+            size_t len = strlen(enc);
+            CHK(len + 1 <= _msize(enc));              /* 块内放得下结尾 NUL */
+            int bad = 0;
+            for (size_t j = 6; j < len; j++) {        /* "dpapi:" 之后只允许 base64 字符 */
+                char c = enc[j];
+                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '='))
+                    bad = 1;
+            }
+            CHK(bad == 0);
+            char *dec = dpapi_unprotect(enc);
+            CHK(dec != NULL && strcmp(dec, samples[i]) == 0);
+            free(dec); free(enc);
+        }
+    }
+
+    /* issue #3 老文件兼容: 旧版 dpapi_protect 写出的"base64 + 堆尾垃圾"必须仍能读回。
+     * 用非 base64 字节(0xB1)开头, 保证截断点确定; 覆盖已有的、已被污染的 cagent.ini。 */
+    {
+        static const char *plain = "sk-test-key-123";
+        static const unsigned char junk[] = { 0xB1, 0x36, 0xF3, 0x6D, 0x11, 0x2D };
+        char *enc = dpapi_protect(plain);
+        CHK(enc != NULL);
+        if (enc) {
+            size_t n = strlen(enc);
+            char *dirty = (char*)malloc(n + sizeof(junk) + 1);
+            CHK(dirty != NULL);
+            if (dirty) {
+                memcpy(dirty, enc, n);
+                memcpy(dirty + n, junk, sizeof(junk));
+                dirty[n + sizeof(junk)] = '\0';
+                char *dec = dpapi_unprotect(dirty);
+                CHK(dec != NULL && strcmp(dec, plain) == 0);
+                free(dec); free(dirty);
+            }
+            free(enc);
+        }
     }
 
     if (fails == 0) printf("json_selftest: OK\n");
