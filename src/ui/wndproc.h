@@ -72,13 +72,13 @@ static void ui_fonts_rebuild(HWND hwnd) {
     HFONT old[2] = { g_hFont, g_hFontHist };
     g_hFont     = CreateFontW(dp(16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+                              CAGENT_FONT_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
     /* 输出区独立字体: 默认比控件/标签大一档, 阅读更醒目。
      * **基准字号恒为 HIST_LPX_DEF** —— Ctrl+滚轮的缩放走 EM_SETZOOM(整体显示缩放),
      * 不再靠改这个字体, 否则每次滚动都要重建字体+刷全部 run, 还会把 run 字号钉死。 */
     g_hFontHist = CreateFontW(dp(HIST_LPX_DEF), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+                              CAGENT_FONT_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
     EnumChildWindows(hwnd, ui_font_cb, 0);
     for (int i = 0; i < 2; i++) if (old[i]) DeleteObject(old[i]);
 }

@@ -74,13 +74,13 @@ static void about_fonts_sync(void) {
     int h = dp_at(g_about_dpi, 16);
     g_aboutFontUI    = CreateFontW(h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+                                   CAGENT_FONT_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
     g_aboutFontTitle = CreateFontW(h, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE,
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+                                   CAGENT_FONT_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
     g_aboutFontLink  = CreateFontW(h, 0, 0, 0, FW_NORMAL, FALSE, TRUE,  FALSE,
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   ANTIALIASED_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
+                                   CAGENT_FONT_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
     g_about_font_dpi = g_about_dpi;
 }
 

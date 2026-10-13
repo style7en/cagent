@@ -126,10 +126,10 @@ static void sess_fonts_sync(void) {
     if (g_sessFontBold) { DeleteObject(g_sessFontBold); g_sessFontBold = NULL; }
     int h = dp_at(g_sess_dpi, 16);
     g_sessFont     = CreateFontW(h, 0,0,0, FW_NORMAL, FALSE,FALSE,FALSE, DEFAULT_CHARSET,
-                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CAGENT_FONT_QUALITY,
                                  FF_DONTCARE, CAGENT_UI_FACE);
     g_sessFontBold = CreateFontW(h, 0,0,0, FW_BOLD,   FALSE,FALSE,FALSE, DEFAULT_CHARSET,
-                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CAGENT_FONT_QUALITY,
                                  FF_DONTCARE, CAGENT_UI_FACE);
     g_sess_font_dpi = g_sess_dpi;
 }

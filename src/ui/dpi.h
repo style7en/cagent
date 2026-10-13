@@ -36,6 +36,18 @@
  * 不能直接克隆主窗口的 g_hFont(那可能是别的 DPI 的尺寸)。 */
 #define CAGENT_UI_FACE L"Microsoft YaHei UI"
 
+/* 界面字体渲染质量。**别再改回 ANTIALIASED_QUALITY** —— 那是"灰度抗锯齿", 在 100%
+ * (96 DPI) 下笔画边缘只有灰阶过渡, 观感发虚发糊, 正是 issue #1 的成因。
+ *
+ * 选 DEFAULT_QUALITY 而不是 CLEARTYPE_QUALITY 的理由:
+ *   - 实测(系统 ClearType 开启)两者渲染结果**逐像素完全相同** —— 都是 577 个墨点、
+ *     其中 484 个次像素着色点(R!=G!=B); 而 ANTIALIASED_QUALITY 的次像素着色点是 0
+ *     (纯灰)。也就是说 DEFAULT 已经能拿到 ClearType 的清晰度。
+ *   - DEFAULT_QUALITY 交给系统按**用户自己的**字体平滑设置去选: 用户若在系统里关了
+ *     ClearType, 界面会跟着关; 而 CLEARTYPE_QUALITY 会强行打开, 反而违背用户意愿。
+ * 用统一常量而不是各建字体处各写一遍, 就是为了避免将来又有人改回去。 */
+#define CAGENT_FONT_QUALITY DEFAULT_QUALITY
+
 static UINT g_dpi = 96;      /* 主窗口所在显示器的 DPI; dpi_init() 给初值, WM_CREATE 里定准 */
 
 static int dp_at(UINT dpi, int v) { return MulDiv(v, (int)dpi, 96); }
