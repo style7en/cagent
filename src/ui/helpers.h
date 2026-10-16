@@ -286,8 +286,8 @@ static void ui_fold_trim_from(long cp) {
  * 所以用 dp(g_hist_lpx + HIST_LINE_EXTRA)。
  *
  * **纵向放宽到一个行高**: 标题行本身只有一行, 200% 下也就 38px, 鼠标稍微偏一点就点空了。
- * 放宽后落在"标题行上下各一行"以内都算命中, 取**最近的那一行** —— 这样既好点中,
- * 又不会出现"点 A 行却折了 B 行"的错乱 (相邻两个标题行之间至少隔着一个参数行)。
+ * 放宽后落在"标题行上下各一行"以内都算命中, 取**最近的那一行**。参数行参与折叠后,
+ * 相邻两个收起的标题行可能紧挨着, 落点在两者正中时取最近的 —— 行为确定, 不会两头跳。
  * 横向不设限: 标题行整行可点, 不用精确戳到字上。 */
 static int ui_fold_hit(POINTL pt) {
     if (g_fold_n <= 0) return -1;
@@ -314,16 +314,11 @@ static int ui_fold_hit(POINTL pt) {
 #define UI_FOLD_GLYPH_OPEN  L"▾"
 #define UI_FOLD_GLYPH_SHUT  L"▸"
 
-/* 折叠范围的起点: 跳过**不参与折叠**的 ARGS 段。
- * 参数行不收 —— 它是"这次调用干了什么"的唯一线索, 通常也就一两行; 全收掉只剩一个工具名,
- * 四个 read_file 排在一起谁也分不清谁 (实测用户就撞上了这个)。输出块才是真正冗长的东西。 */
+/* 正文起点 = 标题行之后。**参数行与输出块一起折叠** —— 收起后只剩一行"▸ 调用工具 X",
+ * 展开时逐段按原角色还原 (ARGS 与 OUTPUT 样式不同)。早期版本参数行保留过一版,
+ * 实测用户明确要求参数也收进去: 收起的本意就是"过程细节先不看"。 */
 static long ui_fold_cut_start(const UiFoldBlock *b) {
-    long pos = b->cp_head + b->head_cp;
-    for (int s = 0; s < b->n_segs; s++) {
-        if (b->segs[s].role != CAGENT_ROLE_ARGS) break;
-        pos += b->segs[s].len;
-    }
-    return pos;
+    return b->cp_head + b->head_cp;
 }
 
 /* 把所有块的标题行按各自角色重设一遍段落格式。
@@ -358,19 +353,16 @@ static void ui_fold_set(int idx, int collapse) {
     long delta;
 
     if (collapse) {
-        /* 折叠范围 = 第一个非 ARGS 段到末尾; 长度就是这些段的长度之和, 不需要再和
+        /* 折叠范围 = 整个正文 (参数行 + 输出块); 长度就是各段长度之和, 不需要再和
          * body_len 对账 —— body_len 本身就是它们的和 (见 ui_fold_extend)。 */
-        int s0 = 0;
-        for (s0 = 0; s0 < b->n_segs; s0++)
-            if (b->segs[s0].role != CAGENT_ROLE_ARGS) break;
         long cut_len = 0;
-        for (int s = s0; s < b->n_segs; s++) cut_len += b->segs[s].len;
+        for (int s = 0; s < b->n_segs; s++) cut_len += b->segs[s].len;
         if (cut_len <= 0) return;                 /* 没有可收的内容 (空块) */
         long pos = cut_start;
-        for (int s = s0; s < b->n_segs; s++) {
+        for (int s = 0; s < b->n_segs; s++) {
             b->segs[s].text = ui_get_range(g_hHistory, pos, pos + b->segs[s].len);
             if (!b->segs[s].text) {
-                for (int k = s0; k < s; k++) { free(b->segs[k].text); b->segs[k].text = NULL; }
+                for (int k = 0; k < s; k++) { free(b->segs[k].text); b->segs[k].text = NULL; }
                 return;
             }
             pos += b->segs[s].len;
@@ -382,11 +374,8 @@ static void ui_fold_set(int idx, int collapse) {
                           UI_FOLD_GLYPH_SHUT, b->kind == UI_FOLD_THINK ? CAGENT_ROLE_THINK_HEAD
                                                                        : CAGENT_ROLE_TOOL);
     } else {
-        int s0 = 0;
-        for (s0 = 0; s0 < b->n_segs; s0++)
-            if (b->segs[s0].role != CAGENT_ROLE_ARGS) break;
         long pos = cut_start, total = 0;
-        for (int s = s0; s < b->n_segs; s++) {
+        for (int s = 0; s < b->n_segs; s++) {
             long n = ui_replace_styled(g_hHistory, pos, pos, b->segs[s].text, b->segs[s].role);
             free(b->segs[s].text);
             b->segs[s].text = NULL;

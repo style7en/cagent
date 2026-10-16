@@ -872,7 +872,7 @@ static void agent_turn(const char *user_msg) {
                 if (line) {
                     /* 首字符是折叠符号: ▾ = 展开(内容可见), ▸ = 收起。前端的块索引表
                      * 靠它定位工具块, 也只替换这一个字符 —— 见 ui/state.h 的 UiFoldBlock。 */
-                    snprintf(line, cap, CAGENT_FOLD_GLYPH_OPEN " %s\r\n", c->name);
+                    snprintf(line, cap, CAGENT_FOLD_GLYPH_OPEN " 调用工具 %s\r\n", c->name);
                     emit_tool(line);
                     if (c->args[ARGS_DISPLAY_MAX]) {
                         char *prev = (char*)malloc(cap);

@@ -146,10 +146,10 @@ make preview       # 渲染输出区排版 -> preview_out.bmp (展开态) + prev
 
 ```
 +-----------------------------------+
-| Base Url: [ https://...v1     ]   |  ← 三项配置, 启动时自动从 cagent.ini 读取
-| Key:      [ ********          ]   |  ← API Key 以 * 隐藏显示
-| Model:    [ deepseek-v4-flash ]   |
-| 工作目录: [ C:\...            ] [浏览...] [新建会话] [加载会话] |
+| 接口地址  [ https://...v1     ]   |  ← 三项配置, 启动时自动从 cagent.ini 读取
+| API Key   [ ********          ]   |  ← 以 * 隐藏显示
+| 模型名称  [ deepseek-v4-flash ]   |
+| 工作目录  [ C:\...            ] [浏览...] [新建会话] [加载会话] |
 +-----------------------------------+
 |                                   |
 | 分析当前项目                        |  ← 用户: 深蓝加粗 + 浅蓝底 (不写"你：", 样式已区分说话人)
@@ -194,10 +194,10 @@ make preview       # 渲染输出区排版 -> preview_out.bmp (展开态) + prev
 
 | 块 | 标题行 | 正文 | 什么时候会有 |
 |---|---|---|---|
-| 工具调用 | `▾ 工具名` | 参数行 + 输出块 | **每次工具调用都有** |
+| 工具调用 | `▾ 调用工具 <名>` | 参数行 + 输出块（**一起折叠**） | **每次工具调用都有** |
 | 思考过程 | `▾ 思考过程` | 推理正文 | 只有模型真返回 `reasoning_content` 时 |
 
-**工具块对所有模型都有用** —— 工具输出经常几十上百行（实测一轮任务能刷出 754 个 SSE 数据行），折起来界面才清爽。收起后只留 `▸ 工具名`，符号从 `▾` 变成 `▸`。
+**工具块对所有模型都有用** —— 工具输出经常几十上百行（实测一轮任务能刷出 754 个 SSE 数据行），折起来界面才清爽。收起后只剩一行 `▸ 调用工具 <名>`，参数行与输出块全部收掉，展开时逐段按原角色还原（参数行与输出块样式不同）。
 
 思考过程来自推理模型（DeepSeek-R1 这类）的 `delta.reasoning_content`，与正式回答的 `delta.content` 并列。三条与 API 语义绑定的规矩：
 
@@ -218,12 +218,12 @@ make preview       # 渲染输出区排版 -> preview_out.bmp (展开态) + prev
 
 ### 配置说明
 
-| 字段 | 说明 |
-|---|---|
-| **Base Url** | 填到 `/v1` 即可,程序自动追加 `/chat/completions`<br>例: `https://token.sensenova.cn/v1` |
-| **Key** | OpenAI 兼容的 API Key,显示为 `*` |
-| **Model** | 模型 ID,例: `deepseek-v4-flash` |
-| **skip_cert_verify** | 写在 `cagent.ini` 中,`1`=跳过 SSL 证书校验(自签端点用,默认 `0` 严格) |
+| 界面标签 | `cagent.ini` 键名 | 说明 |
+|---|---|---|
+| 接口地址 | `url_base` | 填到 `/v1` 即可,程序自动追加 `/chat/completions`<br>例: `https://token.sensenova.cn/v1` |
+| API Key | `api_key` | OpenAI 兼容的 API Key,显示为 `*`,保存时经 DPAPI 加密 |
+| 模型名称 | `model` | 模型 ID,例: `deepseek-v4-flash` |
+| (无,仅 ini) | `skip_cert_verify` | `1`=跳过 SSL 证书校验(自签端点用,默认 `0` 严格) |
 
 ### 配置文件 `cagent.ini`
 

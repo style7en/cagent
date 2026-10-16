@@ -267,7 +267,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         ui_fonts_rebuild(hwnd);   /* 建字体; 此刻还没有子控件, 下发是空操作 */
 
-        static const WCHAR *labels[3] = { L"Base Url:", L"Key:", L"Model:" };
+        /* 前三项配置的标签: 中文、不带冒号 (冒号是"标签 + 输入框"的旧习惯, 这里靠布局对齐
+         * 已经够清楚了)。第 4 项"工作目录"在下面单独建 —— 它旁边还有个"浏览"按钮, 排版不同。 */
+        static const WCHAR *labels[3] = { L"接口地址", L"API Key", L"模型名称" };
         static const DWORD ed_styles[3] = { 0, ES_PASSWORD, 0 };
 
         for (int i = 0; i < 3; i++) {
@@ -295,7 +297,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         set_edit_utf8(g_hCfg[CFG_MDL], g_model);
 
         {
-            HWND lbl = CreateWindowW(L"STATIC", L"工作目录:",
+            HWND lbl = CreateWindowW(L"STATIC", L"工作目录",
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
                 0,0,0,0, hwnd, (HMENU)(LONG_PTR)ID_LBL_WS, NULL, NULL);
             SendMessageW(lbl, WM_SETFONT, (WPARAM)g_hFont, TRUE);
@@ -508,8 +510,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          *  真要走自擦那条路, 必须同时 SetBkColor(COLOR_BTNFACE)。这里选择留在透明模式,
          *  由 WM_DPICHANGED 末尾那次整棵子树重画来保证不留旧像素。) */
         SetBkMode((HDC)wp, TRANSPARENT);
-        /* 状态栏是次要信息, 用灰色 —— 与输出区里旁白的灰度一致 (110 是 247 底上的下限) */
-        if ((HWND)lp == g_hStatus) SetTextColor((HDC)wp, RGB(110, 110, 110));
+        /* 状态栏不单独设色 —— 用默认黑, 与配置区那几个标签同一观感。
+         * (之前用的是灰色 RGB(110,110,110), 那是"次要信息"的取色, 但灰字看着比黑字小,
+         * 实际字号是同一个 g_hFont。字号要改的话改 dpi.h 里 UI 字体那一处, 别在这里单设。) */
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
 
     case WM_APP_STATUS: {

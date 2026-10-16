@@ -457,7 +457,7 @@ static CAGENT_MAYBE_UNUSED void history_replay(void) {
                     char *line = (char*)malloc(cap);
                     if (!line) break;
                     /* 与实时路径同构: "▾ 工具名" + 参数行, 符号取自同一份契约 */
-                    snprintf(line, cap, CAGENT_FOLD_GLYPH_OPEN " %s\r\n", nm);
+                    snprintf(line, cap, CAGENT_FOLD_GLYPH_OPEN " 调用工具 %s\r\n", nm);
                     cagent_emit(line, CAGENT_ROLE_TOOL);
                     if (al) {
                         size_t cut = utf8_trim_len(ag, lim);

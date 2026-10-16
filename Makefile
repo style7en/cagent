@@ -108,8 +108,11 @@ $(GUI_TARGET): $(GUI_SRC) $(CORE_HDRS) $(UI_HDRS) $(GUI_RES)
 	$(CC) $(CFLAGS) -o $@ $< $(GUI_RES) $(LDFLAGS) $(GUI_LDFLAGS)
 
 # make test: 编译并运行回归测试 (失败则 make 返回非 0)
+# make test: 跑离线回归测试, **退出码 = 失败数**。
+# 跑完把测试二进制删掉, 不留在工程根 (下次 make test 会重新编译, 代价可接受)。
+# 注意: 必须先把退出码存进变量再删 —— rm 之后 $? 就变成 rm 的退出码了, 会吞掉失败数。
 test: $(TEST_TARGET)
-	./$(TEST_TARGET)
+	./$(TEST_TARGET); rc=$$?; rm -f $(TEST_TARGET); exit $$rc
 
 $(TEST_TARGET): $(TEST_SRC) $(TEST_HDRS) $(CORE_HDRS)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) -o $@ $(TEST_SRC) $(LDFLAGS) $(TEST_LDFLAGS)
