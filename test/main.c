@@ -11,5 +11,8 @@
 #include "test.h"          /* 同目录: 测试套件本体 */
 
 int main(void) {
-    return run_all_tests();
+    int rc = run_all_tests();
+    /* 无论成败都清掉测试工作区 —— 它建在 exe 旁边(仓库根), 留着会污染工程目录 */
+    test_ws_cleanup();
+    return rc;
 }

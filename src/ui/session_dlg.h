@@ -106,13 +106,16 @@ static void sess_apply_selected(const char *path) {
     if (utf8_to_wide(g_workspace, wws, MAX_PATH))
         SetCurrentDirectoryW(wws);
     SetWindowTextW(g_hHistory, L"");
+    g_last_role = -1;        /* 清空后追加状态作废 (见 ui/state.h) */
+    g_last_no_lf = 0;
+    ui_fold_reset();         /* 折叠块的位置索引也跟着作废 */
     /* 清空会把段落格式一并复位(实测行距会跳回 RichEdit 的自然行距, 比我们设的松),
      * 缩放比也可能被重置 —— 所以紧接着把这两项重新下发一次。 */
     ui_history_parafmt(g_hHistory);
     ui_history_zoom_apply(g_hHistory);
-    append_text("(已载入历史会话, 工作目录: ");
-    append_text(g_workspace);
-    append_text(")\r\n");
+    emit_note("(已载入历史会话, 工作目录: ");
+    emit_note(g_workspace);
+    emit_note(")\r\n");
     history_replay();
 }
 
@@ -156,12 +159,19 @@ static void sess_create_list(HWND hwnd) {
     if (g_sess_n > 0) SendMessageW(lb, LB_SETCURSEL, cur, 0);
 }
 
+/* 对话框窗口样式: **固定大小** —— 去掉 WS_THICKFRAME(可拖边) 与最大化/最小化按钮。
+ * 布局是"客户区 540x400 逻辑像素"这一套写死的几何, 允许缩放只会露出更多空白,
+ * 而且用户没有任何理由去缩放一个列表选择框。 */
+#define SESS_DLG_STYLE (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX)
+
 /* 排布控件并下发字体。尺寸全部按当前 g_sess_dpi 现算, 所以重跑一次就适配新 DPI。
- * 客户区按 540x450 逻辑像素设计 —— 与 show_session_dialog 里的外框计算是一套。 */
+ * 客户区按 540x400 逻辑像素设计 —— 与 show_session_dialog 里的外框计算是一套。
+ * **四周留白都是 12**: 列表宽度 = 540 - 12*2, 列表底 + 12 = 按钮顶, 按钮底 + 12 = 客户区底 ——
+ * 改任何一边都要把这几条一起算, 否则就会出现"左右不对称"或"按钮下面空一大块"。 */
 static void sess_layout(HWND hwnd) {
     const UINT d = g_sess_dpi;
     MoveWindow(GetDlgItem(hwnd, ID_SESS_LB),  dp_at(d, 12),  dp_at(d, 12),
-               dp_at(d, 496), dp_at(d, 330), TRUE);
+               dp_at(d, 516), dp_at(d, 332), TRUE);
     MoveWindow(GetDlgItem(hwnd, ID_SESS_OK), dp_at(d, 300), dp_at(d, 356),
                dp_at(d, 100), dp_at(d, 32), TRUE);
     MoveWindow(GetDlgItem(hwnd, ID_SESS_CAN), dp_at(d, 412), dp_at(d, 356),
@@ -196,8 +206,8 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         sess_create_list(hwnd);
         {
             const RECT *pr = (const RECT*)lp;
-            RECT r = { 0, 0, dp_at(g_sess_dpi, 540), dp_at(g_sess_dpi, 450) };
-            dpi_adjust_rect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
+            RECT r = { 0, 0, dp_at(g_sess_dpi, 540), dp_at(g_sess_dpi, 400) };
+            dpi_adjust_rect(&r, SESS_DLG_STYLE,
                             FALSE, WS_EX_DLGMODALFRAME, g_sess_dpi);
             MoveWindow(hwnd, pr->left, pr->top, r.right - r.left, r.bottom - r.top, TRUE);
         }
@@ -297,15 +307,15 @@ static void show_session_dialog(HWND owner) {
     }
 
     /* 按主窗口所在屏先定尺寸(窗口还没建, 只能问 owner); 建完后 WM_CREATE 会用对话框
-     * 自己的显示器再核一次。540x450 是**客户区**逻辑尺寸, 与 sess_layout 是一套。 */
+     * 自己的显示器再核一次。540x400 是**客户区**逻辑尺寸, 与 sess_layout 是一套。 */
     g_sess_dpi = dpi_of_window(owner);
-    RECT wr = { 0, 0, dp_at(g_sess_dpi, 540), dp_at(g_sess_dpi, 450) };
-    dpi_adjust_rect(&wr, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
+    RECT wr = { 0, 0, dp_at(g_sess_dpi, 540), dp_at(g_sess_dpi, 400) };
+    dpi_adjust_rect(&wr, SESS_DLG_STYLE,
                     FALSE, WS_EX_DLGMODALFRAME, g_sess_dpi);
 
     g_sess_owner = owner;
     g_sess_dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"CAGENT_SESSDLG", L"历史会话",
-        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
+        SESS_DLG_STYLE,
         CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top, owner, NULL,
         GetModuleHandleW(NULL), NULL);
     if (!g_sess_dlg) { g_sess_owner = NULL; return; }

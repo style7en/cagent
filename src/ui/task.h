@@ -49,7 +49,7 @@ static void start_task(HWND hwnd) {
         if (strlen(messages) > strlen(g_system_prompt)) history_save();
         reset_conversation();
         g_history_file[0] = '\0';
-        append_text("(工作目录已变更, 已另起新会话; 旧会话可通过 [加载会话] 恢复)\r\n");
+        emit_note("(工作目录已变更, 已另起新会话; 旧会话可通过 [加载会话] 恢复)\r\n");
     }
     snprintf(g_active_ws, sizeof(g_active_ws), "%s", g_workspace);
 
@@ -75,12 +75,13 @@ static void start_task(HWND hwnd) {
 
     SetWindowTextW(g_hInput, L"");
 
-    /* 回显用户输入到历史框 (USER 角色: 蓝色加粗) */
+    /* 回显用户输入到历史框 (USER 角色: 前端按"用户消息"样式渲染 —— 蓝底加粗, 见 ui/helpers.h)。
+     * 不加"你："前缀: 样式本身已经说清了这是谁说的, 前缀只是噪音。 */
     {
         size_t ul = strlen(task->user_msg);
         char *uecho = (char*)malloc(ul + 16);
         if (uecho) {
-            snprintf(uecho, ul + 16, "\r\n你：%s\r\n", task->user_msg);
+            snprintf(uecho, ul + 16, "\r\n%s\r\n", task->user_msg);
             gui_emit(uecho, CAGENT_ROLE_USER);
             free(uecho);
         }
@@ -99,6 +100,6 @@ static void start_task(HWND hwnd) {
         SetWindowTextW(g_hSend, L"发送");
         EnableWindow(g_hSend, TRUE);
         SetFocus(g_hInput);
-        append_text("(启动后台线程失败, 请重试)\r\n");
+        emit_err("(启动后台线程失败, 请重试)\r\n");
     }
 }

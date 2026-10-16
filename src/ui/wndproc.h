@@ -6,6 +6,20 @@
 
 /* ===== 布局 / 子类化 / 窗口过程 ===== */
 
+/* 输出区的内部留白: RichEdit 的文字默认**贴着控件边缘**, 顶到边框看着很局促。
+ * 用 EM_SETRECT(格式化矩形) 而不是 EM_SETMARGINS —— 后者只能设左右, 上下设不了。
+ * 矩形是相对客户区的, 所以尺寸一变就得重算, 调用点都在布局之后。 */
+static void ui_history_pad(HWND h, int w, int hh) {
+    if (!h) return;
+    RECT rc;
+    rc.left   = dp(10);
+    rc.top    = dp(8);
+    rc.right  = w  - dp(10);
+    rc.bottom = hh - dp(8);
+    SendMessageW(h, EM_SETRECT, 0, (LPARAM)&rc);
+    InvalidateRect(h, NULL, TRUE);
+}
+
 static void layout(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom;
@@ -26,7 +40,10 @@ static void layout(HWND hwnd) {
     int new_w = dp(80);
     int sess_w = dp(80);
     int input_h = dp(72);
-    int input_y = H - input_h - gap;
+    /* 状态栏钉在窗口最底部, 输入区整体上移让出它的高度 */
+    int status_h = dp(20);
+    int status_y = H - status_h - dp(2);
+    int input_y  = status_y - gap - input_h;
     int input_w = W - btn_w - gap * 3;
 
     for (int i = 0; i < 3; i++) {
@@ -50,9 +67,11 @@ static void layout(HWND hwnd) {
     }
 
     MoveWindow(g_hHistory, gap, top_h, W - gap * 2,
-               H - top_h - input_h - gap * 2, TRUE);
+               input_y - gap - top_h, TRUE);
+    ui_history_pad(g_hHistory, W - gap * 2, input_y - gap - top_h);
     MoveWindow(g_hInput, gap, input_y, input_w, input_h, TRUE);
     MoveWindow(g_hSend,  gap * 2 + input_w, input_y, btn_w, input_h, TRUE);
+    MoveWindow(g_hStatus, gap, status_y, W - gap * 2, status_h, TRUE);
 }
 
 /* ===== 字体与行距 (跨显示器 DPI 变化时要整体重做) ===== */
@@ -81,6 +100,51 @@ static void ui_fonts_rebuild(HWND hwnd) {
                               CAGENT_FONT_QUALITY, FF_DONTCARE, CAGENT_UI_FACE);
     EnumChildWindows(hwnd, ui_font_cb, 0);
     for (int i = 0; i < 2; i++) if (old[i]) DeleteObject(old[i]);
+}
+
+/* DPI 变化后重算所有段落的留白与缩进。
+ * 段落属性(段前/段后/左缩进)与行距一样是**绝对 twips**, 不随字体缩放 —— 不重算的话,
+ * 从 200% 屏拖到 250% 屏, 行距是对的(ui_history_parafmt 重设过)而区块之间的留白还是
+ * 旧 DPI 的值, 整体节奏就散了。
+ *
+ * 做法是逐段读出旧值、按 DPI 比例缩放后写回, **不需要知道每段是什么角色**: 缩放是线性的,
+ * 各角色之间的相对关系(工具名紧凑、输出块宽松)自然保留。
+ *
+ * 两个坑:
+ *   ① EM_GETLINECOUNT / EM_LINEINDEX 数的是**显示行**(软换行也占一行), 同一段落可能横跨
+ *      多行 —— 逐行缩放会把该段的留白缩放多次。所以只处理**段落起点**(前一字符是换行的位置)。
+ *   ② 只在跨显示器时跑一次, 但行数可能上千, 循环里全是 SendMessage, 别在别处随手调用。 */
+static void ui_para_reflow(HWND h, UINT old_dpi, UINT new_dpi) {
+    if (!h || !old_dpi || !new_dpi || old_dpi == new_dpi) return;
+    int n = (int)SendMessageW(h, EM_GETLINECOUNT, 0, 0);
+    if (n <= 0) return;
+    LONG sel_s = 0, sel_e = 0;
+    SendMessageW(h, EM_GETSEL, (WPARAM)&sel_s, (LPARAM)&sel_e);
+    for (int i = 0; i < n; i++) {
+        LONG pos = (LONG)SendMessageW(h, EM_LINEINDEX, (WPARAM)i, 0);
+        if (pos < 0) continue;
+        if (pos > 0) {
+            /* 段落起点判定: 前一个字符必须是换行 (CRLF 的两个字节都算) */
+            WCHAR prev = 0;
+            TEXTRANGEW tr;
+            tr.chrg.cpMin = pos - 1;
+            tr.chrg.cpMax = pos;
+            tr.lpstrText = &prev;
+            SendMessageW(h, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+            if (prev != L'\r' && prev != L'\n') continue;
+        }
+        SendMessageW(h, EM_SETSEL, pos, pos);
+        PARAFORMAT2 pf;
+        memset(&pf, 0, sizeof(pf));
+        pf.cbSize = sizeof(pf);
+        if (!SendMessageW(h, EM_GETPARAFORMAT, 0, (LPARAM)&pf)) continue;
+        pf.dwMask        = PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_STARTINDENT;
+        pf.dySpaceBefore = MulDiv(pf.dySpaceBefore, (int)new_dpi, (int)old_dpi);
+        pf.dySpaceAfter  = MulDiv(pf.dySpaceAfter,  (int)new_dpi, (int)old_dpi);
+        pf.dxStartIndent = MulDiv(pf.dxStartIndent, (int)new_dpi, (int)old_dpi);
+        SendMessageW(h, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+    }
+    SendMessageW(h, EM_SETSEL, sel_s, sel_e);
 }
 
 /* 收紧历史框行距: 用 PARAFORMAT2 设"精确"行距 = 字身格高 + HIST_LINE_EXTRA,
@@ -281,6 +345,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_SESS_BTN, NULL, NULL);
         SendMessageW(g_hSess, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
+        /* 状态栏: 只读 STATIC, 显示"模型此刻在做什么"。这些信息以前是往输出区打旁白的,
+         * 但状态不属于对话内容 —— 混进去既占地方, 又会被历史保存和回放 (见 core/base.h
+         * 的 cagent_status)。初值"就绪"由 WM_APP_STATUS 带 0 时统一设置。 */
+        g_hStatus = CreateWindowW(L"STATIC", L"就绪",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_STATUS, NULL, NULL);
+        SendMessageW(g_hStatus, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+
         /* 「关于」挂到系统菜单 (标题栏图标左键 / Alt+Space / 右键标题栏)。
          * GetSystemMenu 第二参数必须传 FALSE: 传 TRUE 会把菜单重置回默认,
          * 我们刚加的两项会被抹掉。分隔线把自定义项与系统的 关闭 隔开。 */
@@ -299,7 +371,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (g_key_decrypt_failed) {
-            append_text("API Key 解密失败 (可能换了用户/机器), 请重新填写 Key。\r\n");
+            emit_err("API Key 解密失败 (可能换了用户/机器), 请重新填写 Key。\r\n");
             g_key_decrypt_failed = 0;
         }
 
@@ -331,7 +403,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InterlockedExchange(&g_cancel, 1);
                 SetWindowTextW(g_hSend, L"停止中...");
                 EnableWindow(g_hSend, FALSE);
-                append_text("(正在停止, 需等当前工具执行完毕...)\r\n");
+                emit_note("(正在停止, 需等当前工具执行完毕...)\r\n");
             } else {
                 start_task(hwnd);
             }
@@ -370,7 +442,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 snprintf(g_active_ws, sizeof(g_active_ws), "%s", g_workspace);
                 history_start_new();
                 SetWindowTextW(g_hHistory, L"");
-                append_text("(新会话已创建。旧会话文件保留, 可通过 [加载会话] 恢复)\r\n");
+                g_last_role = -1;        /* 清空后追加状态作废 */
+                g_last_no_lf = 0;
+                ui_fold_reset();         /* 折叠块的位置索引也跟着作废 */
+                emit_note("(新会话已创建。旧会话文件保留, 可通过 [加载会话] 恢复)\r\n");
                 SetFocus(g_hInput);
             }
             return 0;
@@ -398,6 +473,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * 出现一排残留的笔画尖(屏幕上看得到, PrintWindow 重画时看不到, 因为它是残迹不是绘制错)。 */
         UINT nd = (UINT)HIWORD(wp);
         log_line("[ui] DPI 切换: %u -> %u", g_dpi, nd ? nd : dpi_of_window(hwnd));
+        UINT old_dpi = g_dpi;   /* 段落留白要按新旧 DPI 比例缩放, 换 g_dpi 前先留一份 */
         g_dpi = nd ? nd : dpi_of_window(hwnd);
 
         {
@@ -410,6 +486,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         layout(hwnd);
         ui_fonts_rebuild(hwnd);        /* 最后换字体: 控件按新几何重画一次即可 */
         ui_history_parafmt(g_hHistory);
+        ui_para_reflow(g_hHistory, old_dpi, g_dpi);   /* 区块留白/缩进同样是绝对 twips */
         ui_history_zoom_apply(g_hHistory);   /* 缩放比是控件属性, 这里重下一遍保险 */
 
         /* 兜底: DPI 切换期间父窗口可能有大片区域没被擦到(子控件位移留下的空档)。
@@ -431,7 +508,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          *  真要走自擦那条路, 必须同时 SetBkColor(COLOR_BTNFACE)。这里选择留在透明模式,
          *  由 WM_DPICHANGED 末尾那次整棵子树重画来保证不留旧像素。) */
         SetBkMode((HDC)wp, TRANSPARENT);
+        /* 状态栏是次要信息, 用灰色 —— 与输出区里旁白的灰度一致 (110 是 247 底上的下限) */
+        if ((HWND)lp == g_hStatus) SetTextColor((HDC)wp, RGB(110, 110, 110));
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+
+    case WM_APP_STATUS: {
+        /* core 在工作线程里报告状态, 走消息队列投递到这里才碰控件 */
+        char *txt = (char*)lp;
+        if (txt) {
+            set_edit_utf8(g_hStatus, txt);   /* UTF-8 -> UTF-16 + SetWindowTextW, 对 STATIC 同样适用 */
+            free(txt);
+        } else {
+            SetWindowTextW(g_hStatus, L"就绪");
+        }
+        return 0;
+    }
 
     case WM_DESTROY:
         /* Agent 线程若仍在运行: 先请求取消并等它收尾 (history_save 在线程里执行,
@@ -445,6 +536,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         InterlockedExchange(&g_running, 0);
         config_save();
+        ui_fold_reset();          /* 收起态块里存着的正文副本要释放, 别指望进程退出兜底 */
         if (g_hFont) DeleteObject(g_hFont);
         if (g_hFontHist) DeleteObject(g_hFontHist);
         PostQuitMessage(0);
@@ -464,14 +556,48 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 1) {
             g_stream_chars = 0;
         } else if (g_stream_chars > 0) {
-            /* -1 表示选到真正的末尾, 避免 GetWindowTextLengthW 的估算误差留下残尾 */
-            long start = GetWindowTextLengthW(h) - g_stream_chars;
+            /* 用 cp 长度而不是 GetWindowTextLengthW: g_stream_chars 记的是 cp 增量,
+             * 两个口径混用会删多或删少 (老代码里"估算误差留下残尾"就是这个原因)。
+             * -1 表示选到真正的末尾。 */
+            long start = ui_text_cp_len(h) - g_stream_chars;
             if (start < 0) start = 0;
             SendMessageW(h, EM_SETSEL, start, -1);
             SendMessageW(h, EM_REPLACESEL, FALSE, (LPARAM)L"");
+            ui_fold_trim_from(start);   /* 起点之后的块正文已被删, 位置不再可信 */
             g_stream_chars = 0;
         }
+        /* 回删后文档末尾回到了别的位置, 上一次的角色与"是否以换行结尾"都作废 ——
+         * 留着会让下次追加基于过时状态补出多余的换行。 */
+        g_last_role  = -1;
+        g_last_no_lf = 0;
         return 0;
+    }
+    if (msg == WM_APP_FOLDEND) {
+        /* 一轮结束: 把最后一个块也按默认收起 (用户手动展开过的不动)。
+         * 折叠会让文档变短, 此时滚动位置可能悬在半空, 顺手滚回末尾。 */
+        ui_fold_collapse(g_fold_n - 1);
+        SendMessageW(h, WM_VSCROLL, SB_BOTTOM, 0);
+        return 0;
+    }
+    /* 点击折叠块的标题行 -> 收起/展开。
+     * **流式进行中不响应**: 正文正在往文档末尾追加, 此时收起会让后续增量直接接在标题行
+     * 后面, 块的状态和内容就对不上了。等这一轮结束再折叠。 */
+    if (msg == WM_LBUTTONDOWN) {
+        POINTL pt;
+        pt.x = (LONG)(short)LOWORD(lp);
+        pt.y = (LONG)(short)HIWORD(lp);
+        int idx = ui_fold_hit(pt);
+        if (idx >= 0 && !g_running) { ui_fold_toggle(idx); return 0; }
+    }
+    /* 悬停在标题行上给手型, 提示"这里能点" */
+    if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT && !g_running) {
+        POINT p;
+        if (GetCursorPos(&p) && ScreenToClient(h, &p)) {
+            POINTL pt;
+            pt.x = p.x;
+            pt.y = p.y;
+            if (ui_fold_hit(pt) >= 0) { SetCursor(LoadCursor(NULL, IDC_HAND)); return TRUE; }
+        }
     }
     /* Ctrl+滚轮缩放输出区字号; 其余滚轮动作照旧交回原过程(滚动)并补一次重画 */
     if (msg == WM_MOUSEWHEEL && ui_zoom_wheel(wp)) return 0;

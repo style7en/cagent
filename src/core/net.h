@@ -169,9 +169,45 @@ typedef struct {
     /* 本次 HTTP 分段的状态 (每次尝试前 memset 清零) */
     int emitted;               /* 已向前端上屏过 AI 内容 (重试前据此回删) */
     int truncated;             /* content 超出缓冲上限, 尾部被丢弃 */
+    /* 推理模型的思考过程 (DeepSeek-R1 等返回的 reasoning_content 字段)。
+     * **只上屏, 不累积、不进 messages** —— DeepSeek 明确要求多轮对话不要回传
+     * reasoning_content, 所以这里只记长度 (日志与诊断用), 不留正文:
+     * 既省一份可能上百 KB 的缓冲, 也从根上杜绝它被误写进历史。 */
+    size_t reasoning_len;      /* 本次响应收到的思考内容字节数 (UTF-8) */
+    int    reasoning_open;     /* 思考块标题行已发, 正文还没闭合 (收尾时要补换行) */
+    char   reasoning_last;     /* 思考内容的最后一个字符, 用于判断要不要补换行 */
     struct { char id[256]; char name[64]; } dropped[STREAM_CALLS_MAX]; /* 超上限被丢弃的调用 */
     int n_dropped;
 } StreamCtx;
+
+/* reasoning_content delta 回调: 增量上屏 (THINK 角色), 首个增量前先发块标题。
+ * 标题行是块折叠/展开的抓手 —— 前端的块索引表按它定位, 所以文案与"▾"符号是接口的一部分,
+ * 改之前先看 ui/helpers.h 的 ui_fold_*。
+ * 思考内容不累积 (见 StreamCtx 说明), 只统计长度。 */
+static void on_reasoning_delta(void *ud, const char *delta) {
+    StreamCtx *ctx = (StreamCtx*)ud;
+    if (ctx->reasoning_len == 0) {
+        while (*delta == '\r' || *delta == '\n') delta++;   /* 与 content 一致: 跳过前导空行 */
+        if (!*delta) return;
+        emit_think_head(CAGENT_THINK_TITLE "\r\n");
+        ctx->reasoning_open = 1;
+    }
+    if (cagent_emit) { cagent_emit(delta, CAGENT_ROLE_THINK); ctx->emitted = 1; }
+    size_t dl = strlen(delta);
+    if (dl) ctx->reasoning_last = delta[dl - 1];
+    ctx->reasoning_len += dl;
+}
+
+/* 闭合思考块: 补一个换行收尾, 幂等 (已闭合则什么都不做)。
+ * 两条路径都要走到 —— ① 思考之后来了正式回答 (on_content_delta 开头);
+ * ② 整条流就结束在思考阶段 (比如 finish=length 把预算耗在思考上, 一个字回答都没出)。
+ * 漏掉 ② 的话, 那个思考块永远不闭合, 前端按"整段"折叠时会把它后面的内容一起吞掉。 */
+static void close_reasoning_block(StreamCtx *ctx) {
+    if (!ctx->reasoning_open) return;
+    ctx->reasoning_open = 0;
+    if (ctx->reasoning_last != '\n' && ctx->reasoning_last != '\r')
+        emit_think("\r\n");
+}
 
 /* content delta 回调: 增量显示 + 累积到 content_buf。
  * 首个增量跳过前导换行, 避免 (thinking...) 后出现多余空行。
@@ -179,9 +215,13 @@ typedef struct {
  * 丢掉, 模型下一轮看不到自己说过什么; 界面照常显示完整内容。 */
 static void on_content_delta(void *ud, const char *delta) {
     StreamCtx *ctx = (StreamCtx*)ud;
+    /* 思考块收尾: 不闭合的话正式回答会接在思考内容的同一行上, 而且前端的折叠块
+     * 以"整段"为单位, 会把正式回答一起折叠进去。 */
+    close_reasoning_block(ctx);
     if (ctx->content_len == 0) {
         while (*delta == '\r' || *delta == '\n') delta++;
         if (!*delta) return;
+        set_status("正在生成…");     /* 首个增量到达 = 模型开始吐字了 */
     }
     if (cagent_emit) { cagent_emit(delta, CAGENT_ROLE_AI); ctx->emitted = 1; }
     if (ctx->truncated) return;
@@ -386,6 +426,10 @@ static int http_post_stream_once(const char *url, const char *api_key,
                         const char *frs = json_as_str(json_obj_get(json_arr_at(choices, 0), "finish_reason"));
                         if (frs && *frs) snprintf(ctx->finish, sizeof(ctx->finish), "%s", frs);
                         const JValue *delta = json_obj_get(json_arr_at(choices, 0), "delta");
+                        /* 推理模型的思考内容: 与 content 并列的独立字段, **先于 content 处理** ——
+                         * on_content_delta 开头要把思考块收尾, 顺序反了就会先发正文再补换行。 */
+                        const char *rc = json_as_str(json_obj_get(delta, "reasoning_content"));
+                        if (rc) on_reasoning_delta(ctx, rc);
                         const char *content = json_as_str(json_obj_get(delta, "content"));
                         if (content) on_content_delta(ctx, content);
                         const JValue *tcs = json_obj_get(delta, "tool_calls");
@@ -476,16 +520,17 @@ static int http_post_stream(const char *url, const char *api_key,
             if (wait > 120000) wait = 120000;
         }
 
-        /* 按错误类别给界面不同的提示 (不再一律"网络瞬时错误") */
-        if (cagent_emit) {
-            if (status == -1)
-                append_text("(网络瞬时错误, 等待后重试...)\r\n");
-            else if (status == 429)
-                append_text("(请求限流, 等待后重试...)\r\n");
-            else if (status == 200 && !completed)
-                append_text("(响应流中断, 重试...)\r\n");
-            else
-                append_text("(服务端错误, 等待后重试...)\r\n");
+        /* 重试状态走**状态栏**, 不再往输出区打旁白 —— 它属于"此刻在做什么", 不是对话内容
+         * (以前每重试一次就刷一行"(请求限流, 等待后重试...)", 把对话冲得七零八落)。
+         * 原始错误类别照旧进日志, 见下面的 log_line。 */
+        {
+            char st[96];
+            const char *why = (status == -1) ? "网络错误"
+                            : (status == 429) ? "被限流"
+                            : (status == 200 && !completed) ? "响应流中断"
+                            : "服务端错误";
+            snprintf(st, sizeof(st), "%s, 重试中…", why);
+            set_status(st);
         }
         /* err 按字符边界截取: %.300s 会切半汉字, 日志自己先变成非法 UTF-8 */
         char eprev[304];

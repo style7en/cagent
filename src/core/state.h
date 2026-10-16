@@ -13,7 +13,7 @@
                                       * 超上限现在置 overflow 标志拒绝执行, 不再截断。
                                       * 64KB ≈ 2 万汉字, 覆盖绝大多数调用; 相比 256KB
                                       * 单轮并行 8 个调用省下约 1.5MB 堆。 */
-#define ARGS_DISPLAY_MAX 8192        /* 界面 [Tool] 行 arguments 展示上限 (执行与回传不受影响) */
+#define ARGS_DISPLAY_MAX 8192        /* 界面工具参数行 arguments 展示上限 (执行与回传不受影响) */
 #define TOOL_OUTPUT_CAP (16 * 1024)  /* 单个工具结果进入上下文的上限, 超出即截断 */
 #define EDIT_MAX_BYTES  (2 * 1024 * 1024) /* edit_file 可处理的最大文件体积 */
 /* 请求体缓冲: 内容是 messages(<= BUFSZ) 再套一层 JSON 框架并拼上 model 与 TOOLS_JSON,

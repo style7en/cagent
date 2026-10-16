@@ -32,8 +32,407 @@ static void set_edit_utf8(HWND h, const char *utf8) {
     free(wbuf);
 }
 
-/* 主线程处理: UTF-8 -> UTF-16, LF 补 CRLF, 按角色着色后追加到历史框末尾。
- * emoji 代理对区段显式用 Segoe UI Emoji 字体渲染 (YaHei 无字形, 字体绑定回退会渲染成 '?')。 */
+/* 输出区角色样式查表。role 越界(理论上不会)时退回 SYS, 不做越界访问。 */
+static const UiRoleStyle *ui_role_style(int role) {
+    if (role < 0 || role >= CAGENT_ROLE_COUNT) role = CAGENT_ROLE_SYS;
+    return &g_role_style[role];
+}
+
+/* 逻辑像素 -> twips (1/20 pt)。段落属性的单位是绝对值, 必须按 g_dpi 换算。
+ * 换算口径与 ui_history_parafmt 的行距一致: dp(px) * 1440 / dpi。 */
+static LONG ui_twips(int px) {
+    return (LONG)((LONGLONG)dp(px) * 1440 / (g_dpi ? g_dpi : 96));
+}
+
+/* 段落格式: 段前/段后留白 + 左缩进。作用于**选区所在的段落**, 所以在追加文本前调用,
+ * 新文本就落在已经设好格式的段落里。
+ * 只写 dwMask 里声明的字段, 因此不会碰 ui_history_parafmt 设的精确行距。 */
+static void ui_para_for_role(HWND h, int role) {
+    const UiRoleStyle *st = ui_role_style(role);
+    PARAFORMAT2 pf;
+    memset(&pf, 0, sizeof(pf));
+    pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_STARTINDENT;
+    pf.dySpaceBefore = ui_twips(st->sp_before);
+    pf.dySpaceAfter  = ui_twips(st->sp_after);
+    pf.dxStartIndent = ui_twips(st->indent);
+    SendMessageW(h, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+}
+
+/* 文档的字符位置 (cp) 总数。
+ * **必须用 EM_GETTEXTLENGTHEX 而不是 GetWindowTextLengthW**: 后者为了兼容 EDIT
+ * 会把每个段落标记按 CRLF 算成两个字符, 拿它当 cp 用会偏大 —— 追加时正好被 RichEdit
+ * 钳到末尾所以以前没暴露, 但块索引表是**按 cp 定位**的, 差一个字符就全错。
+ * GTL_DEFAULT 才是 cp 语义 (段落标记算 1 个)。 */
+static long ui_text_cp_len(HWND h) {
+    GETTEXTLENGTHEX gtl;
+    memset(&gtl, 0, sizeof(gtl));
+    gtl.flags = GTL_DEFAULT;
+    gtl.codepage = 1200;          /* Unicode */
+    return (long)SendMessageW(h, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
+}
+
+/* 在 pos 处插入一段带角色样式的文本, 返回插入的 UTF-16 码元数。pos < 0 = 追加到末尾。
+ *
+ * **插入点必须落在段落边界上** (紧跟某个 \r\n 之后): 段落格式作用于**整个段落**,
+ * 在段落中间插入会把那一段的缩进/留白一起改掉。现有调用点都满足 —— 追加在末尾,
+ * 折叠/展开/标题重写也都发生在以换行结尾的整段边界上。
+ *
+ * 排版分两层, 别混:
+ *   段落层 (ui_para_for_role) —— 段前/段后留白、左缩进, 决定"块与块之间的距离";
+ *   字符层 (下面按角色构造的 CHARFORMAT2W) —— 颜色、粗斜体、等宽、底色, 决定"这块长什么样"。
+ * 两层都由 g_role_style 一张表驱动 (见 ui/state.h)。 */
+static long ui_insert_styled(HWND h, const WCHAR *w, int role, long pos) {
+    int total = w ? lstrlenW(w) : 0;
+    if (total <= 0) return 0;
+    long doc_len = ui_text_cp_len(h);
+    if (pos < 0) pos = doc_len;
+
+    /* 空文档时吃掉开头的换行。core 习惯在每条消息前加 \r\n 做分隔, 但**文档开头不需要**:
+     * 那个空段落自身就占一整行高, 再叠上该角色的段前距, 输出区顶部会凭空多出一大块空白。 */
+    if (doc_len == 0) {
+        while (total > 0 && (*w == L'\r' || *w == L'\n')) { w++; total--; }
+        if (total <= 0) return 0;
+    }
+
+    /* **中间插入会顺带改掉"后一段"的段落格式。** RichEdit 把落在段边界上的插入点算作
+     * **后一段**, 所以下面那次 EM_SETPARAFORMAT 会连后一段的缩进/留白一起改掉。
+     * 症状很隐蔽: 展开上一个折叠块之后, 下一个块的标题行莫名被缩进 (实测 indent 从 0
+     * 变成 240 twips), 而它自己什么都没做错。先把后一段的格式存下来, 插完再写回。 */
+    PARAFORMAT2 saved;
+    int restore = (pos > 0 && pos < doc_len);
+    if (restore) {
+        memset(&saved, 0, sizeof(saved));
+        saved.cbSize = sizeof(saved);
+        SendMessageW(h, EM_SETSEL, pos, pos);
+        SendMessageW(h, EM_GETPARAFORMAT, 0, (LPARAM)&saved);
+    }
+
+    SendMessageW(h, EM_SETSEL, pos, pos);
+
+    /* 当前插入点的字符格式 (字体/字号) 作为普通文本基底 */
+    CHARFORMAT2W base;
+    memset(&base, 0, sizeof(base));
+    base.cbSize = sizeof(base);
+    SendMessageW(h, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&base);
+
+    /* 按角色叠加样式。注意必须显式清掉 CFE_AUTOCOLOR —— 它随插入点基底带来, 置位时
+     * RichEdit 会忽略 crTextColor, 颜色设置将完全无效 (症状: 所有文字都是系统黑)。
+     * 同理清 CFE_AUTOBACKCOLOR: 不设底色的角色要让底色跟随控件背景, 设底色的角色
+     * 必须先把"自动"位摘掉, 否则 crBackColor 同样会被忽略。
+     * **刻意不设 CFM_SIZE / yHeight** —— 字号一律继承控件的默认字体。
+     * 踩过的两个坑, 都是"给 run 写死字号"引出来的:
+     *   ① CHARFORMAT.yHeight 是 em 高, 而 WM_SETFONT 的 CreateFontW(h) 是**字身格高**;
+     *      YaHei 的 格/em ≈ 1.27, 于是写死 yHeight 的字比默认字体大 27%,
+     *      而行距是按默认字体的 tmHeight 算的 -> 字被行距削顶(实测削掉 10px)。
+     *   ② WM_SETFONT 会让 RichEdit 丢掉 run 上的显式字号 —— 一旦跨显示器触发
+     *      WM_DPICHANGED 里那轮 ui_fonts_rebuild, 文字会从"大"跳回"默认", 看着像换了套排版。
+     * 缩放输出区字号请走 EM_SETZOOM(见 wndproc.h 的 ui_history_zoom), 它不碰字符格式。 */
+    const UiRoleStyle *st = ui_role_style(role);
+    CHARFORMAT2W role_cf = base;
+    role_cf.dwMask    |= CFM_COLOR | CFM_BOLD | CFM_ITALIC | CFM_FACE | CFM_BACKCOLOR;
+    role_cf.dwEffects &= ~(CFE_AUTOCOLOR | CFE_AUTOBACKCOLOR | CFE_BOLD | CFE_ITALIC);
+    role_cf.crTextColor = st->fg;
+    if (st->bold)   role_cf.dwEffects |= CFE_BOLD;
+    if (st->italic) role_cf.dwEffects |= CFE_ITALIC;
+    if (st->has_bg) role_cf.crBackColor = st->bg;
+    else            role_cf.dwEffects  |= CFE_AUTOBACKCOLOR;   /* 跟随输出区背景 */
+    wcscpy(role_cf.szFaceName, st->mono ? CAGENT_MONO_FACE : CAGENT_UI_FACE);
+
+    /* 一次性插入整串, 再按 run 覆盖字体。
+     * 不用"分段插入"的写法是因为那需要给每段就地补 NUL, 而 w 可能是字符串字面量
+     * (只读段, 写进去直接崩)。先整串插入 + 后置格式, 同样满足"不同字体分段"的需求。 */
+    SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&role_cf);
+    SendMessageW(h, EM_REPLACESEL, FALSE, (LPARAM)w);
+
+    /* 连续 emoji 代理对为一段, 换成 Segoe UI Emoji (YaHei 无字形, 字体绑定回退会渲染成 '?') */
+    int i = 0;
+    while (i < total) {
+        BOOL emo = (w[i] >= 0xD800 && w[i] <= 0xDBFF &&
+                    w[i+1] >= 0xDC00 && w[i+1] <= 0xDFFF);
+        int end = i;
+        if (emo) {
+            while (end + 1 < total && w[end] >= 0xD800 && w[end] <= 0xDBFF &&
+                   w[end+1] >= 0xDC00 && w[end+1] <= 0xDFFF) end += 2;
+        } else {
+            while (end < total && !(w[end] >= 0xD800 && w[end] <= 0xDBFF &&
+                                  end + 1 < total && w[end+1] >= 0xDC00 && w[end+1] <= 0xDFFF)) end++;
+        }
+        if (emo) {
+            CHARFORMAT2W cf = role_cf;
+            cf.dwMask |= CFM_FACE;
+            wcscpy(cf.szFaceName, L"Segoe UI Emoji");
+            SendMessageW(h, EM_SETSEL, pos + i, pos + end);
+            SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+        }
+        i = end;
+    }
+
+    /* **段落格式按"实际插入范围"设, 不能按"插入点所在段落"设。**
+     * 插入点落在文档末尾时, RichEdit 把它算作最后一段落之内 —— 末尾那个段落标记不计入
+     * cp 长度, 于是设置会落到**上一段**上。症状很有迷惑性: 参数行的缩进丢了、紧跟其后
+     * 的第一条旁白反而缩进了, 而再往后几条又是好的 (插入点这时才真正落在新段落里)。
+     * 选中刚插入的范围再设, 段落归属就没有歧义。 */
+    long added = ui_text_cp_len(h) - doc_len;
+    if (added > 0) {
+        SendMessageW(h, EM_SETSEL, pos, pos + added);
+        ui_para_for_role(h, role);
+    }
+
+    /* 把后一段的段落格式写回去 (见上面 restore 的说明)。位置用**实际 cp 增量**算,
+     * 不能用 total —— 段落标记在两种口径下长度不同。 */
+    if (restore) {
+        SendMessageW(h, EM_SETSEL, pos + added, pos + added);
+        SendMessageW(h, EM_SETPARAFORMAT, 0, (LPARAM)&saved);
+    }
+    return total;
+}
+
+/* 读回 [start,end) 的文本 (UTF-16, 调用方负责 free)。失败返回 NULL。
+ * 注意 RichEdit 的 EM_GETTEXTRANGE 把段落标记还原成**单个 CR** —— 所以读回的长度
+ * 可能小于 end-start (文档里是 CRLF)。重新插回时单个 CR 同样能分段, 但**调用方必须
+ * 用返回的字符串长度而不是原来的范围长度**去更新位置索引。 */
+static WCHAR *ui_get_range(HWND h, long start, long end) {
+    if (end <= start) return NULL;
+    long n = end - start;
+    WCHAR *buf = (WCHAR*)malloc((size_t)(n + 1) * sizeof(WCHAR));
+    if (!buf) return NULL;
+    TEXTRANGEW tr;
+    tr.chrg.cpMin = start;
+    tr.chrg.cpMax = end;
+    tr.lpstrText = buf;
+    LONG got = (LONG)SendMessageW(h, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    if (got < 0) { free(buf); return NULL; }
+    buf[got] = L'\0';
+    return buf;
+}
+
+/* 用带样式的新文本替换 [start,end) 范围, 返回新文本的码元数 (删除后为空则 0)。
+ * 折叠 (替换成空) / 展开 (插回正文) / 标题重写 (替换单个状态符号) 都走它。 */
+static long ui_replace_styled(HWND h, long start, long end, const WCHAR *w, int role) {
+    if (end > start) {
+        SendMessageW(h, EM_SETSEL, start, end);
+        SendMessageW(h, EM_REPLACESEL, FALSE, (LPARAM)L"");
+    }
+    if (!w || !*w) return 0;
+    return ui_insert_styled(h, w, role, start);
+}
+
+/* ===== 可折叠块 (思考过程 / 工具调用) =====
+ * 数据与契约见 ui/state.h 的 UiFoldBlock。这里只放操作。 */
+
+static void ui_fold_reset(void) {
+    for (int i = 0; i < g_fold_n; i++)
+        for (int s = 0; s < g_folds[i].n_segs; s++)
+            free(g_folds[i].segs[s].text);
+    g_fold_n = 0;
+}
+
+/* 新块的标题行刚插入: cp_before/cp_after 是插入前后的文档 cp 长度。
+ * head_cp 在这里**实测**而不是写死常量 —— 工具块的标题行长度随工具名变化,
+ * 而且"一个段落标记算几个 cp"这件事 RichEdit 各版本口径不一, 实测比猜可靠:
+ * 这个值错了, 该块正文的起点就全偏。 */
+static void ui_fold_new(int kind, long cp_before, long cp_after) {
+    if (g_fold_n >= UI_FOLD_MAX) return;
+    UiFoldBlock *b = &g_folds[g_fold_n++];
+    memset(b, 0, sizeof(*b));
+    b->kind    = kind;
+    b->cp_head = cp_before;
+    b->head_cp = cp_after - cp_before;
+}
+
+/* 正文追加后延长当前块。只有属于该块的角色才算数:
+ *   思考块收 THINK, 工具块收 ARGS / OUTPUT。
+ * 末尾同角色就并进上一段, 否则开一段新的 —— 展开时要按段重放, 才能保住
+ * "参数行是等宽灰、输出块是等宽灰底"这个区别。 */
+static void ui_fold_extend(int role, long cp_added) {
+    if (g_fold_n <= 0 || cp_added <= 0) return;
+    UiFoldBlock *b = &g_folds[g_fold_n - 1];
+    if (b->collapsed) return;          /* 收起态下不该再有正文追加 (流式中已禁用折叠) */
+    int takes = (b->kind == UI_FOLD_THINK && role == CAGENT_ROLE_THINK)
+             || (b->kind == UI_FOLD_TOOL  && (role == CAGENT_ROLE_ARGS ||
+                                              role == CAGENT_ROLE_OUTPUT));
+    if (!takes) return;
+    if (b->n_segs > 0 && b->segs[b->n_segs - 1].role == role) {
+        b->segs[b->n_segs - 1].len += cp_added;
+    } else if (b->n_segs < UI_FOLD_SEG_MAX) {
+        b->segs[b->n_segs].role = role;
+        b->segs[b->n_segs].len  = cp_added;
+        b->segs[b->n_segs].text = NULL;
+        b->n_segs++;
+    } else {
+        return;
+    }
+    /* body_len 是**各段之和**, 不是"从正文起点到文档末尾"。正文中间可能插进不属于本块的
+     * 内容 (典型是限流重试时那几条旁白), 拿文档末尾去减会把它们的长度也算进来 —— 于是
+     * "各段之和 != body_len" 的校验永远通不过, 整个块就折不动了 (症状是"点了没反应")。 */
+    b->body_len = 0;
+    for (int s = 0; s < b->n_segs; s++) b->body_len += b->segs[s].len;
+}
+
+/* 丢弃 cp 起点在 cp 之后的块: 重试回删把它们的正文删了, 位置不再可信。 */
+static void ui_fold_trim_from(long cp) {
+    while (g_fold_n > 0 && g_folds[g_fold_n - 1].cp_head >= cp) {
+        UiFoldBlock *b = &g_folds[--g_fold_n];
+        for (int s = 0; s < b->n_segs; s++) free(b->segs[s].text);
+    }
+}
+
+/* 命中测试: pt 是否落在某个块的标题行上, 返回块下标, 没有则 -1。
+ *
+ * 做法是取标题行首字符的坐标, 再判断 pt 与哪一行最接近 —— **不用 EM_CHARFROMPOS**:
+ * 它返回值里的字符索引只有 16 位, 文档超过 65535 字符就截断了, 而这里的对话可以很长。
+ * 行高直接取 ui_history_parafmt 设的那个精确行距 —— 它不随字体走, 但会随 EM_SETZOOM 缩放,
+ * 所以用 dp(g_hist_lpx + HIST_LINE_EXTRA)。
+ *
+ * **纵向放宽到一个行高**: 标题行本身只有一行, 200% 下也就 38px, 鼠标稍微偏一点就点空了。
+ * 放宽后落在"标题行上下各一行"以内都算命中, 取**最近的那一行** —— 这样既好点中,
+ * 又不会出现"点 A 行却折了 B 行"的错乱 (相邻两个标题行之间至少隔着一个参数行)。
+ * 横向不设限: 标题行整行可点, 不用精确戳到字上。 */
+static int ui_fold_hit(POINTL pt) {
+    if (g_fold_n <= 0) return -1;
+    long line_h = dp(g_hist_lpx + HIST_LINE_EXTRA);
+    if (line_h <= 0) return -1;
+    long half = line_h / 2;
+    int  best = -1;
+    long best_d = 0x7FFFFFFF;
+    for (int i = 0; i < g_fold_n; i++) {
+        POINTL p;
+        memset(&p, 0, sizeof(p));
+        if (SendMessageW(g_hHistory, EM_POSFROMCHAR, (WPARAM)&p, (LPARAM)g_folds[i].cp_head) == -1)
+            continue;
+        long d = (long)pt.y - (p.y + half);      /* 与标题行垂直中心的距离 */
+        if (d < 0) d = -d;
+        if (d <= line_h && d < best_d) { best_d = d; best = i; }
+    }
+    return best;
+}
+
+/* 标题行首字符的展开/收起符号 —— **必须与 core 的 CAGENT_FOLD_GLYPH_OPEN/SHUT 一致**
+ * (那边是窄字符串 UTF-8, 这边是宽字符)。两个都是单个 UTF-16 码元, 替换后标题行长度不变;
+ * 长度一变, 正文起点和后续块的位置就全得重算。 */
+#define UI_FOLD_GLYPH_OPEN  L"▾"
+#define UI_FOLD_GLYPH_SHUT  L"▸"
+
+/* 折叠范围的起点: 跳过**不参与折叠**的 ARGS 段。
+ * 参数行不收 —— 它是"这次调用干了什么"的唯一线索, 通常也就一两行; 全收掉只剩一个工具名,
+ * 四个 read_file 排在一起谁也分不清谁 (实测用户就撞上了这个)。输出块才是真正冗长的东西。 */
+static long ui_fold_cut_start(const UiFoldBlock *b) {
+    long pos = b->cp_head + b->head_cp;
+    for (int s = 0; s < b->n_segs; s++) {
+        if (b->segs[s].role != CAGENT_ROLE_ARGS) break;
+        pos += b->segs[s].len;
+    }
+    return pos;
+}
+
+/* 把所有块的标题行按各自角色重设一遍段落格式。
+ *
+ * 为什么需要这个"兜底重设": 折叠/展开都是在**段边界**上插入或删除内容, 而 RichEdit 对
+ * "插入点落在段边界时算作哪一段"的处理会让相邻段落的缩进/留白被带跑 —— 实测展开第 N 块
+ * 之后, 第 N+1 块的标题行缩进从 0 变成 240 twips (正是输出块的缩进值)。
+ * ui_insert_styled 里已经存/恢复了一道, 但规则太绕、容易漏; 块数有上限 (64), 直接按角色
+ * 把标题行重设一遍, 比逐处推演 RichEdit 的继承行为可靠得多。
+ * 只动 SPACEBEFORE/SPACEAFTER/STARTINDENT (见 ui_para_for_role), 不碰行距。 */
+static void ui_fold_refresh_heads(void) {
+    for (int i = 0; i < g_fold_n; i++) {
+        int role = (g_folds[i].kind == UI_FOLD_THINK) ? CAGENT_ROLE_THINK_HEAD
+                                                      : CAGENT_ROLE_TOOL;
+        SendMessageW(g_hHistory, EM_SETSEL, g_folds[i].cp_head, g_folds[i].cp_head);
+        ui_para_for_role(g_hHistory, role);
+    }
+}
+
+/* 切换第 idx 块的收起/展开。
+ *
+ * 三个必须守住的点:
+ *   ① 折叠范围两端都落在段落边界上 (core 保证各段以换行收尾), 否则删完会把相邻段落并到一起;
+ *   ② 读回的正文长度可能**小于**原 cp 长度 (EM_GETTEXTRANGE 把 CRLF 还原成单个 CR),
+ *      所以展开后要用实际插入量回写每段长度, 并用同一个 delta 更新后续块的位置;
+ *   ③ 标题状态符号只替换**一个字符**, 长度不变, 所以标题自身不引起位置漂移。 */
+static void ui_fold_set(int idx, int collapse) {
+    if (idx < 0 || idx >= g_fold_n) return;
+    UiFoldBlock *b = &g_folds[idx];
+    if (b->collapsed == !!collapse) return;      /* 已经是目标状态 */
+    long cut_start = ui_fold_cut_start(b);
+    long delta;
+
+    if (collapse) {
+        /* 折叠范围 = 第一个非 ARGS 段到末尾; 长度就是这些段的长度之和, 不需要再和
+         * body_len 对账 —— body_len 本身就是它们的和 (见 ui_fold_extend)。 */
+        int s0 = 0;
+        for (s0 = 0; s0 < b->n_segs; s0++)
+            if (b->segs[s0].role != CAGENT_ROLE_ARGS) break;
+        long cut_len = 0;
+        for (int s = s0; s < b->n_segs; s++) cut_len += b->segs[s].len;
+        if (cut_len <= 0) return;                 /* 没有可收的内容 (空块) */
+        long pos = cut_start;
+        for (int s = s0; s < b->n_segs; s++) {
+            b->segs[s].text = ui_get_range(g_hHistory, pos, pos + b->segs[s].len);
+            if (!b->segs[s].text) {
+                for (int k = s0; k < s; k++) { free(b->segs[k].text); b->segs[k].text = NULL; }
+                return;
+            }
+            pos += b->segs[s].len;
+        }
+        ui_replace_styled(g_hHistory, cut_start, cut_start + cut_len, NULL, 0);
+        delta = -cut_len;
+        b->collapsed = 1;
+        ui_replace_styled(g_hHistory, b->cp_head, b->cp_head + 1,
+                          UI_FOLD_GLYPH_SHUT, b->kind == UI_FOLD_THINK ? CAGENT_ROLE_THINK_HEAD
+                                                                       : CAGENT_ROLE_TOOL);
+    } else {
+        int s0 = 0;
+        for (s0 = 0; s0 < b->n_segs; s0++)
+            if (b->segs[s0].role != CAGENT_ROLE_ARGS) break;
+        long pos = cut_start, total = 0;
+        for (int s = s0; s < b->n_segs; s++) {
+            long n = ui_replace_styled(g_hHistory, pos, pos, b->segs[s].text, b->segs[s].role);
+            free(b->segs[s].text);
+            b->segs[s].text = NULL;
+            b->segs[s].len  = n;      /* 用实际插入量回写, 见上面第 ② 条 */
+            pos   += n;
+            total += n;
+        }
+        /* 展开后按段重算 body_len (上面已把 segs[].len 回写成实际插入量) */
+        b->body_len = 0;
+        for (int s = 0; s < b->n_segs; s++) b->body_len += b->segs[s].len;
+        delta = total;
+        b->collapsed = 0;
+        ui_replace_styled(g_hHistory, b->cp_head, b->cp_head + 1,
+                          UI_FOLD_GLYPH_OPEN, b->kind == UI_FOLD_THINK ? CAGENT_ROLE_THINK_HEAD
+                                                                      : CAGENT_ROLE_TOOL);
+    }
+    for (int j = idx + 1; j < g_fold_n; j++) g_folds[j].cp_head += delta;
+    ui_fold_refresh_heads();     /* 兜底: 段边界插入会把相邻段的缩进带跑, 见上面的说明 */
+    InvalidateRect(g_hHistory, NULL, TRUE);
+}
+
+/* 用户点击切换: 记下"这个块被手动动过", 之后不再自动折叠 (见 state.h 的 user_toggled)。
+ *
+ * **切换前后要把滚动位置原样恢复** —— RichEdit 在文档长度变化时会自己挪滚动条, 折叠后
+ * 整屏内容上移、展开后被推下去, 而用户的视线就落在刚点的那一行上, 于是"点一下整个视图
+ * 都跳了"。恢复滚动位置的效果正是想要的: **标题行钉在原地, 只有它下面的内容伸缩**。
+ * 自动折叠走 ui_fold_collapse, 那条路径希望视图跟着滚到底, 所以这层只包在点击路径上。 */
+static void ui_fold_toggle(int idx) {
+    if (idx < 0 || idx >= g_fold_n) return;
+    g_folds[idx].user_toggled = 1;
+    POINT scroll;
+    memset(&scroll, 0, sizeof(scroll));
+    SendMessageW(g_hHistory, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
+    ui_fold_set(idx, !g_folds[idx].collapsed);
+    SendMessageW(g_hHistory, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
+}
+
+/* 按"默认折叠"收起第 idx 块 (块结束时调用)。用户手动展开过的不动 —— 别把人家特意
+ * 展开的那个又按回去。 */
+static void ui_fold_collapse(int idx) {
+    if (idx < 0 || idx >= g_fold_n) return;
+    if (g_folds[idx].user_toggled) return;
+    ui_fold_set(idx, 1);
+}
+
+/* 主线程处理: UTF-8 -> UTF-16, LF 补 CRLF, 按角色着色/缩进后追加到历史框末尾。 */
 static void do_append(const char *utf8, int role) {
     size_t in_len = strlen(utf8);
     char *norm = (char*)malloc(in_len * 2 + 1);
@@ -57,65 +456,39 @@ static void do_append(const char *utf8, int role) {
     MultiByteToWideChar(CP_UTF8, 0, norm, -1, wbuf, wlen);
     free(norm);
 
-    /* 当前插入点的字符格式 (字体/字号) 作为普通文本基底 */
-    CHARFORMAT2W base;
-    memset(&base, 0, sizeof(base));
-    base.cbSize = sizeof(base);
-    SendMessageW(g_hHistory, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&base);
-
-    /* 按角色叠加颜色: 用户=蓝加粗, 系统/思考提示=灰, AI=默认黑; 不斜体, 字号随基底。
-     * 注意必须显式清掉 CFE_AUTOCOLOR —— 它随插入点基底带来, 置位时 RichEdit 会忽略
-     * crTextColor, 颜色设置将完全无效 (症状: 所有文字都是系统黑)。同时压掉 ITALIC,
-     * 避免插入点周围残留的斜体格式传染给新文本。 */
-    CHARFORMAT2W role_cf = base;
-    role_cf.dwMask    |= CFM_COLOR | CFM_BOLD | CFM_ITALIC;
-    role_cf.dwEffects &= ~(CFE_AUTOCOLOR | CFE_BOLD | CFE_ITALIC);
-    /* **刻意不设 CFM_SIZE / yHeight** —— 字号一律继承控件的默认字体。
-     * 踩过的两个坑, 都是"给 run 写死字号"引出来的:
-     *   ① CHARFORMAT.yHeight 是 em 高, 而 WM_SETFONT 的 CreateFontW(h) 是**字身格高**;
-     *      YaHei 的 格/em ≈ 1.27, 于是写死 yHeight 的字比默认字体大 27%,
-     *      而行距是按默认字体的 tmHeight 算的 -> 字被行距削顶(实测削掉 10px)。
-     *   ② WM_SETFONT 会让 RichEdit 丢掉 run 上的显式字号 —— 一旦跨显示器触发
-     *      WM_DPICHANGED 里那轮 ui_fonts_rebuild, 文字会从"大"跳回"默认", 看着像换了套排版。
-     * 缩放输出区字号请走 EM_SETZOOM(见 wndproc.h 的 ui_history_zoom), 它不碰字符格式。 */
-    role_cf.crTextColor = RGB(0, 0, 0);            /* AI: 默认黑 */
-    if (role == CAGENT_ROLE_USER) {
-        role_cf.crTextColor = RGB(0, 90, 200);     /* 用户: 蓝 */
-        role_cf.dwEffects |= CFE_BOLD;             /* 用户: 加粗 */
-    } else if (role == CAGENT_ROLE_SYS) {
-        role_cf.crTextColor = RGB(110, 110, 110);  /* 系统/思考: 灰 */
-    }
-
-    /* 按 run 插入: 连续 emoji 代理对为一段(用 Segoe UI Emoji), 其余为普通段 */
-    int total = lstrlenW(wbuf);
-    int i = 0;
-    while (i < total) {
-        BOOL emo = (wbuf[i] >= 0xD800 && wbuf[i] <= 0xDBFF &&
-                    wbuf[i+1] >= 0xDC00 && wbuf[i+1] <= 0xDFFF);
-        int end = i;
-        if (emo) {
-            while (end + 1 < total && wbuf[end] >= 0xD800 && wbuf[end] <= 0xDBFF &&
-                   wbuf[end+1] >= 0xDC00 && wbuf[end+1] <= 0xDFFF) end += 2;
-        } else {
-            while (end < total && !(wbuf[end] >= 0xD800 && wbuf[end] <= 0xDBFF &&
-                                  end + 1 < total && wbuf[end+1] >= 0xDC00 && wbuf[end+1] <= 0xDFFF)) end++;
-        }
-
-        CHARFORMAT2W cf = role_cf;
-        if (emo) {
-            cf.dwMask |= CFM_FACE;
-            wcscpy(cf.szFaceName, L"Segoe UI Emoji");
-        }
-        int len = GetWindowTextLengthW(g_hHistory);
+    /* 兜底: 角色切换而上一段没写完时先补个换行 (理由见 ui/state.h 的 g_last_no_lf) */
+    if (g_last_role >= 0 && role != g_last_role && g_last_no_lf) {
+        long len = ui_text_cp_len(g_hHistory);
         SendMessageW(g_hHistory, EM_SETSEL, len, len);
-        SendMessageW(g_hHistory, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-        { WCHAR save = wbuf[end]; wbuf[end] = L'\0';
-          SendMessageW(g_hHistory, EM_REPLACESEL, FALSE, (LPARAM)(wbuf + i));
-          wbuf[end] = save; }
-        i = end;
+        SendMessageW(g_hHistory, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
     }
+
+    /* 新块开始 = 上一个块到此结束, 按"默认折叠"把它收起来。
+     * **必须在插入新标题行之前做**: 折叠会让后面所有块的位置前移, 插完再折就会把刚记下的
+     * cp_head 弄错 —— 之后所有命中测试和展开都跟着偏。 */
+    if (role == CAGENT_ROLE_THINK_HEAD || role == CAGENT_ROLE_TOOL)
+        ui_fold_collapse(g_fold_n - 1);
+
+    long cp_before = ui_text_cp_len(g_hHistory);
+    ui_insert_styled(g_hHistory, wbuf, role, -1);
+    long cp_after = ui_text_cp_len(g_hHistory);
+    long cp_added = cp_after - cp_before;
+
+    /* 折叠块索引: 标题行开一个新块, 属于当前块的正文延长它。
+     * THINK_HEAD 开思考块 (正文是 THINK 角色), TOOL 开工具块 (正文是参数行 + 输出块)。
+     * 工具块对所有模型都有用 —— 工具输出经常几十上百行, 折起来界面才清爽。 */
+    if (role == CAGENT_ROLE_THINK_HEAD)   ui_fold_new(UI_FOLD_THINK, cp_before, cp_after);
+    else if (role == CAGENT_ROLE_TOOL)    ui_fold_new(UI_FOLD_TOOL, cp_before, cp_after);
+    else                                  ui_fold_extend(role, cp_added);
+
     SendMessageW(g_hHistory, EM_SCROLLCARET, 0, 0);
     SendMessageW(g_hHistory, WM_VSCROLL, SB_BOTTOM, 0);   /* 强制滚到末尾 */
-    if (role == CAGENT_ROLE_AI) g_stream_chars += total;  /* 供重试时回删本分段 */
+    /* 供重试时回删本分段: 记的是**实际增加的 cp 数**, 不是 wbuf 的码元数 —— 回删按 cp
+     * 定位, 两个口径混用会删多或删少 (段落标记在两种口径下长度不同)。
+     * 思考内容也必须算进去, 否则重试时旧思考块会留在界面上跟新的一起叠着。 */
+    if (role == CAGENT_ROLE_AI || role == CAGENT_ROLE_THINK || role == CAGENT_ROLE_THINK_HEAD)
+        g_stream_chars += cp_added;
+    g_last_role  = role;
+    g_last_no_lf = (wbuf[0] && wbuf[lstrlenW(wbuf) - 1] != L'\r' && wbuf[lstrlenW(wbuf) - 1] != L'\n');
     free(wbuf);
 }

@@ -1,3 +1,10 @@
+# ===== 输出约定: make 打到终端的一切文案必须是纯 ASCII 英文 =====
+# 本文件以 UTF-8 保存, 而中文 Windows 的控制台默认代码页是 936(GBK)。
+# $(info) / $(warning) / @echo 的字节是原样透传给终端的, 不做任何转码 ——
+# 于是 UTF-8 中文会被按 GBK 两两拆解, "静态链接" 显示成 "闈欐€侀摼鎺?" 之类的乱码。
+# 结论: 注释可以随便写中文(注释不进终端), 但凡是 make 会打印出来的文案一律用英文。
+# 若确需在终端看中文, 可在支持 UTF-8 的终端里先执行 `chcp 65001`。
+
 CC = gcc
 WINDRES = windres
 
@@ -9,16 +16,17 @@ WINDRES = windres
 #   找到   -> 保留 -fstack-protector-strong + 静态链接 libssp;
 #   找不到 -> 回退 -fno-stack-protector (关掉栈保护), 保证仍能构建出可运行的 exe。
 # 可用 `make LIBSSP_PATH=libssp.a` 强制走回退分支 (验证用)。
+# 注意: STACK_NOTE 会被 $(info) 打印到终端, 只能写 ASCII 英文 (见文件头"输出约定")。
 LIBSSP_PATH ?= $(shell $(CC) -print-file-name=libssp.a)
 LIBSSP_REAL := $(filter-out libssp.a,$(LIBSSP_PATH))
 ifneq ($(LIBSSP_REAL),)
   STACK_CFLAGS  := -fstack-protector-strong
   STACK_LDFLAGS := -Wl,-Bstatic -lssp -Wl,-Bdynamic
-  STACK_NOTE    := libssp.a 静态链接 ($(LIBSSP_REAL))
+  STACK_NOTE    := libssp.a static-linked ($(LIBSSP_REAL))
 else
   STACK_CFLAGS  := -fno-stack-protector
   STACK_LDFLAGS :=
-  STACK_NOTE    := 未找到 libssp.a, 回退 -fno-stack-protector
+  STACK_NOTE    := libssp.a not found, falling back to -fno-stack-protector
 endif
 $(info [stack-protector] $(STACK_NOTE))
 
@@ -80,7 +88,11 @@ TEST_TARGET = cagent_test.exe
 TEST_CFLAGS = -Isrc -Itest
 TEST_LDFLAGS = -lcomctl32 -lwinhttp -lcrypt32 -lshell32 -lole32 -luuid
 
-.PHONY: all clean test
+# 输出区排版的离屏预览: 把角色样式渲染成 BMP, 人眼检查 (验证工具, 不进产品二进制)
+PREVIEW_SRC = test/ui_preview.c
+PREVIEW_TARGET = ui_preview.exe
+
+.PHONY: all clean test preview
 
 all: $(GUI_TARGET)
 
@@ -102,5 +114,15 @@ test: $(TEST_TARGET)
 $(TEST_TARGET): $(TEST_SRC) $(TEST_HDRS) $(CORE_HDRS)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) -o $@ $(TEST_SRC) $(LDFLAGS) $(TEST_LDFLAGS)
 
+# make preview: 渲染输出区排版 -> preview_out.bmp (人工看配色/缩进/段间距对不对)
+# -Wno-unused-*: 预览程序直接聚合整套 UI 代码, 但只用到其中一小部分 —— 单 TU 下其余
+# 部分必然"未被使用"。只在这里关, 别动主程序的告警开关。
+preview: $(PREVIEW_TARGET)
+	./$(PREVIEW_TARGET)
+
+$(PREVIEW_TARGET): $(PREVIEW_SRC) $(CORE_HDRS) $(UI_HDRS) src/main_gui.c
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable \
+	      -Isrc -o $@ $(PREVIEW_SRC) $(LDFLAGS) $(TEST_LDFLAGS) -lgdi32 -luser32
+
 clean:
-	@rm -rf $(GUI_TARGET) $(GUI_RES) $(TEST_TARGET)
+	@rm -rf $(GUI_TARGET) $(GUI_RES) $(TEST_TARGET) $(PREVIEW_TARGET)

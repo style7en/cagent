@@ -36,6 +36,12 @@
  * 不能直接克隆主窗口的 g_hFont(那可能是别的 DPI 的尺寸)。 */
 #define CAGENT_UI_FACE L"Microsoft YaHei UI"
 
+/* 等宽字体族, 用于工具参数与工具输出。选 Consolas 是因为它从 Vista 起随系统分发
+ * (不引入额外依赖), 且中英文混排时数字与 ASCII 宽度一致 —— 看目录树、看 diff 时对齐。
+ * 中文没有等宽字形, 会由 RichEdit 的字体绑定回退到系统字体, 这没关系:
+ * 这些块里主要是路径、命令、代码, 中文占比很低。 */
+#define CAGENT_MONO_FACE L"Consolas"
+
 /* 界面字体渲染质量。**别再改回 ANTIALIASED_QUALITY** —— 那是"灰度抗锯齿", 在 100%
  * (96 DPI) 下笔画边缘只有灰阶过渡, 观感发虚发糊, 正是 issue #1 的成因。
  *

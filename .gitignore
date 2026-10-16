@@ -5,6 +5,12 @@
 *.obj
 *.res
 
+# 输出区排版预览产物 (make preview 生成, 供人眼检查配色/缩进/段间距/折叠)
+preview_out.bmp
+preview_out.png
+preview_folded.bmp
+preview_folded.png
+
 # 运行时配置 (含 API Key, 严禁提交)
 cagent.ini
 
@@ -34,5 +40,5 @@ docs/
 # E2E UI 测试运行物证 (每次运行生成, 不入库)
 test/e2e_artifacts/
 
-# UT 测试隔离工作区 (make test 运行时生成)
+# UT 测试隔离工作区 (make test 运行时生成; 正常跑完会自己清掉, 这条只是兜底)
 cagent_test_ws/

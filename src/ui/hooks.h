@@ -13,6 +13,15 @@ static void gui_emit(const char *utf8, int role) {
     if (copy) PostMessageW(g_hHistory, WM_APP_APPEND, (WPARAM)role, (LPARAM)copy);
 }
 
+/* 状态栏: 报告"模型此刻在做什么"。core 在**工作线程**里调它, 所以只能投递到 UI 线程
+ * (直接碰控件是不允许的); text 为 NULL 表示回到空闲。
+ * 这些信息以前是往输出区打旁白的, 但它们属于状态而不是对话内容 —— 见 core/base.h 的说明。 */
+static void gui_status(const char *text) {
+    if (!g_hStatus) return;                        /* 控件还没建好 (理论上不会走到) */
+    char *copy = text ? strdup(text) : NULL;
+    PostMessageW(GetParent(g_hStatus), WM_APP_STATUS, 0, (LPARAM)copy);
+}
+
 /* 一轮 Agent 结束: 恢复 UI。 */
 static void gui_on_done(void) {
     InterlockedExchange(&g_running, 0);
@@ -21,6 +30,12 @@ static void gui_on_done(void) {
     EnableWindow(g_hSend, TRUE);
     EnableWindow(g_hInput, TRUE);
     SetFocus(g_hInput);
+    /* 本轮结束 = 最后一个折叠块也结束了, 按默认收起它。
+     * 走 PostMessage 而不是直接调: 本函数在**工作线程**里跑, 而折叠要动 RichEdit 控件
+     * (读文本、删文本), 跨线程直接操作控件是不允许的。 */
+    PostMessageW(g_hHistory, WM_APP_FOLDEND, 0, 0);
+    /* 状态栏回到"就绪" —— 同样只能投递 (传 0 表示空闲) */
+    if (g_hStatus) PostMessageW(GetParent(g_hStatus), WM_APP_STATUS, 0, 0);
 }
 
 /* 流式分段: 发请求前开新分段, 重试前回删本分段已上屏的内容。

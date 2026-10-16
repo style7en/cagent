@@ -25,6 +25,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     cagent_read_config_ui = gui_read_config_ui;
     cagent_stream_begin = gui_stream_begin;
     cagent_stream_undo = gui_stream_undo;
+    cagent_status = gui_status;
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     dpi_init();          /* 只给 g_dpi 一个初值; DPI 感知本身在 res/app.manifest 里声明 */

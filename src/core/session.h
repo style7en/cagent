@@ -233,7 +233,7 @@ static int load_messages_from_text(const char *text) {
                 strncat(messages, text + s, (size_t)ilen);
             } else if (ilen > 0) {
                 /* 装不下就明确失败并说明原因, 不再静默丢弃整段历史 */
-                append_text("(加载失败: 会话历史超出上下文缓冲容量 (1MB))\r\n");
+                emit_err("(加载失败: 会话历史超出上下文缓冲容量 (1MB))\r\n");
                 json_free(root);
                 return 0;
             }
@@ -423,28 +423,61 @@ static CAGENT_MAYBE_UNUSED void history_replay(void) {
         const JValue *c = json_obj_get(m, "content");
         const char *r  = (role && role->type == J_STR) ? role->str : "";
         const char *ct = (c && c->type == J_STR) ? c->str : "";
-        if (!*ct) continue;
         if (strcmp(r, "user") == 0) {
+            if (!*ct) continue;
             char *line = (char*)malloc(strlen(ct) + 16);
             if (!line) break;
-            snprintf(line, strlen(ct) + 16, "\r\n你：%s\r\n", ct);
+            /* 不加"你："前缀 —— 与实时回显一致 (样式已经区分了说话人, 前缀只是噪音) */
+            snprintf(line, strlen(ct) + 16, "\r\n%s\r\n", ct);
             cagent_emit(line, CAGENT_ROLE_USER);
             free(line);
         } else if (strcmp(r, "assistant") == 0) {
-            char *line = (char*)malloc(strlen(ct) + 8);
-            if (!line) break;
-            snprintf(line, strlen(ct) + 8, "%s\r\n", ct);
-            cagent_emit(line, CAGENT_ROLE_AI);
-            free(line);
+            /* 正文可能为空 (只有 tool_calls 的那一轮), 所以这里**不能**拿空 content 提前跳过 */
+            if (*ct) {
+                char *line = (char*)malloc(strlen(ct) + 8);
+                if (!line) break;
+                snprintf(line, strlen(ct) + 8, "%s\r\n", ct);
+                cagent_emit(line, CAGENT_ROLE_AI);
+                free(line);
+            }
+            /* **工具调用也要重建** (标题行 + 参数行)。只回放 tool 结果的话, 历史会话里就只剩
+             * 一堆没头没尾的输出块: 既看不出是哪次调用, 也没法折叠 —— 折叠块的抓手正是那行
+             * 标题。这里发出的角色序列与实时路径完全同构, 前端因此不用为回放写第二套逻辑。 */
+            const JValue *tcs = json_obj_get(m, "tool_calls");
+            if (tcs && tcs->type == J_ARR) {
+                for (size_t k = 0; k < tcs->arr.n; k++) {
+                    const JValue *fn = json_obj_get(json_arr_at(tcs, k), "function");
+                    if (!fn) continue;
+                    const char *nm = json_as_str(json_obj_get(fn, "name"));
+                    const char *ag = json_as_str(json_obj_get(fn, "arguments"));
+                    if (!nm || !*nm) continue;
+                    size_t al  = ag ? strlen(ag) : 0;
+                    size_t lim = al > ARGS_DISPLAY_MAX ? ARGS_DISPLAY_MAX : al;
+                    size_t cap = strlen(nm) + lim + 64;
+                    char *line = (char*)malloc(cap);
+                    if (!line) break;
+                    /* 与实时路径同构: "▾ 工具名" + 参数行, 符号取自同一份契约 */
+                    snprintf(line, cap, CAGENT_FOLD_GLYPH_OPEN " %s\r\n", nm);
+                    cagent_emit(line, CAGENT_ROLE_TOOL);
+                    if (al) {
+                        size_t cut = utf8_trim_len(ag, lim);
+                        snprintf(line, cap, "%.*s%s\r\n", (int)cut, ag, (al > lim) ? "…" : "");
+                        cagent_emit(line, CAGENT_ROLE_ARGS);
+                    }
+                    free(line);
+                }
+            }
         } else if (strcmp(r, "tool") == 0) {
+            if (!*ct) continue;
             size_t tl = strlen(ct);
             size_t cut = utf8_trim_len(ct, tl > 800 ? 800 : tl);
             int trunc = (tl > 800);
             char *line = (char*)malloc(cut + 48);
             if (!line) break;
-            snprintf(line, cut + 48, "[Output]\r\n%.*s%s\r\n",
+            /* 与实时对话一致: 不带 "[Output]" 标签, 靠 OUTPUT 角色单独成块 (见 agent.h) */
+            snprintf(line, cut + 48, "%.*s%s\r\n",
                      (int)cut, ct, trunc ? "\r\n(已截断)" : "");
-            cagent_emit(line, CAGENT_ROLE_SYS);
+            cagent_emit(line, CAGENT_ROLE_OUTPUT);
             free(line);
         }
     }

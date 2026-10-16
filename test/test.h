@@ -33,6 +33,38 @@ static void test_ws_begin(void) {
     g_touched_files[0] = '\0';
 }
 
+/* 递归删除一个目录 (宽字符版)。测试工作区建在 exe 旁边 —— 也就是**仓库根**,
+ * 留着会让工程目录看着很乱, 所以跑完必须自己清掉。Windows 没有现成的递归删除 API,
+ * FindFirstFile 走一遍是最直接的做法 (不依赖 shell, 也不用起进程)。 */
+static void test_rmtree_w(const wchar_t *dir) {
+    wchar_t pat[PATHSZ];
+    _snwprintf(pat, PATHSZ, L"%s\\*", dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.cFileName[0] == L'.' &&
+                (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0)))
+                continue;                                  /* 跳过 . 与 .. */
+            wchar_t sub[PATHSZ];
+            _snwprintf(sub, PATHSZ, L"%s\\%s", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) test_rmtree_w(sub);
+            else DeleteFileW(sub);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(dir);
+}
+
+/* 跑完把测试工作区整个删掉。路径只认 g_test_ws (那是 test_ws_begin 亲手建的),
+ * **绝不接受外部传入的路径** —— 这是唯一一处递归删除, 参数必须可控。 */
+static void test_ws_cleanup(void) {
+    if (!g_test_ws[0]) return;
+    wchar_t w[PATHSZ];
+    if (utf8_to_wide(g_test_ws, w, (int)sizeof(w))) test_rmtree_w(w);
+    g_test_ws[0] = '\0';
+}
+
 /* 删掉测试工作目录里的一个文件 (走绝对路径, 不受 CWD 影响) */
 static void test_ws_rm(const char *name) {
     char p[PATHSZ];

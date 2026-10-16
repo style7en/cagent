@@ -19,6 +19,7 @@
 #define ID_WS_EDIT  1012   /* 工作目录输入框 */
 #define ID_WS_BTN   1013   /* 浏览按钮 */
 #define ID_SESS_BTN 1014   /* 加载会话按钮 */
+#define ID_STATUS   1015   /* 状态栏: 显示模型此刻在做什么 (等待响应/生成中/执行工具/重试中) */
 #define ID_SESS_LB  2001   /* 会话列表 ListBox */
 #define ID_SESS_OK  2002   /* 载入 */
 #define ID_SESS_CAN 2003   /* 取消 */
@@ -46,6 +47,11 @@
 #define WM_APP_APPEND  (WM_APP + 1)   /* wParam = role(int), lParam = UTF-8 char* (须 free) */
 #define WM_APP_STREAM  (WM_APP + 2)   /* wParam = 1: 新分段开始(清零计数); 0: 回删本分段 AI 文本
                                        * 必须与 APP_APPEND 一样按 FIFO 投递, 不能跨线程 SendMessage */
+#define WM_APP_FOLDEND (WM_APP + 3)   /* 一轮结束: 把最后一个折叠块也按默认收起
+                                       * (由工作线程投递 —— 折叠要碰控件, 不能跨线程直接调) */
+#define WM_APP_STATUS  (WM_APP + 4)   /* 更新状态栏。lParam = UTF-8 char* (须 free),
+                                       * 传 0 表示回到空闲。**必须走消息队列**: core 在工作
+                                       * 线程里报告状态, 直接碰控件是不允许的。 */
 
 #define CFG_URL 0
 #define CFG_KEY 1
@@ -59,6 +65,58 @@
  * 再深就接近窗口自身的 COLOR_BTNFACE(240), 输出区会和背景糊在一起, 层次反而没了。
  * 想整体调深浅只改这一个数。 */
 #define HIST_BG RGB(247, 247, 247)
+
+/* ===== 输出区角色样式表 =====
+ * 每行对应一个 CAGENT_ROLE_* (索引即角色值), 决定这类文字长什么样。
+ * 集中成一张表而不是散在 do_append 的 if-else 里: 加角色只要加一行, 调观感只改一处。
+ *
+ * 配色分工 (一屏内最多同时出现三四种颜色, 再多就成圣诞树):
+ *   蓝底=用户说的话, 黑=AI 正文, 灰=过程旁白, 琥珀=工具调用, 灰底等宽=工具输出, 红=出错,
+ *   冷灰底=思考过程。
+ *
+ * **三块容易混的东西靠"字体 + 底色冷暖 + 有没有引导行"同时错开**, 任一维度单独用都不够:
+ *   思考过程  正文字体 + 冷灰底 RGB(241,242,246) + 缩进 16, 前面有"▾ 思考过程"引导行
+ *   工具输出  等宽字体 + 暖灰底 RGB(237,237,233) + 缩进 16, 前面有"▸ 工具名"引导行
+ *   AI 正文   正文字体 + 无底色 + 不缩进
+ * 只靠灰度区分是不行的 —— 两块都是灰底, 挨在一起就糊成一片了。
+ *
+ * **灰色有下限**: 输出区底色是 RGB(247,247,247), 灰字最浅只能到 RGB(110,110,110) ——
+ * 再浅对比度就跌破 WCAG AA 的 4.5:1 (实测 138 灰只有 3.2:1)。旁白想"更淡"只能靠
+ * 字号或留白, 不能靠调浅颜色。
+ *
+ * 字段:
+ *   fg/bg     文字色 / 字符底色 (has_bg=0 时不设底色, 跟随输出区背景)
+ *   bold/italic/mono   粗体 / 斜体 / 等宽字体 (mono 用于工具参数与输出, 让数字对齐)
+ *   sp_before/sp_after 段前 / 段后留白 (逻辑像素) —— 靠它把区块拉开, 不再一行行贴死
+ *   indent             左缩进 (逻辑像素) —— 参数与输出缩进在工具名之下, 形成从属关系
+ *
+ * **段前/段后距是"整段"属性, 多行内容里每一行都是独立段落**, 所以: 留白只给那些
+ * "一段就是一块"的角色 (用户消息、工具名行、旁白、错误), 而工具输出这种多行块
+ * 必须保持 0 —— 否则每一行都带上间距, 整块会被拉散成稀疏的几行。
+ * 块与块之间的间隔, 靠**下一个块首行的 sp_before** 提供。
+ *
+ * **字符底色只覆盖文字本身, 不铺满整行** (RichEdit 的限制, 详见 helpers.h 的说明):
+ * 所以用户消息的蓝底是"像荧光笔划过一条"的效果, 不是通栏色块。想要通栏卡片只能自绘。 */
+typedef struct {
+    COLORREF fg;
+    COLORREF bg;
+    int has_bg;
+    int bold, italic, mono;
+    int sp_before, sp_after, indent;
+} UiRoleStyle;
+
+static const UiRoleStyle g_role_style[CAGENT_ROLE_COUNT] = {
+    /* SYS    兜底 */ { RGB(110,110,110), 0,              0, 0,0,0,  2,  0,  0 },
+    /* USER   用户 */ { RGB( 12, 68,124), RGB(230,241,251),1, 1,0,0, 14,  6,  0 },
+    /* AI     正文 */ { RGB( 26, 26, 26), 0,              0, 0,0,0, 16,  0,  0 },
+    /* NOTE   旁白 */ { RGB(110,110,110), 0,              0, 0,0,0,  4,  4,  0 },
+    /* TOOL   调用 */ { RGB(138, 90,  0), 0,              0, 1,0,0, 14,  0,  0 },
+    /* ARGS   参数 */ { RGB(107,107,107), 0,              0, 0,0,1,  0,  0, 16 },
+    /* OUTPUT 输出 */ { RGB( 60, 60, 60), RGB(237,237,233),1, 0,0,1,  0,  0, 16 },
+    /* ERR    出错 */ { RGB(176, 32, 32), 0,              0, 1,0,0,  8,  0,  0 },
+    /* THINK  思考 */ { RGB(110,110,110), RGB(241,242,246),1, 0,0,0,  0,  0, 16 },
+    /* THINKH 思考题头 */ { RGB( 84, 84, 84), RGB(241,242,246),1, 1,0,0, 10,  0,  0 },
+};
 
 /* ===== 输出区字号 (Ctrl+滚轮缩放) =====
  * 单位是 96 DPI 的**逻辑像素**, 表示"等效字号"。实现方式是 `EM_SETZOOM(当前值, 默认值)`,
@@ -79,17 +137,74 @@
 static void read_edit_utf8(HWND h, char *out, size_t cap);
 static void set_edit_utf8(HWND h, const char *utf8);
 
+/* ===== 可折叠块的位置索引 =====
+ * RichEdit **没有"块"的概念, 也没有隐藏文本** (CFE_HIDDEN 在它这儿不生效), 所谓"折叠"
+ * 只能是把正文从字符流里删掉、展开时再插回去。于是必须自己记住每块在哪 —— 而且任何一次
+ * 折叠/展开都会让后面所有块的位置左移/右移, 得同步更新这张表。
+ *
+ * 位置一律用**字符位置 (cp)**, 与 EM_SETSEL / EM_POSFROMCHAR 同一坐标系。
+ * 注意别和 GetWindowTextLengthW 混用: 那个把段落标记按 CRLF 算两个字符 (见 ui_text_cp_len)。
+ *
+ * 两种块共用一套机制:
+ *   THINK  推理模型的思考过程 —— 标题行 "▾ 思考过程", 正文是 THINK 角色
+ *   TOOL   一次工具调用 —— 标题行 "▾ 工具名", 正文是参数行 + 输出块 (ARGS / OUTPUT)
+ * 工具块对所有模型都有用 (工具输出经常几十上百行), 思考块只在模型真返回 reasoning 时才有。 */
+#define UI_FOLD_THINK 0
+#define UI_FOLD_TOOL  1
+
+/* 正文按"角色段"记 —— 折叠时逐段读回、展开时按原角色重放, 否则参数行和输出块会
+ * 被刷成同一种样式 (读回来的是纯文本, 样式信息全在角色里)。
+ * 一个工具块最多两段 (ARGS + OUTPUT), 思考块一段; 给 8 个是留足余量。 */
+#define UI_FOLD_SEG_MAX 8
+typedef struct {
+    int    role;
+    long   len;        /* 该段的 cp 长度 */
+    WCHAR *text;       /* 收起时保存的文本 (展开时释放并置 NULL) */
+} UiFoldSeg;
+
+#define UI_FOLD_MAX 64
+typedef struct {
+    int        kind;       /* UI_FOLD_THINK / UI_FOLD_TOOL */
+    long       cp_head;    /* 标题行首字符的 cp */
+    long       head_cp;    /* 标题行的 cp 长度 —— **因块而异** (工具名长短不同), 创建时实测 */
+    long       body_len;   /* 正文的 cp 总长 (展开态) */
+    UiFoldSeg  segs[UI_FOLD_SEG_MAX];
+    int        n_segs;
+    int        collapsed;
+    /* 用户手动展开/收起过。置位后**不再自动折叠** —— 块结束时的默认收起不该把用户
+     * 特意展开的那个又按回去。 */
+    int        user_toggled;
+} UiFoldBlock;
+
+static UiFoldBlock g_folds[UI_FOLD_MAX];
+static int  g_fold_n;
+
+/* 前向声明 (实现见 UI 辅助区) */
+static void   ui_fold_reset(void);
+static void   ui_fold_new(int kind, long cp_before, long cp_after);
+static void   ui_fold_extend(int role, long cp_added);
+static void   ui_fold_collapse(int idx);
+static int    ui_fold_hit(POINTL pt);
+static void   ui_fold_toggle(int idx);
+static void   ui_fold_trim_from(long cp);
+
 /* ===== GUI 状态 ===== */
 static HWND g_hHistory, g_hInput, g_hSend, g_hNew, g_hSess;
 static void show_session_dialog(HWND owner);
 static void show_about(HWND owner);
 static HWND g_hCfg[3];                 /* [url, key, model] */
 static HWND g_hWorkspace, g_hWsBrowse; /* 工作目录 Edit + 浏览按钮 */
+static HWND g_hStatus;                 /* 状态栏 (只读 STATIC) */
 static HFONT g_hFont;
 static HFONT g_hFontHist;
 static int g_hist_lpx = HIST_LPX_DEF;   /* 输出区字号(逻辑像素), Ctrl+滚轮可调 */
 static int g_hist_zoom_acc;             /* Ctrl+滚轮的累积残量, 给高精度滚轮/触控板用 */
 static long g_stream_chars;      /* 当前分段已上屏的 AI 文本字符数(UTF-16), 供重试时回删 */
+/* 上一次追加的角色, 以及"它是否以换行结尾"。用于在角色切换处补换行 —— 段落格式
+ * (缩进/段间距)作用于整段, 若上一段没写完就切角色, 新格式会把上一段一起重排。
+ * 核心侧已保证各类文本以换行收尾, 这里只是兜底, 别把它当成排版的主力。 */
+static int g_last_role = -1;
+static int g_last_no_lf = 0;
 static HANDLE g_hThread = NULL;
 static WNDPROC g_oldInputProc;
 static WNDPROC g_oldHistoryProc;

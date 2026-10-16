@@ -153,6 +153,21 @@ static void system_prompt_init(void) {
     free(buf);
 }
 
+/* 找出工具输出里"尾部说明"的起点 (以 \n...( 开头的**最后一段**), 没有则返回 NULL。
+ *
+ * 这类说明 (如 read_file 的"...(已截断: 文件共 N 字节...)") 是**本次调用的协议层信息**:
+ * 模型靠它知道"内容被截断了、该用 offset 接着读", 但**用户不需要看到** —— 用户关心的是
+ * 内容本身。所以上屏前把它剥掉, 回传模型的 tool_out 保持完整。
+ * 取"最后一次出现"且要求它确实是最后一行 —— 文件内容里也可能出现同样的字样。 */
+static const char *tool_note_split(const char *s) {
+    const char *found = NULL;
+    for (const char *p = s; (p = strstr(p, "\n...(")) != NULL; p++) found = p;
+    if (!found) return NULL;
+    const char *nl = strchr(found + 1, '\n');
+    if (nl && nl[1]) return NULL;          /* 后面还有内容, 说明不是尾部说明 */
+    return found;
+}
+
 /* 前向声明: agent_turn 调用历史保存, 其定义在 session.h (聚合顺序在本文件之后) */
 static void history_save(void);
 
@@ -419,7 +434,7 @@ static int compact_via_summary(int halve) {
     if (wn <= 0 || (size_t)wn >= ncap || wn >= BUFSZ) { free(newbuf); return 0; }
     memcpy(messages, newbuf, (size_t)wn + 1);
     free(newbuf);
-    append_text("(上下文已压缩为摘要, 最近的消息保留原文, 继续对话)\r\n");
+    emit_note("(上下文已压缩为摘要, 最近的消息保留原文, 继续对话)\r\n");
     return 1;
 }
 
@@ -473,7 +488,7 @@ static int compact_drop_oldest(void) {
     snprintf(note, sizeof(note),
              "(摘要压缩失败, 已按整条消息丢弃最早的 %d 条; 早期细节不再在上下文中)\r\n",
              (int)dropped_n);
-    append_text(note);
+    emit_note(note);
     return 1;
 }
 
@@ -505,11 +520,11 @@ static void agent_turn(const char *user_msg) {
 
     /* 上下文压力检查 (token 优先, 字节兜底): 先压缩, 再开始本轮 */
     if (context_pressure()) {
-        append_text("(上下文接近上限, 正在压缩为摘要...)\r\n");
+        emit_note("(上下文接近上限, 正在压缩为摘要...)\r\n");
         int cok = compact_conversation();
         log_line("[compact] 轮首触发 -> %s, msgs_len=%zu", cok ? "成功" : "失败", strlen(messages));
         if (!cok) {
-            append_text("(压缩失败, 已自动另起新会话)\r\n");
+            emit_err("(压缩失败, 已自动另起新会话)\r\n");
             reset_conversation();
             g_history_file[0] = '\0';
         }
@@ -530,7 +545,7 @@ static void agent_turn(const char *user_msg) {
 
     char *escaped = json_escape_alloc(user_msg);
     if (!escaped) {
-        append_text("(内存不足, 已忽略本轮)\r\n");
+        emit_err("(内存不足, 已忽略本轮)\r\n");
         reason = "内存不足 (user 消息转义失败)";
         rolled_back = 1;
         goto done;
@@ -538,7 +553,7 @@ static void agent_turn(const char *user_msg) {
     ok = msg_append(",{\"role\":\"user\",\"content\":\"%s\"}", escaped);
     free(escaped);
     if (!ok) {
-        append_text("(输入过长, 已忽略本轮)\r\n");
+        emit_err("(输入过长, 已忽略本轮)\r\n");
         reason = "输入过长 (user 消息拼不进 messages)";
         rolled_back = 1;
         goto done;                            /* 截断交给 done 统一做, 这里不再重复 */
@@ -546,7 +561,7 @@ static void agent_turn(const char *user_msg) {
 
     for (;;) {
         if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
-            append_text("(已取消)\r\n");
+            emit_note("(已取消)\r\n");
             reason = "用户取消 (轮次开始前)";
             rolled_back = 1;
             goto done;
@@ -555,11 +570,11 @@ static void agent_turn(const char *user_msg) {
          * 是安全的压缩点。压缩失败不回滚 —— 已完成的工具调用与结论都保留,
          * 本轮提前收束, 用户可继续下一条指令。 */
         if (iter > 0 && context_pressure()) {
-            append_text("(上下文接近上限, 正在压缩为摘要...)\r\n");
+            emit_note("(上下文接近上限, 正在压缩为摘要...)\r\n");
             int cok = compact_conversation();
             log_line("[compact] 迭代间隙触发 -> %s, msgs_len=%zu", cok ? "成功" : "失败", strlen(messages));
             if (!cok) {
-                append_text("(压缩失败, 本轮到此暂停; 已完成的步骤都保留在对话中)\r\n");
+                emit_err("(压缩失败, 本轮到此暂停; 已完成的步骤都保留在对话中)\r\n");
                 reason = "上下文压缩失败 (保留已完成步骤, 不回滚)";
                 goto done;
             }
@@ -576,7 +591,7 @@ static void agent_turn(const char *user_msg) {
             /* BODY_SZ 的余量让这在数学上不可能发生; 真发生了也绝不能把半截 JSON
              * 发出去 —— 服务端只会回一个看不懂的 400。停本轮并留痕, 由用户压缩会话。 */
             log_line("[http] 请求体需要 %d 字节 > 上限 %d, 本轮中止", blen, (int)sizeof(body));
-            append_text("(请求体超出上限, 本轮已中止; 请压缩或另开会话)\r\n");
+            emit_err("(请求体超出上限, 本轮已中止; 请压缩或另开会话)\r\n");
             reason = "请求体超出上限 (未发送)";
             goto done;
         }
@@ -596,13 +611,13 @@ static void agent_turn(const char *user_msg) {
                 if (healed) {
                     log_line("[utf8] 历史含非法 UTF-8, 已就地净化 %zu 字节后重发 (msgs_len=%zu)",
                              healed, strlen(messages));
-                    append_text("(消息历史含非法 UTF-8 字节, 已就地修复并重发本请求)\r\n");
+                    emit_note("(消息历史含非法 UTF-8 字节, 已就地修复并重发本请求)\r\n");
                     iter--;              /* 这次请求没发出去, 不计入迭代序号 */
                     continue;            /* 重新拼 body (messages 已变) 再发一次 */
                 }
             }
             /* 提示要跟开关走: 日志关着时不会有留档, 说"详见 log\"就是假的 */
-            append_text(g_log_enabled
+            emit_err(g_log_enabled
                 ? "(请求体含非法 UTF-8 字节, 已本地拦截未发送; 本轮回滚, 详见 log\\)\r\n"
                 : "(请求体含非法 UTF-8 字节, 已本地拦截未发送; 本轮回滚)\r\n");
             reason = "请求体含非法 UTF-8, 本地拦截未发送";
@@ -612,15 +627,17 @@ static void agent_turn(const char *user_msg) {
         log_line("[http] 请求 iter=%d msgs_len=%zu body_len=%zu",
              iter, strlen(messages), strlen(body));
 
-        append_text("(thinking...)\r\n");
+        /* 请求发出 → 状态栏显示"等待响应"。这类"此刻在做什么"的信息不再往输出区打旁白:
+         * 它不属于对话内容, 混进去既占地方, 又会被历史保存和回放。 */
+        set_status("等待响应…");
 
         /* ctx 内含 1MB content_buf: 放堆, 不占工作线程的 1MB 栈。
          * 上一迭代已消费的 ctx 在此释放 (每迭代一个, 不能等 done 才释放)。 */
         free(ctx);
         ctx = (StreamCtx*)calloc(1, sizeof(StreamCtx));
         if (!ctx) {
-            append_text("(内存不足, 本轮回滚)\r\n");
-            append_text(ROLLBACK_HINT);
+            emit_err("(内存不足, 本轮回滚)\r\n");
+            emit_err(ROLLBACK_HINT);
             reason = "内存不足 (StreamCtx 分配失败)";
             rolled_back = 1;
             goto done;
@@ -633,8 +650,13 @@ static void agent_turn(const char *user_msg) {
         int status = http_post_stream(full_url, g_api_key, body, strlen(body),
                                       resp, BUFSZ, ctx);
 
+        /* 流可能整个结束在思考阶段 (没有 content), 这里兜底闭合那个思考块 */
+        close_reasoning_block(ctx);
+        if (ctx->reasoning_len > 0)
+            log_line("[think] 思考内容 %zu 字节 (仅上屏, 不写入 messages)", ctx->reasoning_len);
+
         if (status == -2) {
-            append_text("(已取消)\r\n");
+            emit_note("(已取消)\r\n");
             reason = "用户取消 (流式请求进行中)";
             rolled_back = 1;
             goto done;
@@ -644,7 +666,7 @@ static void agent_turn(const char *user_msg) {
              * 保留已完成步骤、不回滚 —— 与 HTTP 失败路径同一语义, 用户可直接重发。 */
             log_line("[http] 响应流不完整 (重试耗尽) iter=%d data_lines=%d bad_json=%d",
                      iter, ctx->n_data_lines, ctx->n_bad_json);
-            append_text("(响应流中断, 重试后仍未收完整; 本轮未完成, 可直接重发)\r\n");
+            emit_err("(响应流中断, 重试后仍未收完整; 本轮未完成, 可直接重发)\r\n");
             reason = "响应流不完整 (重试耗尽, 非完整 200)";
             goto done;
         }
@@ -660,7 +682,7 @@ static void agent_turn(const char *user_msg) {
             if (status == 400 && overflow_retries < CONTEXT_OVERFLOW_RETRIES &&
                 is_context_overflow_error(resp)) {
                 overflow_retries++;
-                append_text("(服务端报告上下文超限, 正在压缩后重试...)\r\n");
+                emit_note("(服务端报告上下文超限, 正在压缩后重试...)\r\n");
                 free(ctx);
                 ctx = NULL;
                 if (compact_conversation()) {
@@ -669,16 +691,16 @@ static void agent_turn(const char *user_msg) {
                     continue;
                 }
                 log_line("[compact] 400超限触发 -> 失败");
-                append_text("(压缩失败)\r\n");
+                emit_err("(压缩失败)\r\n");
             }
             /* 界面给人看的结论 (额度/鉴权/限流有友好文案), 原始报文已在上面进日志 */
             char fr[512];
-            if (http_friendly_error(status, resp, fr, sizeof(fr))) append_text(fr);
-            else append_text(resp);
+            if (http_friendly_error(status, resp, fr, sizeof(fr))) emit_err(fr);
+            else emit_err(resp);
             /* 请求阶段失败 = 没收到任何响应内容, messages 状态完整 (此前所有工具往返
              * 都已闭合): 保留已完成步骤, 只结束本轮 —— 学压缩失败的处理, 不让 429/网络
              * 抖动白白吃掉整轮 (文件改动本来也不回滚)。用户取消在上面另行回滚。 */
-            append_text("(本轮未完成: 已完成的工具步骤保留在对话中, 可直接发下一条指令继续)\r\n");
+            emit_note("(本轮未完成: 已完成的工具步骤保留在对话中, 可直接发下一条指令继续)\r\n");
             reason = "HTTP 请求失败 (保留已完成步骤, 不回滚)";
             goto done;
         }
@@ -694,9 +716,9 @@ static void agent_turn(const char *user_msg) {
         }
 
         if (strcmp(ctx->finish, "length") == 0)
-            append_text("(达到长度上限被截断; 可让模型继续补全)\r\n");
+            emit_note("(达到长度上限被截断; 可让模型继续补全)\r\n");
         else if (strcmp(ctx->finish, "content_filter") == 0)
-            append_text("(内容被服务端的过滤策略拦截)\r\n");
+            emit_err("(内容被服务端的过滤策略拦截)\r\n");
 
         /* content 装不下时补一条截断标记, 否则模型下一轮看不到自己说过什么,
          * 却以为说完了 (界面已完整显示)。 */
@@ -704,7 +726,7 @@ static void agent_turn(const char *user_msg) {
             strncat(ctx->content_buf,
                     "\n...(回复过长, 超出缓冲上限, 上文只记录了前半部分)",
                     CONTENT_TAIL_RESERVE - 1);
-            append_text("(模型回复过长, 上文只记录了前半部分)\r\n");
+            emit_note("(模型回复过长, 上文只记录了前半部分)\r\n");
         }
 
         if (ctx->n_calls == 0 && ctx->n_dropped == 0) {
@@ -712,11 +734,11 @@ static void agent_turn(const char *user_msg) {
             if (ctx->content_len > 0) {
                 if (ctx->content_buf[ctx->content_len - 1] != '\n' &&
                     ctx->content_buf[ctx->content_len - 1] != '\r')
-                    append_text("\r\n");   /* 末尾已有换行则不补, 避免双倍空行 */
+                    emit_role("\r\n", CAGENT_ROLE_AI);   /* 末尾已有换行则不补, 避免双倍空行 */
                 char *esc = json_escape_alloc(ctx->content_buf);
                 if (esc) {
                     if (!msg_append(",{\"role\":\"assistant\",\"content\":\"%s\"}", esc)) {
-                        append_text("(历史空间不足, 本轮回滚)\r\n");
+                        emit_err("(历史空间不足, 本轮回滚)\r\n");
                         reason = "历史空间不足 (assistant content 拼不进 messages)";
                         rolled_back = 1;
                     }
@@ -732,21 +754,30 @@ static void agent_turn(const char *user_msg) {
                          ctx->finish[0] ? ctx->finish : "-", iter,
                          ctx->n_data_lines, ctx->n_bad_json, ctx->sse_head);
                 if (strcmp(ctx->finish, "length") == 0)
-                    append_text("(响应为空且已达长度上限, 本轮回滚)\r\n");
+                    emit_err("(响应为空且已达长度上限, 本轮回滚)\r\n");
                 else
-                    append_text("(响应解析失败)\r\n");
-                append_text(ROLLBACK_HINT);
+                    emit_err("(响应解析失败)\r\n");
+                emit_err(ROLLBACK_HINT);
                 reason = "服务端返回空 content (响应解析失败/空回复)";
                 rolled_back = 1;
             }
             goto done;
         }
 
-        /* 有 tool_calls: 转 AgentToolCall 并执行。
+        /* 有 tool_calls: 先把 AI 正文收尾。
+         * **必须补换行**: 紧接着就要发 "▸ 工具名", 正文末尾若没有换行, 两段会挤在同一行;
+         * 更麻烦的是前端的段落格式(缩进/段间距)按段落生效, 不闭合会让工具行的缩进
+         * 把整段 AI 正文一起带上。 */
+        if (ctx->content_len > 0 &&
+            ctx->content_buf[ctx->content_len - 1] != '\n' &&
+            ctx->content_buf[ctx->content_len - 1] != '\r')
+            emit_role("\r\n", CAGENT_ROLE_AI);
+
+        /* 转 AgentToolCall 并执行。
          * 调用表 (8 项 ≈ 2MB) 放堆: 放栈会和工作线程默认 1MB 栈争空间。 */
         calls = (AgentToolCall*)calloc(STREAM_CALLS_MAX, sizeof(AgentToolCall));
         if (!calls) {
-            append_text("(内存不足, 本轮回滚)\r\n");
+            emit_err("(内存不足, 本轮回滚)\r\n");
             reason = "内存不足 (工具调用表分配失败)";
             rolled_back = 1;
             goto done;
@@ -783,8 +814,8 @@ static void agent_turn(const char *user_msg) {
             log_line("[http] 200 但 tool_calls 无法还原: finish=%s iter=%d data_lines=%d bad_json=%d sse_head=%s",
                      ctx->finish[0] ? ctx->finish : "-", iter,
                      ctx->n_data_lines, ctx->n_bad_json, ctx->sse_head);
-            append_text("(tool_calls 解析失败)\r\n");
-            append_text(ROLLBACK_HINT);
+            emit_err("(tool_calls 解析失败)\r\n");
+            emit_err(ROLLBACK_HINT);
             reason = "tool_calls 解析失败 (没能还原出可执行的调用)";
             rolled_back = 1;
             goto done;
@@ -792,18 +823,21 @@ static void agent_turn(const char *user_msg) {
 
         for (int i = 0; i < n_calls; i++) {
             if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
-                append_text("(已取消)\r\n");
+                emit_note("(已取消)\r\n");
                 reason = "用户取消 (工具执行中)";
                 rolled_back = 1;
                 goto done;
             }
             AgentToolCall *c = &calls[i];
             if (c->too_big) {
-                /* arguments 超上限: 拒绝执行并把原因交回模型 (执行只会得到非法 JSON) */
+                /* arguments 超上限: 拒绝执行并把原因交回模型 (执行只会得到非法 JSON)。
+                 * 界面按"工具名 + 原因"两行显示, 与正常调用的排版一致, 只是换成错误色。 */
                 char msg[512];
-                snprintf(msg, sizeof(msg), "[Tool] %s -> 未执行 (arguments 超过 %dKB 上限)\r\n",
-                         c->name, (int)(ARGS_MAX / 1024));
-                append_text(msg);
+                snprintf(msg, sizeof(msg), "× %s\r\n", c->name);
+                emit_err(msg);
+                snprintf(msg, sizeof(msg), "未执行: arguments 超过 %dKB 上限\r\n",
+                         (int)(ARGS_MAX / 1024));
+                emit_err(msg);
                 snprintf(tool_out, sizeof(tool_out),
                          "(未执行: arguments 超过 %dKB 上限, 已拒绝; 大文件请改用 edit_file "
                          "分段修改, 或用 execute_bash 分批写入)", (int)(ARGS_MAX / 1024));
@@ -814,10 +848,11 @@ static void agent_turn(const char *user_msg) {
                  * 拒绝执行, 把原因交回模型让它重新生成; arguments 已降级为占位 "{}", 不污染历史。 */
                 int truncated = (strcmp(ctx->finish, "length") == 0);
                 char msg[512];
-                snprintf(msg, sizeof(msg),
-                         "[Tool] %s -> 未执行 (arguments 不是合法 JSON%s)\r\n",
-                         c->name, truncated ? " (疑似被长度上限截断)" : "");
-                append_text(msg);
+                snprintf(msg, sizeof(msg), "× %s\r\n", c->name);
+                emit_err(msg);
+                snprintf(msg, sizeof(msg), "未执行: arguments 不是合法 JSON%s\r\n",
+                         truncated ? " (疑似被长度上限截断)" : "");
+                emit_err(msg);
                 snprintf(tool_out, sizeof(tool_out),
                          "(未执行: %s 的 arguments 不是合法 JSON%s, 已拒绝; 请完整重新发出该调用 "
                          "(包含全部必需参数, 不要省略或发空对象); 参数过大就分段写, "
@@ -826,36 +861,60 @@ static void agent_turn(const char *user_msg) {
                 log_line("[tool] 拒绝执行: name=%s arguments 非法 JSON (疑似截断=%d)",
                          c->name, truncated);
             } else {
-                /* [Tool] 提示行按展示上限堆分配, 不占栈; 执行与回传仍是完整参数。
+                /* 工具调用分两行发: 标题行(工具名) + 参数行。参数行独立成一个角色, 前端才能
+                 * 用等宽字体、缩进在标题之下 —— 挤成一行 "[Tool] name(args)" 的话, 名字和
+                 * 参数只能共用一种样式, 长参数还会把工具名顶到看不见的地方。
+                 * 参数按展示上限堆分配, 不占栈; 执行与回传仍是完整参数。
                  * 摘要必须按字符边界截取 (utf8_safe_copy): 旧的 %.8192s 会切半汉字,
                  * 而且硬编码的 8192 与 ARGS_DISPLAY_MAX 脱钩 —— 改宏它不会跟着变。 */
                 size_t cap = ARGS_DISPLAY_MAX + 256;
                 char *line = (char*)malloc(cap);
                 if (line) {
+                    /* 首字符是折叠符号: ▾ = 展开(内容可见), ▸ = 收起。前端的块索引表
+                     * 靠它定位工具块, 也只替换这一个字符 —— 见 ui/state.h 的 UiFoldBlock。 */
+                    snprintf(line, cap, CAGENT_FOLD_GLYPH_OPEN " %s\r\n", c->name);
+                    emit_tool(line);
                     if (c->args[ARGS_DISPLAY_MAX]) {
                         char *prev = (char*)malloc(cap);
                         if (prev) {
                             utf8_safe_copy(c->args, ARGS_DISPLAY_MAX, prev, cap);
-                            snprintf(line, cap, "[Tool] %s(%s…)\r\n", c->name, prev);
+                            snprintf(line, cap, "%s…\r\n", prev);
                             free(prev);
                         } else {
-                            snprintf(line, cap, "[Tool] %s(参数过长, 未显示)\r\n", c->name);
+                            snprintf(line, cap, "(参数过长, 未显示)\r\n");
                         }
                     } else {
-                        snprintf(line, cap, "[Tool] %s(%s)\r\n", c->name, c->args);
+                        snprintf(line, cap, "%s\r\n", c->args);
                     }
-                    append_text(line);
+                    emit_args(line);
                     free(line);
+                }
+                {
+                    char st[128];
+                    snprintf(st, sizeof(st), "正在执行 %s…", c->name);
+                    set_status(st);
                 }
                 dispatch_tool(c->name, c->args, ctx->finish);   /* 错误原因写进 tool_out 交回模型 */
             }
             c->output = strdup(tool_out);
             size_t tl = strlen(tool_out);
-            char *oline = (char*)malloc(tl + 64);
+            /* 输出正文不再带 "[Output]" 标签: 它紧跟在 "▸ 工具名" 之后, 前端又用等宽+底色
+             * 单独成块, 再写个标签是冗余。空输出给一句说明, 免得留一个看不懂的空块。
+             *
+             * **尾部说明只回传给模型, 不上屏**: "(已截断: 文件共 N 字节, 用 offset=... 继续读)"
+             * 这类话属于协议层 —— 模型靠它知道怎么接着读, 但用户关心的是内容本身, 不是
+             * "这次读了多少字节"。这条边界要划清: 回传给模型的 ≠ 显示给用户的。 */
+            const char *note = tool_note_split(tool_out);
+            size_t shown = note ? (size_t)(note - tool_out) : tl;   /* 上屏的只有正文部分 */
+            char *oline = (char*)malloc(shown + 64);
             if (oline) {
-                int eol = (tl > 0 && (tool_out[tl-1] == '\n' || tool_out[tl-1] == '\r'));
-                snprintf(oline, tl + 64, eol ? "[Output]\r\n%s" : "[Output]\r\n%s\r\n", tool_out);
-                append_text(oline);
+                if (shown == 0) {
+                    snprintf(oline, 64, "(无输出)\r\n");
+                } else {
+                    int eol = (tool_out[shown-1] == '\n' || tool_out[shown-1] == '\r');
+                    snprintf(oline, shown + 64, eol ? "%.*s" : "%.*s\r\n", (int)shown, tool_out);
+                }
+                emit_output(oline);
                 free(oline);
             }
         }
@@ -863,10 +922,12 @@ static void agent_turn(const char *user_msg) {
         /* 超上限被丢弃的调用: 界面如实说明"没执行", 与下面回填的 tool 结果一致 */
         for (int i = 0; i < ctx->n_dropped; i++) {
             char line[512];
+            snprintf(line, sizeof(line), "× %s\r\n",
+                     ctx->dropped[i].name[0] ? ctx->dropped[i].name : "?");
+            emit_err(line);
             snprintf(line, sizeof(line),
-                     "[Tool] %s -> 未执行 (超出单轮 %d 个并行调用上限, 请分批调用)\r\n",
-                     ctx->dropped[i].name[0] ? ctx->dropped[i].name : "?", STREAM_CALLS_MAX);
-            append_text(line);
+                     "未执行: 超出单轮 %d 个并行调用上限, 请分批调用\r\n", STREAM_CALLS_MAX);
+            emit_err(line);
         }
 
         /* 写回 messages: assistant 消息 (含 tool_calls 数组) + 每个调用的 tool 结果。
@@ -930,7 +991,7 @@ static void agent_turn(const char *user_msg) {
         if (!ok) {
             /* 任一步失败: 把本次拼接的 assistant+tool 段全部截掉, 回滚整轮 */
             messages[mstart] = '\0';
-            append_text("(历史空间或内存不足, 本轮回滚)\r\n");
+            emit_err("(历史空间或内存不足, 本轮回滚)\r\n");
             reason = "历史空间/内存不足 (assistant+tool 段拼装失败)";
             rolled_back = 1;
             goto done;
@@ -956,7 +1017,7 @@ done:
             snprintf(note, sizeof(note),
                      "(注意: 本轮已改动的文件不会随对话一起还原: %s)\r\n",
                      g_touched_files);
-            append_text(note);
+            emit_err(note);
         }
     }
     history_save();   /* 每轮 done 后保存 (含回滚后状态) */
