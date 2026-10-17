@@ -174,8 +174,9 @@ static long ui_insert_ex(HWND h, const WCHAR *w, int role, long pos, const UiSty
         wcscpy(role_cf.szFaceName, ov->mono ? CAGENT_MONO_FACE : CAGENT_UI_FACE);
     } else {
         role_cf.crTextColor = st->fg;
-        if (st->bold)   role_cf.dwEffects |= CFE_BOLD;
-        if (st->italic) role_cf.dwEffects |= CFE_ITALIC;
+        if (st->bold)      role_cf.dwEffects |= CFE_BOLD;
+        if (st->italic)    role_cf.dwEffects |= CFE_ITALIC;
+        if (st->underline) role_cf.dwEffects |= CFE_UNDERLINE;
         if (st->has_bg) role_cf.crBackColor = st->bg;
         else            role_cf.dwEffects  |= CFE_AUTOBACKCOLOR;   /* 跟随输出区背景 */
         wcscpy(role_cf.szFaceName, st->mono ? CAGENT_MONO_FACE : CAGENT_UI_FACE);

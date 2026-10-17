@@ -243,6 +243,9 @@ static void on_reasoning_delta(void *ud, const char *delta) {
         if (!*delta) return;
         emit_think_head(CAGENT_THINK_TITLE "\r\n");
         ctx->reasoning_open = 1;
+        /* 状态栏也要跟上: 之前可能停在"等待响应/被限流重试中"等旧状态, 而思考正文
+         * 已在增量上屏 —— 不及时更新, 用户看到的还是重试时的文案。 */
+        set_status("正在思考…");
     }
     if (cagent_emit) { cagent_emit(delta, CAGENT_ROLE_THINK); ctx->emitted = 1; }
     /* 旁路累积, **只这里加 reasoning_len**: 上屏之后 (上屏是"必须成功"的路径, 累积失败
