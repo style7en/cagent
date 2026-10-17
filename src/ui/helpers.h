@@ -338,17 +338,22 @@ static void ui_fold_refresh_heads(void) {
     }
 }
 
-/* 切换第 idx 块的收起/展开。
+/* 切换第 idx 块的收起/展开 —— 只改文档, **不重画**。返回 1 表示状态真的变了
+ * (调用方需要重画), 0 表示目标状态已是现状、什么都没动。
  *
  * 三个必须守住的点:
  *   ① 折叠范围两端都落在段落边界上 (core 保证各段以换行收尾), 否则删完会把相邻段落并到一起;
  *   ② 读回的正文长度可能**小于**原 cp 长度 (EM_GETTEXTRANGE 把 CRLF 还原成单个 CR),
  *      所以展开后要用实际插入量回写每段长度, 并用同一个 delta 更新后续块的位置;
- *   ③ 标题状态符号只替换**一个字符**, 长度不变, 所以标题自身不引起位置漂移。 */
-static void ui_fold_set(int idx, int collapse) {
-    if (idx < 0 || idx >= g_fold_n) return;
+ *   ③ 标题状态符号只替换**一个字符**, 长度不变, 所以标题自身不引起位置漂移。
+ *
+ * 为什么单独拆出来不做重画: 一路都是 EM_REPLACESEL / EM_SETPARAFORMAT, 末尾还有
+ * ui_fold_refresh_heads 给**每个**块的标题行重设格式 —— 每步都画的话, 用户看到的是
+ * 内容一段段刷出来。重画由调用方 (ui_fold_set / ui_fold_toggle) 在序列末尾统一收尾。 */
+static int ui_fold_apply(int idx, int collapse) {
+    if (idx < 0 || idx >= g_fold_n) return 0;
     UiFoldBlock *b = &g_folds[idx];
-    if (b->collapsed == !!collapse) return;      /* 已经是目标状态 */
+    if (b->collapsed == !!collapse) return 0;    /* 已经是目标状态 */
     long cut_start = ui_fold_cut_start(b);
     long delta;
 
@@ -357,13 +362,13 @@ static void ui_fold_set(int idx, int collapse) {
          * body_len 对账 —— body_len 本身就是它们的和 (见 ui_fold_extend)。 */
         long cut_len = 0;
         for (int s = 0; s < b->n_segs; s++) cut_len += b->segs[s].len;
-        if (cut_len <= 0) return;                 /* 没有可收的内容 (空块) */
+        if (cut_len <= 0) return 0;               /* 没有可收的内容 (空块) */
         long pos = cut_start;
         for (int s = 0; s < b->n_segs; s++) {
             b->segs[s].text = ui_get_range(g_hHistory, pos, pos + b->segs[s].len);
             if (!b->segs[s].text) {
                 for (int k = 0; k < s; k++) { free(b->segs[k].text); b->segs[k].text = NULL; }
-                return;
+                return 0;
             }
             pos += b->segs[s].len;
         }
@@ -394,7 +399,27 @@ static void ui_fold_set(int idx, int collapse) {
     }
     for (int j = idx + 1; j < g_fold_n; j++) g_folds[j].cp_head += delta;
     ui_fold_refresh_heads();     /* 兜底: 段边界插入会把相邻段的缩进带跑, 见上面的说明 */
-    InvalidateRect(g_hHistory, NULL, TRUE);
+    return 1;
+}
+
+/* 变更序列结束后的一次性重画 —— **不带 erase**。RichEdit 是子窗口, 会自己处理
+ * WM_ERASEBKGND 之前的背景 (实测不擦背景时 WM_PAINT 出来的角落底色仍是 HIST_BG),
+ * 所以这里直接 RDW_INVALIDATE | RDW_UPDATENOW: 同步画一帧, 且不经过"整屏擦成背景色"
+ * 的空窗期 —— 那正是折叠/缩放时闪一下的根源。 */
+static void ui_fold_paint_once(void) {
+    if (!g_hHistory) return;
+    RedrawWindow(g_hHistory, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
+/* 折叠/展开 + 重画的完整路径: 整段文档变更包在 WM_SETREDRAW(FALSE) 里, 末尾一次性
+ * 同步重画。中间态的 EM_REPLACESEL / EM_SETPARAFORMAT 一步都不会上屏, 用户看到的是
+ * 旧状态直接过渡到新状态, 没有逐段刷出来的过程, 也没有擦背景的空白帧。 */
+static void ui_fold_set(int idx, int collapse) {
+    if (idx < 0 || idx >= g_fold_n) return;
+    SendMessageW(g_hHistory, WM_SETREDRAW, FALSE, 0);
+    int changed = ui_fold_apply(idx, collapse);
+    SendMessageW(g_hHistory, WM_SETREDRAW, TRUE, 0);
+    if (changed) ui_fold_paint_once();
 }
 
 /* 用户点击切换: 记下"这个块被手动动过", 之后不再自动折叠 (见 state.h 的 user_toggled)。
@@ -408,9 +433,15 @@ static void ui_fold_toggle(int idx) {
     g_folds[idx].user_toggled = 1;
     POINT scroll;
     memset(&scroll, 0, sizeof(scroll));
+    /* 取滚动位、改文档、恢复滚动位三步必须包在同一对 WM_SETREDRAW 里: 折叠路径的重绘
+     * 本就发生在恢复滚动位那一步 (RichEdit 文档长度变化后会自己挪一次滚动条), 把它
+     * 留在批处理外面就相当于又多一次独立重画 —— 批处理白做, 还是会闪。 */
+    SendMessageW(g_hHistory, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_hHistory, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
-    ui_fold_set(idx, !g_folds[idx].collapsed);
+    ui_fold_apply(idx, !g_folds[idx].collapsed);
     SendMessageW(g_hHistory, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
+    SendMessageW(g_hHistory, WM_SETREDRAW, TRUE, 0);
+    ui_fold_paint_once();
 }
 
 /* 按"默认折叠"收起第 idx 块 (块结束时调用)。用户手动展开过的不动 —— 别把人家特意

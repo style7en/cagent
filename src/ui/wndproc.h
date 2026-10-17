@@ -17,7 +17,8 @@ static void ui_history_pad(HWND h, int w, int hh) {
     rc.right  = w  - dp(10);
     rc.bottom = hh - dp(8);
     SendMessageW(h, EM_SETRECT, 0, (LPARAM)&rc);
-    InvalidateRect(h, NULL, TRUE);
+    /* 同样不带 erase: EM_SETRECT 会全文档重排, 重排后重画一帧即可, 擦背景只会添空窗 */
+    RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
 static void layout(HWND hwnd) {
@@ -197,7 +198,12 @@ static void ui_history_zoom_apply(HWND hist) {
     SendMessageW(hist, EM_SETZOOM, (WPARAM)g_hist_lpx, (LPARAM)HIST_LPX_DEF);
 }
 
-/* 步进单位 1 逻辑像素。 */
+/* 步进单位 1 逻辑像素。
+ *
+ * EM_SETZOOM 触发的重排是全文档最重的一次: 每个段落都要重新算行高、每个换行点都要
+ * 重新断行。它本身会同步重画, 之后若再 InvalidateRect 就是第二次全量重画, 且中间还
+ * 隔着"整屏擦成背景色"的空窗 —— 缩放手势那一下闪就是这么来的。所以: SETREDRAW 包住
+ * EM_SETZOOM, 末尾只留一次不带 erase 的同步重画收尾。 */
 static void ui_history_zoom(HWND hist, int steps) {
     if (!hist || !steps) return;
     int n = g_hist_lpx + steps;
@@ -205,8 +211,10 @@ static void ui_history_zoom(HWND hist, int steps) {
     if (n > HIST_LPX_MAX) n = HIST_LPX_MAX;
     if (n == g_hist_lpx) return;                 /* 已到上下限: 不做无谓的缩放 */
     g_hist_lpx = n;
+    SendMessageW(hist, WM_SETREDRAW, FALSE, 0);
     ui_history_zoom_apply(hist);
-    InvalidateRect(hist, NULL, TRUE);
+    SendMessageW(hist, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(hist, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
 /* Ctrl+滚轮 -> 缩放输出区字号; 返回非 0 表示该消息已被消费。
@@ -602,13 +610,13 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (ui_fold_hit(pt) >= 0) { SetCursor(LoadCursor(NULL, IDC_HAND)); return TRUE; }
         }
     }
-    /* Ctrl+滚轮缩放输出区字号; 其余滚轮动作照旧交回原过程(滚动)并补一次重画 */
+    /* Ctrl+滚轮缩放输出区字号; 其余滚轮动作照旧交回原过程(滚动)并补一次重画。
+     * 重画不带 erase: 滚一下擦一次整屏, 快速滚动时会看到底色一闪一闪。 */
     if (msg == WM_MOUSEWHEEL && ui_zoom_wheel(wp)) return 0;
     if (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL ||
         msg == WM_KEYDOWN || msg == WM_KEYUP) {
         LRESULT r = CallWindowProcW(g_oldHistoryProc, h, msg, wp, lp);
-        InvalidateRect(h, NULL, TRUE);
-        UpdateWindow(h);
+        RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
         return r;
     }
     return CallWindowProcW(g_oldHistoryProc, h, msg, wp, lp);
