@@ -25,6 +25,7 @@ log/
 
 # 工作区数据 (记忆/日志, 非源码)
 .workbuddy/
+.workbuddy-ai/
 
 # 编辑器/IDE
 .vscode/
