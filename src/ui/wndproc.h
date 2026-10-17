@@ -37,7 +37,6 @@ static void layout(HWND hwnd) {
     int lbl_w = dp(80);
     int top_h = row_h * 4 + gap * 5;
     int btn_w = dp(80);
-    int stop_w = dp(80);      /* 停止按钮: 与发送并列, 等宽 */
     int ws_btn_w = dp(72);
     int new_w = dp(80);
     int sess_w = dp(80);
@@ -46,7 +45,12 @@ static void layout(HWND hwnd) {
     int status_h = dp(20);
     int status_y = H - status_h - dp(2);
     int input_y  = status_y - gap - input_h;
-    int input_w = W - btn_w - stop_w - gap * 4;
+    /* 发送与停止**垂直叠成一列** (停止在上, 发送在下), 而不是左右并列:
+     * 并排时这一列要吃 160+ 逻辑像素, 输入框被挤窄; 叠起来只占一个按钮的宽。
+     * 两个按钮在 input_h 内均分高度 —— 用"总高减一个 gap 再对半"算, 于是列的上下边缘
+     * 与输入框齐平, 两个按钮中间正好一个 gap。 */
+    int btn_h = (input_h - gap) / 2;
+    int input_w = W - btn_w - gap * 3;
 
     for (int i = 0; i < 3; i++) {
         int y = gap + i * (row_h + gap);
@@ -72,8 +76,11 @@ static void layout(HWND hwnd) {
                input_y - gap - top_h, TRUE);
     ui_history_pad(g_hHistory, W - gap * 2, input_y - gap - top_h);
     MoveWindow(g_hInput, gap, input_y, input_w, input_h, TRUE);
-    MoveWindow(g_hSend,  gap * 2 + input_w, input_y, btn_w, input_h, TRUE);
-    MoveWindow(g_hStop,  gap * 3 + input_w + btn_w, input_y, stop_w, input_h, TRUE);
+    {
+        int bx = gap * 2 + input_w;
+        MoveWindow(g_hStop, bx, input_y,               btn_w, btn_h, TRUE);   /* 上: 停止 */
+        MoveWindow(g_hSend, bx, input_y + btn_h + gap, btn_w, btn_h, TRUE);   /* 下: 发送 */
+    }
     MoveWindow(g_hStatus, gap, status_y, W - gap * 2, status_h, TRUE);
 }
 
