@@ -76,12 +76,15 @@ static void start_task(HWND hwnd) {
     SetWindowTextW(g_hInput, L"");
 
     /* 回显用户输入到历史框 (USER 角色: 前端按"用户消息"样式渲染 —— 蓝底加粗, 见 ui/helpers.h)。
-     * 不加"你："前缀: 样式本身已经说清了这是谁说的, 前缀只是噪音。 */
+     * 不加"你："前缀: 样式本身已经说清了这是谁说的, 前缀只是噪音。
+     * 与 session.h 的回显一致, 不带前导换行: 上一块若没收尾段落, do_append 的
+     * g_last_no_lf 兜底会补; 带了的代价是每条用户消息前多出一个吃 USER 段前距的空段
+     * (约 90px 空白)。 */
     {
         size_t ul = strlen(task->user_msg);
         char *uecho = (char*)malloc(ul + 16);
         if (uecho) {
-            snprintf(uecho, ul + 16, "\r\n%s\r\n", task->user_msg);
+            snprintf(uecho, ul + 16, "%s\r\n", task->user_msg);
             gui_emit(uecho, CAGENT_ROLE_USER);
             free(uecho);
         }

@@ -427,8 +427,11 @@ static CAGENT_MAYBE_UNUSED void history_replay(void) {
             if (!*ct) continue;
             char *line = (char*)malloc(strlen(ct) + 16);
             if (!line) break;
-            /* 不加"你："前缀 —— 与实时回显一致 (样式已经区分了说话人, 前缀只是噪音) */
-            snprintf(line, strlen(ct) + 16, "\r\n%s\r\n", ct);
+            /* 不加"你："前缀 —— 与实时回显一致 (样式已经区分了说话人, 前缀只是噪音)。
+             * 前导换行**不能要**: 上一块结尾的换行已经闭合了段落, 再补一个就是带 USER
+             * 段前距的空段 (段前距 + 整行行高 + 段后距, 实测约 90px 的空白)。真要分隔
+             * 的时候 do_append 的 g_last_no_lf 兜底会补, 两边都不该在这里补。 */
+            snprintf(line, strlen(ct) + 16, "%s\r\n", ct);
             cagent_emit(line, CAGENT_ROLE_USER);
             free(line);
         } else if (strcmp(r, "assistant") == 0) {
@@ -436,7 +439,12 @@ static CAGENT_MAYBE_UNUSED void history_replay(void) {
             if (*ct) {
                 char *line = (char*)malloc(strlen(ct) + 8);
                 if (!line) break;
-                snprintf(line, strlen(ct) + 8, "%s\r\n", ct);
+                /* 末尾已有换行则不补 (agent.h 实时路径同一条规则: "避免双倍空行")。
+                 * 模型回复常以 "\n" 收尾, 无条件补 "\r\n" 会多出一个空段落 —— 空段也吃
+                 * AI 的段前距加整行行高, 回放时表现为正文与工具标题之间一大块空白。 */
+                size_t cl = strlen(ct);
+                int eol = (cl && (ct[cl-1] == '\n' || ct[cl-1] == '\r'));
+                snprintf(line, cl + 8, eol ? "%s" : "%s\r\n", ct);
                 cagent_emit(line, CAGENT_ROLE_AI);
                 free(line);
             }
@@ -468,15 +476,21 @@ static CAGENT_MAYBE_UNUSED void history_replay(void) {
                 }
             }
         } else if (strcmp(r, "tool") == 0) {
-            if (!*ct) continue;
-            size_t tl = strlen(ct);
-            size_t cut = utf8_trim_len(ct, tl > 800 ? 800 : tl);
-            int trunc = (tl > 800);
-            char *line = (char*)malloc(cut + 48);
+            /* 与实时路径逐字同构 (agent.h): 先剥尾部说明 —— "(已截断: 文件共 N 字节,
+             * 用 offset=... 继续读)" 这类话是回传给模型的协议层, 用户关心的是内容本身;
+             * 输出为空给 "(无输出)"; 尾换行按 eol 判定 (已带换行则不补)。
+             * **不再截到 800 字符**: 回放比实时少看内容才叫不一致, 长输出有折叠块兜底
+             * (默认收起只留标题行, 用户手动展开才看全文), 不存在刷屏问题。 */
+            const char *note = tool_note_split(ct);
+            size_t shown = note ? (size_t)(note - ct) : strlen(ct);
+            if (shown == 0) {
+                cagent_emit("(无输出)\r\n", CAGENT_ROLE_OUTPUT);
+                continue;
+            }
+            char *line = (char*)malloc(shown + 64);
             if (!line) break;
-            /* 与实时对话一致: 不带 "[Output]" 标签, 靠 OUTPUT 角色单独成块 (见 agent.h) */
-            snprintf(line, cut + 48, "%.*s%s\r\n",
-                     (int)cut, ct, trunc ? "\r\n(已截断)" : "");
+            int eol = (ct[shown-1] == '\n' || ct[shown-1] == '\r');
+            snprintf(line, shown + 64, eol ? "%.*s" : "%.*s\r\n", (int)shown, ct);
             cagent_emit(line, CAGENT_ROLE_OUTPUT);
             free(line);
         }
