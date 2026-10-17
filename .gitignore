@@ -43,3 +43,11 @@ test/e2e_artifacts/
 
 # UT 测试隔离工作区 (make test 运行时生成; 正常跑完会自己清掉, 这条只是兜底)
 cagent_test_ws/
+
+# UI 排查探针 (本地验证工具: 间隙/光标/闪烁三套 + cue_probe 的 manifest/rc 配套,
+# 是历次渲染/折叠/滚动修复的取证程序; 留在本机但不入库 —— 仓库里不留"构建外的代码")
+test/ui_gap_probe.c
+test/ui_cue_probe.c
+test/ui_flicker_probe.c
+test/cue_probe.manifest
+test/cue_probe.rc
