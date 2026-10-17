@@ -280,8 +280,23 @@ static void ui_fold_reset(void) {
  * head_cp 在这里**实测**而不是写死常量 —— 工具块的标题行长度随工具名变化,
  * 而且"一个段落标记算几个 cp"这件事 RichEdit 各版本口径不一, 实测比猜可靠:
  * 这个值错了, 该块正文的起点就全偏。 */
+/* 丢掉**最老的**一个块 (索引表满了的时候)。
+ * 必须释放它持有的正文副本: 收起态的块把正文 malloc 在 segs[].text 里, 直接 memmove
+ * 覆盖会把它漏掉 —— 长会话每挤掉一块就漏一份, 会话越长漏得越多。 */
+static void ui_fold_drop_oldest(void) {
+    if (g_fold_n <= 0) return;
+    UiFoldBlock *b = &g_folds[0];
+    for (int s = 0; s < b->n_segs; s++) { free(b->segs[s].text); b->segs[s].text = NULL; }
+    memmove(g_folds, g_folds + 1, (size_t)(g_fold_n - 1) * sizeof(UiFoldBlock));
+    g_fold_n--;
+}
+
 static void ui_fold_new(int kind, long cp_before, long cp_after) {
-    if (g_fold_n >= UI_FOLD_MAX) return;
+    /* 表满时**挤掉最老的**, 而不是把新块丢掉 —— 新块在文档末尾, 正是用户正在看、也最
+     * 想收起的区域; 丢它等于"会话聊到一定长度之后就再也折不动了", 而且是静默失效:
+     * 界面上标题行照常显示、点上去却没反应。老块此时通常已是收起态, 丢掉索引只是不能
+     * 再点开 (它在好几屏之前, 且视觉上没变化)。 */
+    if (g_fold_n >= UI_FOLD_MAX) ui_fold_drop_oldest();
     UiFoldBlock *b = &g_folds[g_fold_n++];
     memset(b, 0, sizeof(*b));
     b->kind    = kind;

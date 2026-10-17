@@ -500,6 +500,71 @@ static void note_split_selftest(void) {
     printf("note split selftest: [%s]\n", ok ? "OK" : "FAIL");
 }
 
+static const wchar_t *pv_wstrstr(const wchar_t *hay, const wchar_t *needle);  /* 定义在下面 */
+
+/* 读回历史框全文 (调用方 free)。 */
+static WCHAR *pv_doc_text(void) {
+    int n = GetWindowTextLengthW(g_hHistory);
+    WCHAR *w = (WCHAR*)calloc((size_t)n + 8, sizeof(WCHAR));
+    if (w) GetWindowTextW(g_hHistory, w, n + 1);
+    return w;
+}
+
+/* 折叠块索引表**满了之后, 最新的块必须仍然可折**。
+ *
+ * 真实场景: 一个 150 条消息、67 次工具调用的会话, 加载后**末尾几个块全都折不动** ——
+ * 因为 ui_fold_new 在 g_fold_n >= UI_FOLD_MAX 时直接 return, 新块压根不进索引表。
+ * 界面上标题行照常显示 (看着一切正常), 点上去却没反应, 而且是从某个长度开始**静默**
+ * 失效 —— 会话越往后聊, 折不动的块越多, 用户看到的就是"最新的全都没折叠"。
+ *
+ * 所以断言不能只看"表里的块收起了没" (旧写法下表里那批照样全收起, 照样通过):
+ * 必须证明**文档末尾那个块**在表里 —— 给它一个只会在这里出现的输出文本, 断言它被
+ * 折掉了 (文档里搜不到), 再展开又能搜到。 */
+static void fold_cap_selftest(void) {
+    const char *path = "preview_foldcap_session.json";
+    int nblk = UI_FOLD_MAX + 8;                 /* 必定溢出, 逼出"表满"这条路径 */
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fputs("{\"workspace\":\".\",\"messages\":[{\"role\":\"user\",\"content\":\"跑很多工具\"}", f);
+        for (int i = 0; i < nblk; i++)
+            fprintf(f, ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c%d\","
+                       "\"type\":\"function\",\"function\":{\"name\":\"tool_%d\",\"arguments\":\"{}\"}}]}"
+                       ",{\"role\":\"tool\",\"content\":\"out %d\"}", i, i, i);
+        fputs(",{\"role\":\"assistant\",\"content\":\"done\"}]}", f);
+        fclose(f);
+    }
+
+    g_active_ws[0] = '\0';
+    g_pq_n = 0;
+    cagent_emit = gui_emit;
+    sess_apply_selected(path);
+    pq_pump();
+    cagent_emit = NULL;
+    remove(path);
+
+    char marker[32];
+    snprintf(marker, sizeof(marker), "out %d", nblk - 1);      /* 只属于最后一块 */
+    WCHAR wm[32];
+    memset(wm, 0, sizeof(wm));
+    utf8_to_wide(marker, wm, (int)(sizeof(wm) / sizeof(WCHAR)));
+
+    int last = g_fold_n - 1;
+    int last_collapsed = (last >= 0) ? g_folds[last].collapsed : -1;   /* 先取: 下面要展开它 */
+    int ok = (g_fold_n == UI_FOLD_MAX) && (last >= 0) && g_folds[last].collapsed;
+    WCHAR *doc = pv_doc_text();
+    int hidden = doc ? (pv_wstrstr(doc, wm) == NULL) : 0;       /* 收起 = 正文不在文档里 */
+    free(doc);
+    ok &= hidden;
+    ui_fold_toggle(last);                                        /* 还能点开 = 真在表里 */
+    doc = pv_doc_text();
+    int reshown = doc ? (pv_wstrstr(doc, wm) != NULL) : 0;
+    free(doc);
+    ok &= reshown;
+    if (!ok) g_pv_fails++;
+    printf("fold cap selftest: %d 个块进表 (上限 %d), 最新块 收起=%d 正文隐藏=%d 可再展开=%d [%s]\n",
+           g_fold_n, UI_FOLD_MAX, last_collapsed, hidden, reshown, ok ? "OK" : "FAIL");
+}
+
 /* 宽字符子串查找 (MinGW 的 wcsstr 在没引 <wchar.h> 时未必可见, 自己写三行更稳)。 */
 static const wchar_t *pv_wstrstr(const wchar_t *hay, const wchar_t *needle) {
     if (!*needle) return hay;
@@ -819,6 +884,7 @@ int main(void) {
     inbox_selftest();
     drain_order_selftest();
     replay_selftest();
+    fold_cap_selftest();
 
     ui_fold_reset();
     DestroyWindow(hwnd);

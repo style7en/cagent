@@ -163,7 +163,10 @@ typedef struct {
     WCHAR *text;       /* 收起时保存的文本 (展开时释放并置 NULL) */
 } UiFoldSeg;
 
-#define UI_FOLD_MAX 64
+/* 折叠块索引表的容量。**表满时丢最老的块给新块腾位置** (见 ui_fold_new), 所以这不是
+ * "最多能折多少个"而是"同时可交互的窗口有多大": 128 够往回翻好几屏, 又不至于让
+ * ui_fold_refresh_heads (每次折叠都要遍历全表重设标题行格式) 变得昂贵。 */
+#define UI_FOLD_MAX 128
 typedef struct {
     int        kind;       /* UI_FOLD_THINK / UI_FOLD_TOOL */
     long       cp_head;    /* 标题行首字符的 cp */
