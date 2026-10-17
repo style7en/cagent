@@ -14,14 +14,27 @@
  * ② **只认完整行**。流式 delta 会把一行劈成几段、也会把标记劈开 —— 半行留在
  *    行缓冲里, 凑齐整行再解析, 标记永远不会被 delta 边界截断。
  *
- * ③ **纯样式层: 一个字符都不增删**。所有 Markdown 标记字符原样插入, 只是染成
+ * ③ **纯样式层: 内容字符一个都不增删**。所有 Markdown 标记字符原样插入, 只是染成
  *    浅灰"淡化"(CommonMark 规定 \* 的 \ 不渲染、[链接](地址) 只渲染文字,
- *    这里都不做删除)。这条是硬约束: 重试回删按 g_stream_chars (实际插入的 cp
- *    数) 定位, 解析时一旦吞字符, 计数就与文本脱节, 回删会留下残尾。
+ *    这里都不做删除)。回删安全靠的是 g_stream_chars 按**实际插入的 cp** 对账
+ *    (do_append 里 cp_after - cp_before), 所以"空行不落地"这种处理不破坏它 ——
+ *    被跳过的字符本就没进文档, 计数依然吻合; 但**非空行的内容字符一概不能动**。
  *
  * ④ CRLF 整条插入。RichEdit 把孤立的 \r 和孤立的 \n 各当成一个段落标记,
  *    拆两次插入会让行距翻倍、后续 run 的样式整体串位 (旧分支实测)。
  *    做法是行尾也进行缓冲, 与行内容作为同一段文本一次插入。
+ *
+ * ⑤ **空行是块分隔符, 不是内容** (空白治理)。CommonMark 里空行只负责分段、没有
+ *    可视内容。把它落成一个空段落, 它会吃满"段前距(AI 角色 16) + 整行行高",
+ *    而下一块还各带一份段前距 —— 模型一句 "\n\n" 就是几十上百像素的空白
+ *    (用户截图实录: 每个小标题后面都拖一片白)。所以**围栏以外的空行一律不落地**,
+ *    块间距只由"下一块的段前距"表达。围栏内的空行是代码内容, 照常按字面上屏。
+ *
+ * ⑥ **段前距只给块首行** (空白治理)。段前距表达的是"块与块之间"的距离; 同一段落的
+ *    软换行续行、列表的相邻项、引用的相邻行, 一律 0 —— 行内再加一份就把内容拉散了。
+ *    判据用"上一个落地的行是什么" (md_prev_kind): 同类行才是续行 (段落续段落/软换行、
+ *    列表续列表、引用续引用); 段落后接列表 = 列表打断段落, 是块边界, 段前距回来。
+ *    标题/分割线/围栏永远是新块。
  *
  * 支持范围 ("简单"的边界):
  *   行级  ``` 围栏代码块 / # 标题 / > 引用 / - * + 与 N. 列表 / --- 分割线
@@ -55,6 +68,15 @@ static int    md_len;        /* 已缓冲码元数 */
 static int    md_cap;        /* 缓冲容量 */
 static int    md_in_fence;   /* 正处于 ``` 围栏代码块内 */
 static int    md_fence_len;  /* 开围栏那行的反引号个数 —— 关围栏要求不少于它 */
+
+/* 上一个落地的行是什么 (原则 ⑥: 段前距只给块首行)。
+ * NONE = 块边界 (空行/标题/分割线/围栏/文档开头/复位之后);
+ * PARA/LIST/QUOTE = 行内内容行, 且**同类**的下一行是它的续行 (段前距 0)。 */
+#define MD_PREV_NONE  0
+#define MD_PREV_PARA  1
+#define MD_PREV_LIST  2
+#define MD_PREV_QUOTE 3
+static int    md_prev_kind;
 
 /* ===== 行内/行级样式 =====
  * 不直接碰 CHARFORMAT: 解析器只描述"这段跑什么样式", 落到 ui_insert_ex 的
@@ -107,7 +129,8 @@ static void md_put(WCHAR *line, int s, int n, const MdStyle *st,
 }
 
 /* 缓冲涨爆 / 分配失败时的兜底: 不解析, 按当前状态直接落地。
- * 等宽代码样式在围栏内, 否则正文字体; 段距: 围栏内 0 (多行块), 否则角色默认。
+ * 等宽代码样式在围栏内, 否则正文字体; 段距: 围栏内 0 (多行块), 否则只有第一段
+ * 带角色段前距 (它是块首, 后续分段是同一内容的延续 —— 原则 ⑥)。
  * 分段用栈缓冲, 不分配内存 —— 兜底路径自己不能再失败。 */
 static void md_emit_raw(const WCHAR *w, int n) {
     if (n <= 0) return;
@@ -115,8 +138,9 @@ static void md_emit_raw(const WCHAR *w, int n) {
     MdStyle st;
     st.fg = rs->fg; st.bold = rs->bold; st.italic = rs->italic;
     st.mono = rs->mono; st.underline = 0;
-    int sp_before = rs->sp_before;
-    if (md_in_fence) { st.mono = 1; st.fg = MD_CODE_FG; sp_before = 0; }
+    int sp_first = 0;
+    if (md_in_fence) { st.mono = 1; st.fg = MD_CODE_FG; }
+    else             { sp_first = rs->sp_before; }
     UiStyleOv ov;
     memset(&ov, 0, sizeof(ov));
     ov.has_cf = 1;
@@ -124,7 +148,7 @@ static void md_emit_raw(const WCHAR *w, int n) {
     ov.bold = st.bold; ov.italic = st.italic;
     ov.mono = st.mono; ov.underline = st.underline;
     ov.has_para = 1;
-    ov.sp_before = sp_before; ov.sp_after = rs->sp_after; ov.indent = rs->indent;
+    ov.sp_before = sp_first; ov.sp_after = rs->sp_after; ov.indent = rs->indent;
     WCHAR tmp[512];
     int off = 0;
     while (off < n) {
@@ -136,7 +160,10 @@ static void md_emit_raw(const WCHAR *w, int n) {
         tmp[k] = L'\0';
         ui_insert_ex(g_hHistory, tmp, CAGENT_ROLE_AI, -1, &ov);
         off += k;
+        ov.sp_before = 0;   /* 后续分段是同一内容的延续, 不再要段前距 (原则 ⑥) */
     }
+    /* 兜底落的是行内内容: 围栏外当段落 (后续行可软换行续行), 围栏内算块 */
+    md_prev_kind = md_in_fence ? MD_PREV_NONE : MD_PREV_PARA;
 }
 
 /* ===== 行缓冲 =====
@@ -169,11 +196,13 @@ static void md_buf_push(const WCHAR *w, int n) {
 }
 
 /* 复位: 清空行缓冲与围栏状态。**重试回删 / 新分段 / 清空历史框之后必须调** ——
- * 缓冲里是没上屏的半行, 删了文档不清缓冲, 下一段文本会接在它的后面。 */
+ * 缓冲里是没上屏的半行, 删了文档不清缓冲, 下一段文本会接在它的后面。
+ * md_prev_kind 一起清: 新分段的第一行是块首行, 段前距要给。 */
 static void md_reset(void) {
     md_len = 0;
     md_in_fence = 0;
     md_fence_len = 0;
+    md_prev_kind = MD_PREV_NONE;
 }
 
 /* 行缓冲里有没有未落地的半行 */
@@ -405,6 +434,7 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
 
     /* ---- 围栏代码块内 ---- */
     if (md_in_fence) {
+        md_prev_kind = MD_PREV_NONE;   /* 围栏是独立块: 块内行进完, 下一行都是块首 */
         int fp = 0, fn = 0;
         if (md_fence_at(line, len, &fp, &fn) && fn >= md_fence_len &&
             md_rest_blank(line, fp + fn, len)) {
@@ -434,19 +464,26 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
             MdStyle s = dim;
             s.mono = 1;
             md_put(line, 0, len, &s, sp_before, sp_after, indent);
+            md_prev_kind = MD_PREV_NONE;   /* 围栏永远是新块 */
             return;
         }
     }
 
-    /* ---- 空行 ---- */
+    /* ---- 空行 ----
+     * CommonMark 里空行只是块分隔符, 没有可视内容。落成空段落的话, 它会吃满
+     * "段前距(16) + 整行行高", 而下一块还各带一份段前距 —— 模型一句 "\n\n"
+     * 就是几十上百像素的空白 (用户截图实录)。所以围栏以外的空行一律**不落地**,
+     * 块间距交给下一块的段前距表达 (原则 ⑤)。围栏内的空行是代码内容, 上面
+     * 已经按字面上屏了。 */
     if (md_is_blank(line, len)) {
-        md_put(line, 0, len, &base, sp_before, sp_after, indent);
+        md_prev_kind = MD_PREV_NONE;
         return;
     }
 
     /* ---- 分割线 ---- */
     if (md_is_rule(line, len)) {
         md_put(line, 0, len, &dim, sp_before, sp_after, indent);
+        md_prev_kind = MD_PREV_NONE;   /* 分割线永远是新块 */
         return;
     }
 
@@ -476,6 +513,7 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
             /* 收尾 # 序列 + 行尾一起淡化。**行尾必须跟着内容走** (文件头第 ④ 条):
              * 单独插一次 CRLF 会让行距翻倍、后续 run 样式串位。 */
             md_put(line, ce, len - ce, &dim, sb, sp_after, indent);
+            md_prev_kind = MD_PREV_NONE;   /* 标题永远是新块 (标题后接的正文是新段) */
             return;
         }
     }
@@ -486,8 +524,11 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
         if (cs < len - tail_len && (line[cs] == L' ' || line[cs] == L'\t')) cs++;
         MdStyle qs = base;
         qs.fg = MD_QUOTE_FG;
-        md_put(line, 0, cs, &dim, sp_before, sp_after, MD_QUOTE_INDENT);
-        md_scan_inline(line, cs, len, &qs, 0, sp_before, sp_after, MD_QUOTE_INDENT);
+        /* 同类续行 (引用接引用) 段前距 0; 别处转来的引用是块边界 */
+        int sp_in = (md_prev_kind == MD_PREV_QUOTE) ? 0 : sp_before;
+        md_put(line, 0, cs, &dim, sp_in, sp_after, MD_QUOTE_INDENT);
+        md_scan_inline(line, cs, len, &qs, 0, sp_in, sp_after, MD_QUOTE_INDENT);
+        md_prev_kind = MD_PREV_QUOTE;
         return;
     }
 
@@ -506,14 +547,24 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
                 cs = q + 2;
         }
         if (cs >= 0) {
-            md_put(line, 0, cs, &dim, sp_before, sp_after, indent);
-            md_scan_inline(line, cs, len, &base, 0, sp_before, sp_after, indent);
+            /* 相邻列表项紧凑 (同类续行); 列表打断段落/接在别的块后 = 块边界 */
+            int sp_in = (md_prev_kind == MD_PREV_LIST) ? 0 : sp_before;
+            md_put(line, 0, cs, &dim, sp_in, sp_after, indent);
+            md_scan_inline(line, cs, len, &base, 0, sp_in, sp_after, indent);
+            md_prev_kind = MD_PREV_LIST;
             return;
         }
     }
 
     /* ---- 普通段落行 ---- */
-    md_scan_inline(line, 0, len, &base, 0, sp_before, sp_after, indent);
+    /* 软换行续行 (上一个落地的行是任何行内内容) 段前距 0; 空行/标题/分割线/
+     * 围栏之后才是新段。CommonMark 语义: 段落续段落 = 软换行, 段落续列表项 =
+     * 延迟延续, 都算同一块; 列表/引用打断段落才是块边界 (见上面各分支)。 */
+    {
+        int sp_in = (md_prev_kind != MD_PREV_NONE) ? 0 : sp_before;
+        md_scan_inline(line, 0, len, &base, 0, sp_in, sp_after, indent);
+        md_prev_kind = MD_PREV_PARA;
+    }
 }
 
 /* ===== 对外接口 (前向声明见 ui/state.h) ===== */

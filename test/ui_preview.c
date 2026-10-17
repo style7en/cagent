@@ -47,8 +47,11 @@ static const struct { const char *text; int role; } kSample[] = {
     { "(请求限流, 等待后重试...)\r\n",                                 CAGENT_ROLE_NOTE },
     /* ---- Markdown 渲染: 只有正式答案 (AI) 参与解析, 旁白/工具调用不参与 ---- */
     { "## 构建方式\r\n",                                            CAGENT_ROLE_AI },
+    /* 这些 "\r\n" 空行条目在界面上**什么都看不见** —— 空行是 CommonMark 的块分隔符,
+     * 不落地 (曾按空段落落地, 每个空行吃满"段前距 16 + 整行行高", 一片一片的白) */
     { "\r\n",                                                      CAGENT_ROLE_AI },
-    { "项目用 **MinGW-w64 + make** 构建, *单编译单元*, 零第三方依赖。\r\n", CAGENT_ROLE_AI },
+    /* 两行一段、中间无空行: 第二行是软换行续行, 段前距 0, 与第一行贴紧 */
+    { "项目用 **MinGW-w64 + make** 构建, *单编译单元*, 零第三方依赖,\r\n产物是单个 cagent.exe, exe 所在目录即数据根。\r\n", CAGENT_ROLE_AI },
     { "关键命令是 `make` 与 `make test`, 见 [仓库说明](https://example.com)。\r\n", CAGENT_ROLE_AI },
     { "字面星号写作 \\*esc\\*, 不当斜体; ``a`b`` 反引号按 CommonMark 配对。\r\n", CAGENT_ROLE_AI },
     { "\r\n",                                                      CAGENT_ROLE_AI },

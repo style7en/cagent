@@ -378,6 +378,58 @@ int main(void) {
     run_is(0, 0, 3, 0, 0, 0, 0, AI_FG, 0, "star-unclosed");
 
     /* ---------------------------------------------------------------
+     * 5b) 空白治理: 空行不落地 (块分隔符) / 段前距只给块首行
+     *     空行一旦落成空段落, 它会吃满"段前距 16 + 整行行高", 而下一块还各带
+     *     一份段前距 —— 模型一句 "\n\n" 就是几十上百像素的空白 (截图实录)。
+     * ------------------------------------------------------------- */
+    /* 空行不进文档, 前后两块都带段前距 (间距只由下一块表达) */
+    reset_test(); feed(W("a\r\n\r\nb\r\n"));
+    doc_is(W("a\r\nb\r\n"), "blank-skip");
+    run_is(0, 0, 3, 0, 0, 0, 0, AI_FG, 0, "blank-skip");   /* "a\r\n" */
+    run_is(1, 3, 3, 0, 0, 0, 0, AI_FG, 0, "blank-skip");   /* "b\r\n" */
+    para_is(0, 16, 0, 0, "blank-skip");
+    para_is(1, 16, 0, 0, "blank-skip");   /* 空行后仍是块首, 段前距不丢 */
+
+    /* 连续多个空行同理: 一个都不落地 */
+    reset_test(); feed(W("a\r\n\r\n\r\nb\r\n"));
+    doc_is(W("a\r\nb\r\n"), "blank-multi");
+
+    /* 软换行续行: 同一段落的第二行段前距 0 */
+    reset_test(); feed(W("a\r\nb\r\n"));
+    para_is(0, 16, 0, 0, "softwrap");
+    para_is(1, 0,  0, 0, "softwrap");
+
+    /* 列表相邻项紧凑; 段落后接列表 = 列表打断段落, 块边界段前距回来 */
+    reset_test(); feed(W("- x\r\n- y\r\n"));
+    para_is(0, 16, 0, 0, "list-tight");
+    para_is(2, 0,  0, 0, "list-tight");
+    reset_test(); feed(W("text\r\n- x\r\n"));
+    para_is(0, 16, 0, 0, "list-break");
+    para_is(1, 16, 0, 0, "list-break");
+
+    /* 引用相邻行紧凑; 段落后接引用 = 块边界 */
+    reset_test(); feed(W("> a\r\n> b\r\n"));
+    para_is(0, 16, 0, MD_QUOTE_INDENT, "quote-tight");
+    para_is(2, 0,  0, MD_QUOTE_INDENT, "quote-tight");
+    reset_test(); feed(W("text\r\n> a\r\n"));
+    para_is(1, 16, 0, MD_QUOTE_INDENT, "quote-break");
+
+    /* 标题/分割线之后都是块边界 (标题还叠标题加量) */
+    reset_test(); feed(W("text\r\n## H\r\n"));
+    para_is(1, 16 + 4, 0, 0, "head-break");
+    reset_test(); feed(W("text\r\n---\r\n"));
+    para_is(1, 16, 0, 0, "rule-break");
+
+    /* 围栏内的空行是**代码内容**, 照常按字面上屏 (不能被当块分隔符吞掉) */
+    reset_test(); feed(W("```\r\nx\r\n\r\ny\r\n```\r\n"));
+    doc_is(W("```\r\nx\r\n\r\ny\r\n```\r\n"), "fence-blank");
+    run_is(2, 8, 2, 0, 0, 0, 1, MD_CODE_FG, 0, "fence-blank");
+
+    /* 围栏闭合之后的第一行是块首 (段前距回来), 不继承围栏前的段落状态 */
+    reset_test(); feed(W("p\r\n```\r\nc\r\n```\r\nafter\r\n"));
+    para_is(4, 16, 0, 0, "fence-after");
+
+    /* ---------------------------------------------------------------
      * 6) 接线 (do_append): 切角色先落地半行 / 围栏跨 NOTE / TOOL 复位
      * ------------------------------------------------------------- */
     /* NOTE 是流式插播: 围栏状态跨过它, 半行按代码样式落地, 兜底换行落在半行之后 */
