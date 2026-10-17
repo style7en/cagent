@@ -386,7 +386,9 @@ static void do_append_wrapper(const char *utf8, int role) { do_append(utf8, role
 
 /* 历史回放自检: 载入含工具调用的会话后, 必须能重建出可折叠的工具块。
  * 以前 history_replay 只回放 tool 结果、不回放 assistant 的 tool_calls, 于是历史会话里
- * 只剩一堆没头没尾的输出块 —— 看不出是哪次调用, 也没有标题行可点。 */
+ * 只剩一堆没头没尾的输出块 —— 看不出是哪次调用, 也没有标题行可点。
+ * 终态还必须和实时一致: 回放结束也要收尾 (ui_turn_tail), 最后一个块默认收起 ——
+ * 漏了它, "加载历史会话, 最后一个调用工具总是展开", 与实时终态对不上。 */
 static void replay_selftest(void) {
     /* 回放走 cagent_emit; 预览里没有消息循环, 直接同步接到 do_append 上 */
     cagent_emit = do_append_wrapper;
@@ -408,9 +410,11 @@ static void replay_selftest(void) {
         g_system_prompt);
 
     history_replay();
+    /* 与 sess_apply_selected 同构: 回放结束也要走 ui_turn_tail */
+    ui_turn_tail();
 
-    int ok = (g_fold_n == 1) && !g_folds[0].collapsed;
-    printf("replay selftest: 重建了 %d 个工具块 (期望 1) [%s]\n",
+    int ok = (g_fold_n == 1) && g_folds[0].collapsed;
+    printf("replay selftest: 重建了 %d 个工具块 (期望 1, 默认收起) [%s]\n",
            g_fold_n, ok ? "OK" : "FAIL");
     cagent_emit = NULL;
 }

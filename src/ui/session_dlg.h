@@ -118,6 +118,10 @@ static void sess_apply_selected(const char *path) {
     emit_note(g_workspace);
     emit_note(")\r\n");
     history_replay();
+    /* 回放结束 = 一轮结束, 收尾必须和实时走同一条 (ui_turn_tail): 把最后一个块按
+     * 默认收起、滚回末尾。漏了这一步, 加载进来的会话最后一个工具块是展开的, 而它在
+     * 实时对话里明明是收起的 —— 同一段对话只因"重新载入"看起来不一样。 */
+    ui_turn_tail();
 }
 
 /* ===== 布局与字体 (首次创建与 WM_DPICHANGED 共用) ===== */

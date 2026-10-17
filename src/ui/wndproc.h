@@ -595,13 +595,9 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_APP_FOLDEND) {
-        /* 一轮结束: 先把 Markdown 行缓冲里的半行落地 (它是本段答案的结尾, 不落地
-         * 就永远停在缓冲里 —— 用户看不到, 历史会话回放时也对不上), 再把最后一个块
-         * 按默认收起 (用户手动展开过的不动)。
-         * 折叠会让文档变短, 此时滚动位置可能悬在半空, 顺手滚回末尾。 */
-        g_stream_chars += md_flush();
-        ui_fold_collapse(g_fold_n - 1);
-        SendMessageW(h, WM_VSCROLL, SB_BOTTOM, 0);
+        /* 一轮结束的收尾 (半行落地 + 最后一个块按默认收起 + 滚回末尾)。
+         * 历史回放走同一条 ui_turn_tail —— 保证"重新打开会话"与"实时对话"终态一致。 */
+        ui_turn_tail();
         return 0;
     }
     /* 点击折叠块的标题行 -> 收起/展开。

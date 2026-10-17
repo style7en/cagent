@@ -500,6 +500,17 @@ static void ui_fold_collapse(int idx) {
     ui_fold_set(idx, 1);
 }
 
+/* 一轮对话 / 一次历史回放结束后的收尾: Markdown 半行落地, 最后一个块按默认收起,
+ * 滚回末尾。
+ * **实时与回放必须走同一条收尾** (回放与实时同构): 实时路径由 gui_on_done 投递
+ * WM_APP_FOLDEND 触发; 回放路径以前漏了这一步, 于是同一段对话只因"重新载入"终态
+ * 就不一样 —— 实时里最后一个工具块是收起的, 从会话列表加载回来它却摊开着。 */
+static void ui_turn_tail(void) {
+    g_stream_chars += md_flush();
+    ui_fold_collapse(g_fold_n - 1);
+    SendMessageW(g_hHistory, WM_VSCROLL, SB_BOTTOM, 0);
+}
+
 /* 主线程处理: UTF-8 -> UTF-16, LF 补 CRLF, 按角色着色/缩进后追加到历史框末尾。 */
 static void do_append(const char *utf8, int role) {
     size_t in_len = strlen(utf8);
