@@ -145,6 +145,12 @@ typedef struct {
     char name[64];
     char args[ARGS_MAX];   /* arguments 片段累积 */
     int  args_overflow;    /* 累积将超上限: 置位并停止拼接, 执行期拒绝执行而非截尾成非法 JSON */
+    /* 思考签名 (Gemini 3 等): 服务端挂在某个 tool_call 分片上的
+     * extra_content.google.thought_signature, 下一轮必须原样带回 —— 缺了它服务端直接
+     * 400 "Function call is missing a thought_signature in functionCall parts"。
+     * 挂在**哪一条**由服务端决定 (实测并发调用时只挂第一条), 所以"哪条带就存哪条",
+     * 回写也放回同一条, 不做合并或搬运。 */
+    char sig[TOOL_SIG_MAX];
 } StreamToolCall;
 
 /* 单轮允许的最大并行 tool_calls (超出部分只记 id/name, 回填"未执行"结果) */
@@ -289,6 +295,47 @@ static void on_content_delta(void *ud, const char *delta) {
     ctx->content_buf[ctx->content_len] = '\0';
 }
 
+/* 取 tool_call 分片上的思考签名 (extra_content.google.thought_signature)。
+ * Gemini 3 的 OpenAI 兼容层把它挂在 functionCall 分片上, 并要求下一轮原样带回;
+ * 放在 assistant 消息层级**不算数** —— 实测那样仍然 400, 只能跟着 functionCall 走。 */
+static const char *tool_call_thought_sig(const JValue *tc) {
+    const JValue *ec = json_obj_get(tc, "extra_content");
+    const JValue *g  = ec ? json_obj_get(ec, "google") : NULL;
+    const char *s = g ? json_as_str(json_obj_get(g, "thought_signature")) : NULL;
+    return (s && *s) ? s : NULL;
+}
+
+/* 把存下来的签名包成回写 tool_call 用的 extra_content 片段 (**含前导逗号**),
+ * 无签名返回 NULL; 返回值需 free。
+ * 单独抽出来是为了能单测: 少一个括号, 服务端只会回一句看不懂的 400。 */
+static char *tool_sig_extra_alloc(const char *sig) {
+    if (!sig || !*sig) return NULL;
+    char *esc = json_escape_alloc(sig);
+    if (!esc) return NULL;
+    size_t n = strlen(esc) + 64;
+    char *out = (char*)malloc(n);
+    if (out)
+        snprintf(out, n, ",\"extra_content\":{\"google\":{\"thought_signature\":\"%s\"}}", esc);
+    free(esc);
+    return out;
+}
+
+/* 分片没有 index 时决定它落到哪一条调用上。OpenAI 每个分片都带 index, 但 Gemini 的
+ * OpenAI 兼容层**不发这个字段** (实测并发调用的第二个分片只有 id/function) ——
+ * 于是"缺 index 就当 0 号"的写法会把并发调用全挤进 0 号槽: id/name 被后一条覆盖,
+ * arguments 首尾相接拼成非法 JSON, 两个调用退化成"一个被拒绝执行的坏调用"。
+ * 兜底规则: 有 id → 找同 id 的槽, 找不到就顺延新开一条; 没 id → 归到最近一条 (续片)。
+ * 返回 STREAM_CALLS_MAX 表示已经到上限, 调用方按"丢弃"处理。 */
+static int stream_slot_for_fragment(StreamCtx *ctx, const char *id) {
+    if (id && *id) {
+        for (int k = 0; k < ctx->n_calls; k++)
+            if (strcmp(ctx->calls[k].id, id) == 0) return k;
+        return (ctx->n_calls < STREAM_CALLS_MAX) ? ctx->n_calls : STREAM_CALLS_MAX;
+    }
+    if (ctx->n_calls == 0) return 0;
+    return ctx->n_calls - 1;      /* 没有 id: 当作上一条的续片 */
+}
+
 /* 把一个 delta 里的 tool_calls 按 index 累积进 ctx (流式分片拼接)。
  * 超出 STREAM_CALLS_MAX 的调用不再保存参数, 只记下 id/name —— 必须记下来, 否则这些
  * 调用既不出现在回传的 assistant 消息里、也没有 tool 结果, 模型会以为它们已经执行过。 */
@@ -296,14 +343,16 @@ static void stream_apply_tool_calls(StreamCtx *ctx, const JValue *tcs) {
     if (!tcs || tcs->type != J_ARR) return;
     for (size_t j = 0; j < tcs->arr.n; j++) {
         const JValue *tc = tcs->arr.items[j];
-        int idx = 0;
-        const JValue *idxv = json_obj_get(tc, "index");
-        if (idxv && idxv->type == J_NUM) idx = (int)idxv->num;
-        if (idx < 0) continue;
         const char *id   = json_as_str(json_obj_get(tc, "id"));
         const JValue *fn = json_obj_get(tc, "function");
         const char *name = json_as_str(json_obj_get(fn, "name"));
         const char *args = json_as_str(json_obj_get(fn, "arguments"));
+        const char *sig  = tool_call_thought_sig(tc);
+        int idx = -1;
+        const JValue *idxv = json_obj_get(tc, "index");
+        if (idxv && idxv->type == J_NUM) idx = (int)idxv->num;
+        if (idx < 0) idx = stream_slot_for_fragment(ctx, id);   /* 无 index: 见该函数说明 */
+        if (idx < 0) continue;
         if (idx >= STREAM_CALLS_MAX) {
             if (ctx->n_dropped >= STREAM_CALLS_MAX || !id || !id[0]) continue;
             snprintf(ctx->dropped[ctx->n_dropped].id,
@@ -317,6 +366,16 @@ static void stream_apply_tool_calls(StreamCtx *ctx, const JValue *tcs) {
         StreamToolCall *sc = &ctx->calls[idx];
         if (id && *id) snprintf(sc->id, sizeof(sc->id), "%s", id);
         if (name && *name) snprintf(sc->name, sizeof(sc->name), "%s", name);
+        /* 签名只存不解析: 它是加密串, 任何改写都会让它失效。超上限就整条丢掉
+         * (残半截发回去同样是 400), 并留痕以便日后调大 TOOL_SIG_MAX。 */
+        if (sig) {
+            if (strlen(sig) < sizeof(sc->sig)) {
+                snprintf(sc->sig, sizeof(sc->sig), "%s", sig);
+            } else {
+                log_line("[tool] 思考签名超上限 (%zu >= %zu), 已丢弃: name=%s",
+                         strlen(sig), sizeof(sc->sig), sc->name[0] ? sc->name : "?");
+            }
+        }
         if (args && !sc->args_overflow) {
             size_t al = strlen(sc->args);
             size_t dl = strlen(args);

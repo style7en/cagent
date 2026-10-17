@@ -14,6 +14,11 @@ typedef struct {
     char id[256]; char name[64]; char args[ARGS_MAX]; char *output;
     int too_big;   /* arguments 超上限: 不执行, 回填占位 "{}" + 原因交回模型 */
     int bad_json;  /* arguments 非合法 JSON (疑似被长度上限截断): 不执行, 降级占位 "{}" + 原因 */
+    /* 服务端给的思考签名 (Gemini 3 的 extra_content.google.thought_signature)。
+     * **跟着调用一起走**: 回写 assistant 消息时必须原样放回**同一条** tool_call 里,
+     * 否则下一轮请求直接被 400 拒掉 (missing a thought_signature in functionCall parts)。
+     * 空串 = 该条没有签名 (多数服务端都不发这个字段), 回写时原样省略。 */
+    char sig[TOOL_SIG_MAX];
 } AgentToolCall;
 
 /* 内置默认系统提示词正文 (单行原文)。内容不含引号与反斜杠, 可直接作为 JSON 字符串值,
@@ -360,6 +365,26 @@ static int msg_append(const char *fmt, ...) {
     int n = vsnprintf(messages + len, BUFSZ - len, fmt, ap);
     va_end(ap);
     return (n > 0 && (size_t)n < BUFSZ - len);
+}
+
+/* 拼一条 tool_call 对象进 messages 的 assistant 消息。
+ * leading_comma=1 表示它是数组第一项 (不加分隔逗号), 0 则补一个逗号。
+ * sig 非空时附带 extra_content.google.thought_signature —— Gemini 3 要求这个签名原样
+ * 带回同一条调用, 缺了它下一轮请求直接被 400 拒掉 (服务端只给一句 "missing a
+ * thought_signature in functionCall parts", 看不出是序列化写错了还是没收全)。
+ * 抽成函数就是为了能单测: 那一串括号、转义、逗号写错一位, 症状与别的原因长得一模一样。 */
+static int msg_append_one_tool_call(const char *id, const char *name, const char *args,
+                                    const char *sig, int leading_comma) {
+    char *ei = json_escape_alloc(id ? id : "");
+    char *en = json_escape_alloc(name ? name : "");
+    char *ea = json_escape_alloc(args ? args : "");
+    char *es = tool_sig_extra_alloc(sig);
+    int ok = ei && en && ea && msg_append(
+        "%s{\"id\":\"%s\",\"type\":\"function\"%s,"
+        "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}",
+        leading_comma ? "" : ",", ei, es ? es : "", en, ea);
+    free(ei); free(en); free(ea); free(es);
+    return ok;
 }
 
 /* ===== 超限识别 ===== */
@@ -897,6 +922,7 @@ static void agent_turn(const char *user_msg) {
             AgentToolCall *c = &calls[n_calls++];
             snprintf(c->id,   sizeof(c->id),   "%s", ctx->calls[i].id);
             snprintf(c->name, sizeof(c->name), "%s", ctx->calls[i].name);
+            snprintf(c->sig,  sizeof(c->sig),  "%s", ctx->calls[i].sig);   /* 空串=无签名 */
             c->too_big = ctx->calls[i].args_overflow;
             if (c->too_big) {
                 snprintf(c->args, sizeof(c->args), "{}");                    /* 残缺 JSON 不回传, 用占位 */
@@ -1049,25 +1075,15 @@ static void agent_turn(const char *user_msg) {
 
         for (int i = 0; i < n_calls && ok; i++) {
             AgentToolCall *c = &calls[i];
-            char *ei = json_escape_alloc(c->id);
-            char *en = json_escape_alloc(c->name);
-            char *ea = json_escape_alloc(c->args);
-            ok = ei && en && ea && msg_append(
-                "%s{\"id\":\"%s\",\"type\":\"function\","
-                "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}",
-                i ? "," : "", ei, en, ea);
-            free(ei); free(en); free(ea);
+            /* 思考签名跟着这条调用一起回写 (无签名时序列化形状与旧版逐字节一致) */
+            ok = msg_append_one_tool_call(c->id, c->name, c->args, c->sig, i == 0);
         }
 
         /* 超上限被丢弃的调用也回填占位 tool_call: 否则模型以为它们已经执行过了 */
         for (int i = 0; ok && i < ctx->n_dropped; i++) {
-            char *ei = json_escape_alloc(ctx->dropped[i].id);
-            char *en = json_escape_alloc(ctx->dropped[i].name[0] ? ctx->dropped[i].name : "unknown");
-            ok = ei && en && msg_append(
-                "%s{\"id\":\"%s\",\"type\":\"function\","
-                "\"function\":{\"name\":\"%s\",\"arguments\":\"{}\"}}",
-                (i > 0 || n_calls > 0) ? "," : "", ei, en);
-            free(ei); free(en);
+            ok = msg_append_one_tool_call(ctx->dropped[i].id,
+                                          ctx->dropped[i].name[0] ? ctx->dropped[i].name : "unknown",
+                                          "{}", "", i > 0 || n_calls > 0);
         }
         if (ok) ok = msg_append("]}");
 

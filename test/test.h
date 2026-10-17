@@ -420,6 +420,150 @@ static int run_all_tests(void) {
         }
     }
 
+    /* ---- SSE: 无 index 的 tool_call 分片必须各自成条 (Gemini 3 兼容层的形状) ----
+     * Gemini 的 OpenAI 兼容层不发 tool_calls[].index: 每个分片带一条完整的 function,
+     * 只有 id/name/arguments。旧写法"缺 index 一律当 0 号"会把并发调用的第二条并进第一条
+     * —— id/name 被覆盖, arguments 首尾相接拼成非法 JSON, 于是两个调用退化成"一个被
+     * 拒绝执行的坏调用" (用户看到的是"arguments 不是合法 JSON, 已拒绝")。 */
+    {
+        StreamCtx *c = (StreamCtx*)calloc(1, sizeof(StreamCtx));
+        CHK(c != NULL);
+        if (c) {
+            /* 逐片喂真实录像里的两个分片 (均无 index), 外加一个无 id 的续片 */
+            JValue *a = json_parse(
+                "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":"
+                "{\"name\":\"execute_bash\",\"arguments\":\"{\\\"command\\\":\\\"dir\\\"}\"}}]");
+            JValue *b = json_parse(
+                "[{\"id\":\"call_2\",\"type\":\"function\",\"function\":"
+                "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]");
+            JValue *cont = json_parse("[{\"function\":{\"arguments\":\"\"}}]");
+            CHK(a != NULL && b != NULL && cont != NULL);
+            if (a && b && cont) {
+                stream_apply_tool_calls(c, a);
+                stream_apply_tool_calls(c, b);
+                stream_apply_tool_calls(c, cont);        /* 无 id: 续片, 不得新开槽 */
+                CHK(c->n_calls == 2);                    /* 两条独立调用 */
+                CHK(strcmp(c->calls[0].id, "call_1") == 0);
+                CHK(strcmp(c->calls[0].name, "execute_bash") == 0);
+                CHK(strcmp(c->calls[0].args, "{\"command\":\"dir\"}") == 0);
+                CHK(strcmp(c->calls[1].id, "call_2") == 0);
+                CHK(strcmp(c->calls[1].name, "read_file") == 0);
+                CHK(strcmp(c->calls[1].args, "{\"path\":\"README.md\"}") == 0);   /* 没被拼坏 */
+                CHK(c->calls[0].args_overflow == 0 && c->calls[1].args_overflow == 0);
+                stream_apply_tool_calls(c, a);           /* 同 id 重发: 仍归原来那条 */
+                CHK(c->n_calls == 2);
+            }
+            json_free(a); json_free(b); json_free(cont);
+            free(c);
+        }
+    }
+
+    /* ---- SSE: 思考签名 (thought_signature) 按条捕获, 回写时原样放回同一条 ----
+     * Gemini 3 要求把 functionCall 上的 extra_content.google.thought_signature 带回下一轮,
+     * 否则 400 "Function call is missing a thought_signature in functionCall parts"。
+     * 实测: 挂到 assistant 消息层级不算数 (仍然 400); 并发调用时只有第一条带签名,
+     * 所以必须"哪条带存哪条", 不能汇总到一处。 */
+    {
+        StreamCtx *c = (StreamCtx*)calloc(1, sizeof(StreamCtx));
+        CHK(c != NULL);
+        if (c) {
+            JValue *tcs = json_parse(
+                "[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\","
+                "\"extra_content\":{\"google\":{\"thought_signature\":\"abc+/=\"}},"
+                "\"function\":{\"name\":\"execute_bash\","
+                "\"arguments\":\"{\\\"command\\\":\\\"dir\\\"}\"}},"
+                "{\"index\":1,\"id\":\"call_2\",\"type\":\"function\","
+                "\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]");
+            CHK(tcs != NULL);
+            if (tcs) {
+                stream_apply_tool_calls(c, tcs);
+                CHK(strcmp(c->calls[0].sig, "abc+/=") == 0);     /* 带签名的原样存 */
+                CHK(c->calls[1].sig[0] == '\0');                 /* 没签名的保持空 */
+                json_free(tcs);
+            }
+            /* 超上限: 整条丢弃而不是存半截 (半截发回去同样 400) */
+            {
+                size_t big_len = TOOL_SIG_MAX + 10;
+                char *big = (char*)malloc(big_len + 200);
+                CHK(big != NULL);
+                if (big) {
+                    int pre = snprintf(big, big_len + 200,
+                        "[{\"index\":1,\"id\":\"call_3\",\"function\":{\"name\":\"read_file\","
+                        "\"arguments\":\"{}\"},\"extra_content\":{\"google\":"
+                        "{\"thought_signature\":\"");
+                    for (size_t k = 0; k < big_len; k++) big[pre + (int)k] = 'a';
+                    snprintf(big + pre + (int)big_len, 200, "\"}}}]");
+                    JValue *jb = json_parse(big);
+                    CHK(jb != NULL);
+                    if (jb) {
+                        stream_apply_tool_calls(c, jb);
+                        CHK(c->calls[1].sig[0] == '\0');          /* 超限不存残片 */
+                        json_free(jb);
+                    }
+                    free(big);
+                }
+            }
+            free(c);
+        }
+        /* 回写形状: 片段自带前导逗号, 拼进 tool_call 后必须是合法 JSON 且签名不变 */
+        char *es = tool_sig_extra_alloc("abc+/=");
+        CHK(es != NULL);
+        if (es) {
+            CHK(strcmp(es, ",\"extra_content\":{\"google\":{\"thought_signature\":\"abc+/=\"}}") == 0);
+            char obj[512];
+            snprintf(obj, sizeof(obj),
+                     "{\"id\":\"call_1\",\"type\":\"function\"%s,"
+                     "\"function\":{\"name\":\"execute_bash\",\"arguments\":\"{}\"}}", es);
+            JValue *chk = json_parse(obj);
+            CHK(chk != NULL && chk->type == J_OBJ);
+            if (chk) {
+                const JValue *ts = json_obj_get(
+                    json_obj_get(json_obj_get(chk, "extra_content"), "google"), "thought_signature");
+                CHK(ts != NULL && strcmp(json_as_str(ts), "abc+/=") == 0);
+                json_free(chk);
+            }
+            free(es);
+        }
+        CHK(tool_sig_extra_alloc("") == NULL);       /* 无签名: 序列化形状与旧版一致 */
+        CHK(tool_sig_extra_alloc(NULL) == NULL);
+    }
+
+    /* ---- 回写形状: assistant 消息里的 tool_call (含思考签名) 必须是合法 JSON ----
+     * 签名靠 msg_append_one_tool_call 拼进 tool_call, 括号/逗号/转义错一位, 服务端都只回
+     * 一句 400; 这里直接把拼出来的消息解析一遍, 并核对"只有带签名的那条多出该字段"。 */
+    {
+        char *saved = (char*)malloc(strlen(messages) + 1);
+        CHK(saved != NULL);
+        if (saved) {
+            strcpy(saved, messages);
+            messages[0] = '\0';
+            int ok0 = msg_append("{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[");
+            int ok1 = msg_append_one_tool_call("call_1", "execute_bash",
+                                               "{\"command\":\"dir\"}", "abc+/=", 1);
+            int ok2 = msg_append_one_tool_call("call_2", "read_file",
+                                               "{\"path\":\"README.md\"}", "", 0);
+            CHK(ok0 && ok1 && ok2);
+            msg_append("]}");
+            JValue *j = json_parse(messages);
+            CHK(j != NULL);                                   /* 形状必须能解析 */
+            if (j) {
+                const JValue *tcs = json_obj_get(j, "tool_calls");
+                CHK(tcs != NULL && tcs->type == J_ARR && tcs->arr.n == 2);
+                if (tcs && tcs->type == J_ARR && tcs->arr.n == 2) {
+                    const JValue *sig = json_obj_get(
+                        json_obj_get(json_obj_get(json_arr_at(tcs, 0), "extra_content"), "google"),
+                        "thought_signature");
+                    CHK(sig != NULL && strcmp(json_as_str(sig), "abc+/=") == 0);
+                    CHK(json_obj_get(json_arr_at(tcs, 1), "extra_content") == NULL);  /* 无签名不多字段 */
+                    CHK(strcmp(json_as_str(json_obj_get(json_arr_at(tcs, 1), "id")), "call_2") == 0);
+                }
+                json_free(j);
+            }
+            strcpy(messages, saved);                          /* 复原全局, 别影响后续用例 */
+            free(saved);
+        }
+    }
+
     /* ---- SSE: arguments 超过旧 8KB 上限要完整保留, 超硬上限置 overflow 而非截断 ---- */
     {
         StreamCtx *c = (StreamCtx*)calloc(1, sizeof(StreamCtx));

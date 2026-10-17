@@ -14,6 +14,11 @@
                                       * 64KB ≈ 2 万汉字, 覆盖绝大多数调用; 相比 256KB
                                       * 单轮并行 8 个调用省下约 1.5MB 堆。 */
 #define ARGS_DISPLAY_MAX 8192        /* 界面工具参数行 arguments 展示上限 (执行与回传不受影响) */
+/* 思考签名的保存上限 (每个 tool_call 一份)。Gemini 3 在 functionCall 分片里带
+ * extra_content.google.thought_signature, 下一轮必须原样带回, 否则直接 400
+ * (missing a thought_signature in functionCall parts)。实测一段签名 ~1.1KB base64,
+ * 4KB 够覆盖数倍; 超限就整条丢弃 (半截签名发回去同样 400, 不如不发并在日志留痕)。 */
+#define TOOL_SIG_MAX    4096
 #define TOOL_OUTPUT_CAP (16 * 1024)  /* 单个工具结果进入上下文的上限, 超出即截断 */
 #define EDIT_MAX_BYTES  (2 * 1024 * 1024) /* edit_file 可处理的最大文件体积 */
 /* 请求体缓冲: 内容是 messages(<= BUFSZ) 再套一层 JSON 框架并拼上 model 与 TOOLS_JSON,
