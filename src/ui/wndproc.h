@@ -293,6 +293,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(g_hCfg[i], WM_SETFONT, (WPARAM)g_hFont, TRUE);
         }
         SendMessageW(g_hCfg[CFG_KEY], EM_SETPASSWORDCHAR, (WPARAM)'*', 0);
+        /* 接口地址的占位提示: 框为空时以灰字显示, 顺带说明协议的兼容范围。
+         * EM_SETCUEBANNER (Vista + comctl32 v6, manifest 已声明) 只对空串生效 ——
+         * 用户已保存的 api_url 不会被打扰。用 Edit_SetCueBannerText 宏 (wParam=0):
+         * 聚焦即隐藏、失焦且仍为空时回来。提示只是"看一眼就该被替换"的示例地址,
+         * 用户已经知道要填什么了还挂在里面反而挡眼。 */
+        Edit_SetCueBannerText(g_hCfg[CFG_URL],
+                              L"仅支持 OpenAI 兼容协议 API, 如 https://api.example.com/v1");
 
         config_load();
         log_line("[启动] cagent %s, 日志已启用 (cagent.ini 里 log=0 可关)", CAGENT_VERSION_STR);
