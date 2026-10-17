@@ -22,6 +22,19 @@ static void gui_status(const char *text) {
     PostMessageW(GetParent(g_hStatus), WM_APP_STATUS, 0, (LPARAM)copy);
 }
 
+/* "这一轮结束了" 的信号: 投递 WM_APP_FOLDEND (wndproc 收到后走 ui_turn_tail)。
+ * 实时路径由 gui_on_done 在工作线程里投; **历史回放的终点也是轮次终点**,
+ * 走同一条信号 (session_dlg.h 的 sess_apply_selected) —— 终态必须与实时一致。
+ *
+ * **必须走消息, 不能直接调 ui_turn_tail**: gui_emit 是 PostMessage 异步追加
+ * (线程安全), 回放发出的一切此刻还排在队列里, 文档是空的、g_fold_n 为 0 ——
+ * 直接调就是对着空气栈收尾 (d46e7f3 正是这么错的: 同步直调的测试桩测不出来,
+ * 真机上最后一个工具块照旧展开)。同一条窗口队列 FIFO, 这条信号天然排在最后
+ * 一条 WM_APP_APPEND 之后处理。 */
+static void gui_turn_end(void) {
+    PostMessageW(g_hHistory, WM_APP_FOLDEND, 0, 0);
+}
+
 /* 一轮 Agent 结束: 恢复 UI。 */
 static void gui_on_done(void) {
     InterlockedExchange(&g_running, 0);
@@ -30,10 +43,8 @@ static void gui_on_done(void) {
     EnableWindow(g_hSend, TRUE);
     EnableWindow(g_hInput, TRUE);
     SetFocus(g_hInput);
-    /* 本轮结束 = 最后一个折叠块也结束了, 按默认收起它。
-     * 走 PostMessage 而不是直接调: 本函数在**工作线程**里跑, 而折叠要动 RichEdit 控件
-     * (读文本、删文本), 跨线程直接操作控件是不允许的。 */
-    PostMessageW(g_hHistory, WM_APP_FOLDEND, 0, 0);
+    /* 本轮结束 = 最后一个折叠块也结束了, 按默认收起它 (见 gui_turn_end)。 */
+    gui_turn_end();
     /* 状态栏回到"就绪" —— 同样只能投递 (传 0 表示空闲) */
     if (g_hStatus) PostMessageW(GetParent(g_hStatus), WM_APP_STATUS, 0, 0);
 }

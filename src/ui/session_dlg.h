@@ -118,10 +118,14 @@ static void sess_apply_selected(const char *path) {
     emit_note(g_workspace);
     emit_note(")\r\n");
     history_replay();
-    /* 回放结束 = 一轮结束, 收尾必须和实时走同一条 (ui_turn_tail): 把最后一个块按
-     * 默认收起、滚回末尾。漏了这一步, 加载进来的会话最后一个工具块是展开的, 而它在
-     * 实时对话里明明是收起的 —— 同一段对话只因"重新载入"看起来不一样。 */
-    ui_turn_tail();
+    /* 回放结束 = 一轮结束, 收尾必须和实时走同一条 (gui_turn_end -> WM_APP_FOLDEND):
+     * 把最后一个块按默认收起、滚回末尾。漏了它, "加载历史会话, 最后一个调用工具
+     * 总是展开", 与实时终态对不上。
+     * **必须是投递而不是直接调 ui_turn_tail**: history_replay 发出的内容全走
+     * gui_emit 的 PostMessage, 此刻还排在队列里 —— 文档是空的、g_fold_n 为 0,
+     * 直接调就是对着空气栈收尾 (d46e7f3 踩过: 同步直调的测试桩测不出来)。
+     * 同一条窗口队列 FIFO, 信号天然排在本回放最后一条追加之后。 */
+    gui_turn_end();
 }
 
 /* ===== 布局与字体 (首次创建与 WM_DPICHANGED 共用) ===== */

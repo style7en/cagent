@@ -18,7 +18,57 @@
  * 用法: make preview   -> 生成 preview_out.bmp (展开态) 与 preview_folded.bmp (收起态)
  */
 
+#include <windows.h>   /* 下面的 PostMessage 拦截要先于 main_gui.c (那头也有, 有 guard) */
+
+/* ===== 保序拦截 PostMessageW (回放自检专用) =====
+ * 生产的输出投递**全是 PostMessage 异步追加** (ui/hooks.h: gui_emit / gui_turn_end),
+ * 回放自检要的就是这个消息泵的 FIFO 语义。这里把投递只**记进队列、不执行**, 由
+ * pq_pump (见 main_gui.c 之后) 按入队顺序逐条处理, 动作与 wndproc.h 的两条分支
+ * 一致; 队列满则转给真身。
+ *
+ * 拦截器本身**不引用任何产品符号** (g_hHistory / do_append 都在 main_gui.c 里),
+ * hwnd 与消息类的过滤推迟到 pq_pump —— 否则定义点会早于声明点。
+ *
+ * 为什么必须保真: 旧自检把 cagent_emit 换成同步直调 do_append 的桩, 于是"回放之后
+ * 直接调 ui_turn_tail"这种异步 ordering bug 在测试里永远测不出来 —— d46e7f3 正是
+ * 这么漏的 (真机上最后一个工具块照旧展开, 而自检全绿)。 */
+#define PQ_MAX 512
+static struct { HWND h; UINT msg; WPARAM wp; char *txt; } g_pq[PQ_MAX];
+static int g_pq_n;
+static BOOL (WINAPI *g_real_post)(HWND, UINT, WPARAM, LPARAM) = PostMessageW;
+#define PostMessageW MyPostMessageW
+static BOOL WINAPI MyPostMessageW(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (g_pq_n < PQ_MAX) {
+        g_pq[g_pq_n].h = h; g_pq[g_pq_n].msg = m;
+        g_pq[g_pq_n].wp = w; g_pq[g_pq_n].txt = (char*)l;
+        g_pq_n++;
+        return TRUE;
+    }
+    return g_real_post(h, m, w, l);
+}
+
 #include "../src/main_gui.c"
+
+/* 消息泵: 按 FIFO 处理队列里投给 g_hHistory 的消息, 动作与 wndproc.h 一致
+ * (APPEND -> do_append 后释放字符串; FOLDEND -> ui_turn_tail)。别处的消息
+ * (如状态栏) 与本测试无关; WM_APP_STREAM 在预览里本来就没有消息循环处理, 丢弃。 */
+static void pq_pump(void) {
+    int n = g_pq_n;              /* 截断: 泵过程中新投递的不再本轮处理 */
+    for (int i = 0; i < n; i++) {
+        if (g_pq[i].h != g_hHistory) continue;
+        if (g_pq[i].msg == WM_APP_APPEND) {
+            do_append(g_pq[i].txt, (int)g_pq[i].wp);
+            free(g_pq[i].txt);
+        } else if (g_pq[i].msg == WM_APP_FOLDEND) {
+            ui_turn_tail();
+        }
+    }
+    g_pq_n = 0;
+}
+
+/* 自检失败计数: main 末尾据此给非零退出码, make preview 才能当门禁用。
+ * 教训来自 d46e7f3 —— "自检全绿但生产是坏的"最难防, 退出码是最低限度的兜底。 */
+static int g_pv_fails;
 
 /* 示例对话: 覆盖全部角色, 一张图就能看出配色、缩进、留白是否成体系。
  * 文案贴近真实运行时的样子 (含思考块、工具调用的两行结构、拒绝执行、错误提示),
@@ -176,11 +226,13 @@ static void fold_selftest(void) {
         WCHAR *after = dump_all(g_hHistory, &n2);
         int ok_back = (after && n2 == n0 && wcscmp(after, before) == 0);
 
+        if (!ok_fold || !ok_back) g_pv_fails++;
         printf("  block %d (%s): 收起 %ld->%ld 字符 [%s], 展开还原 [%s]\n",
                i, kind, n0, n1, ok_fold ? "OK" : "FAIL", ok_back ? "OK" : "FAIL");
         all_ok &= ok_fold && ok_back;
         free(folded); free(after);
     }
+    if (!all_ok) g_pv_fails++;
     printf("fold selftest: %d 个块 [%s]\n", blocks, all_ok ? "OK" : "FAIL");
     free(before);
 }
@@ -231,6 +283,7 @@ static void reasoning_flow_selftest(void) {
     int ok = (titles == 1) && strstr(g_cap_buf, "先看目录") && strstr(g_cap_buf, "再读 Makefile。")
              && strstr(g_cap_buf, "项目结构如下") && !ctx.reasoning_open
              && ctx.reasoning_len == strlen("先看目录") + strlen("，再读 Makefile。");
+    if (!ok) g_pv_fails++;
     printf("reasoning flow: 标题 %d 次 [%s], reasoning_len=%zu\n",
            titles, ok ? "OK" : "FAIL", ctx.reasoning_len);
 }
@@ -269,6 +322,7 @@ static void style_selftest(void) {
              (f1.crBackColor == f2.crBackColor) &&
              (wcscmp(f1.szFaceName, f2.szFaceName) == 0) &&
              ((f1.dwEffects & (CFE_BOLD | CFE_ITALIC)) == (f2.dwEffects & (CFE_BOLD | CFE_ITALIC)));
+    if (!ok) g_pv_fails++;
     printf("style selftest: 输出段 字色 %06lX->%06lX 底色 %06lX->%06lX 字体 %ls [%s]\n",
            (unsigned long)f1.crTextColor, (unsigned long)f2.crTextColor,
            (unsigned long)f1.crBackColor, (unsigned long)f2.crBackColor,
@@ -299,6 +353,7 @@ static void head_indent_selftest(void) {
                i, g_folds[i].kind == UI_FOLD_TOOL ? "tool" : "think",
                ind_folded, ind_open, ok ? "[OK]" : "[FAIL]");
     }
+    if (bad) g_pv_fails++;
     printf("head indent selftest: %s\n", bad ? "FAIL" : "OK");
 }
 
@@ -319,9 +374,11 @@ static void scroll_hit_selftest(void) {
     memset(&p1, 0, sizeof(p1));
     SendMessageW(g_hHistory, EM_POSFROMCHAR, (WPARAM)&p1, (LPARAM)g_folds[0].cp_head);
 
+    if (p0.y == p1.y) g_pv_fails++;
     printf("scroll hit: 滚 2 行, 标题行 y %ld -> %ld (坐标随滚动%s)\n",
            (long)p0.y, (long)p1.y, p0.y != p1.y ? "变化 [OK]" : "不变 [FAIL]");
     int hit = ui_fold_hit(p1);
+    if (hit != 0) g_pv_fails++;
     printf("  滚动后命中 (%ld,%ld) -> 块 %d (期望 0) [%s]\n",
            (long)p1.x, (long)p1.y, hit, hit == 0 ? "OK" : "FAIL");
     SendMessageW(g_hHistory, WM_VSCROLL, SB_BOTTOM, 0);
@@ -358,6 +415,7 @@ static void scroll_anchor_selftest(void) {
             bad++;
         }
     }
+    if (bad) g_pv_fails++;
     printf("scroll anchor selftest: 测了 %d 个块 %s\n", tested, bad ? "[FAIL]" : "[OK]");
 }
 
@@ -384,42 +442,49 @@ static void dump_line_indents(void) {
     }
 }
 
-/* 把 core 的 emit 直接接到 do_append 上 —— 预览程序没有消息循环, 走不了 PostMessage。 */
-static void do_append_wrapper(const char *utf8, int role) { do_append(utf8, role); }
-
 /* 历史回放自检: 载入含工具调用的会话后, 必须能重建出可折叠的工具块。
  * 以前 history_replay 只回放 tool 结果、不回放 assistant 的 tool_calls, 于是历史会话里
  * 只剩一堆没头没尾的输出块 —— 看不出是哪次调用, 也没有标题行可点。
- * 终态还必须和实时一致: 回放结束也要收尾 (ui_turn_tail), 最后一个块默认收起 ——
- * 漏了它, "加载历史会话, 最后一个调用工具总是展开", 与实时终态对不上。 */
+ * 终态还必须和实时一致: 回放结束也要收尾 (gui_turn_end -> WM_APP_FOLDEND),
+ * 最后一个块默认收起 —— 漏了它, "加载历史会话, 最后一个调用工具总是展开"。
+ *
+ * **驱动的是真实的 sess_apply_selected** (读文件 -> 清空 -> 回放 -> 收尾一条龙),
+ * 全部投递经过上面拦截的 PostMessage 队列, 再 pq_pump 按 FIFO 泵一遍 —— 与生产的
+ * 消息循环同构。d46e7f3 的教训: 收尾当时是 history_replay() 之后**直接调**
+ * ui_turn_tail, 而回放内容全是 PostMessage 异步追加 (hooks.h 的 gui_emit) ——
+ * 收尾赶在正文入队之前, 对着 g_fold_n==0 的空气栈收尾, 最后一个工具块照旧展开;
+ * 而用同步直调桩的旧自检全绿。现在: 直接调 / 漏投递 / 投递顺序错, 任一复发都 FAIL。 */
 static void replay_selftest(void) {
-    /* 回放走 cagent_emit; 预览里没有消息循环, 直接同步接到 do_append 上 */
-    cagent_emit = do_append_wrapper;
+    /* 会话文件是自描述 JSON (workspace + messages), 见 core/session.h 的
+     * load_messages_from_text; 末尾那条 assistant 让会话以"工具调用之后还有正文"
+     * 收尾 —— 此时最后一个折叠块仍是工具块, 正是收尾要管的对象。 */
+    const char *path = "preview_replay_session.json";
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fputs("{\"workspace\":\".\",\"messages\":["
+              "{\"role\":\"user\",\"content\":\"看下项目结构\"}"
+              ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\","
+              "\"type\":\"function\",\"function\":{\"name\":\"read_file\","
+              "\"arguments\":\"{\\\"path\\\": \\\"Makefile\\\"}\"}}]}"
+              ",{\"role\":\"tool\",\"content\":\"CC = gcc\\nCFLAGS = -Wall\\n\"}"
+              ",{\"role\":\"assistant\",\"content\":\"Makefile 里用的是 gcc。\"}]}", f);
+        fclose(f);
+    }
 
-    SetWindowTextW(g_hHistory, L"");
-    g_last_role = -1;
-    g_last_no_lf = 0;
-    ui_fold_reset();
+    g_active_ws[0] = '\0';   /* 空工作区 -> sess_apply_selected 跳过 history_save */
+    g_pq_n = 0;              /* 只数这一轮投递出来的消息 */
+    cagent_emit = gui_emit;  /* 真实钩子: PostMessage 入队, 不是同步直调桩 */
 
-    /* messages 的格式是 "系统提示词 + ,{...},{...}" —— 系统提示词那段不能省,
-     * history_replay 正是靠 strlen(g_system_prompt) 跳过它的 (漏了就会读到越界位置)。 */
-    snprintf(messages, sizeof(messages),
-        "%s"
-        ",{\"role\":\"user\",\"content\":\"看下项目结构\"}"
-        ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\": \\\"Makefile\\\"}\"}}]}"
-        ",{\"role\":\"tool\",\"content\":\"CC = gcc\\nCFLAGS = -Wall\\n\"}"
-        ",{\"role\":\"assistant\",\"content\":\"Makefile 里用的是 gcc。\"}",
-        g_system_prompt);
+    sess_apply_selected(path);
+    pq_pump();               /* FIFO: 载入旁白 -> 回放正文 -> 轮次收尾 */
 
-    history_replay();
-    /* 与 sess_apply_selected 同构: 回放结束也要走 ui_turn_tail */
-    ui_turn_tail();
+    remove(path);
+    cagent_emit = NULL;
 
     int ok = (g_fold_n == 1) && g_folds[0].collapsed;
+    if (!ok) g_pv_fails++;
     printf("replay selftest: 重建了 %d 个工具块 (期望 1, 默认收起) [%s]\n",
            g_fold_n, ok ? "OK" : "FAIL");
-    cagent_emit = NULL;
 }
 
 /* tool_note_split 的检查: 认得出尾部说明 (好把它从上屏内容里剥掉), 但**不能误认文件内容里
@@ -431,6 +496,7 @@ static void note_split_selftest(void) {
     int ok = (tool_note_split(tail) != NULL)      /* 尾部说明: 认出来 */
           && (tool_note_split(inner) == NULL)     /* 内文里的: 后面还有内容, 不认 */
           && (tool_note_split(none) == NULL);
+    if (!ok) g_pv_fails++;
     printf("note split selftest: [%s]\n", ok ? "OK" : "FAIL");
 }
 
@@ -490,9 +556,10 @@ int main(void) {
     {
         int folded = 0;
         for (int i = 0; i < g_fold_n; i++) if (g_folds[i].collapsed) folded++;
+        int ok = (folded == (g_fold_n > 0 ? g_fold_n - 1 : 0));
+        if (!ok) g_pv_fails++;
         printf("默认折叠: %d/%d 个块收起 (期望 %d) [%s]\n", folded, g_fold_n,
-               g_fold_n > 0 ? g_fold_n - 1 : 0,
-               folded == (g_fold_n > 0 ? g_fold_n - 1 : 0) ? "OK" : "FAIL");
+               g_fold_n > 0 ? g_fold_n - 1 : 0, ok ? "OK" : "FAIL");
     }
     /* 预览图要展示的是**全部展开**的排版 (看配色/缩进/留白), 所以先展开再渲染。
      * 展开走 ui_fold_toggle 会置 user_toggled, 之后的自动折叠就不会再来打扰。 */
@@ -519,6 +586,7 @@ int main(void) {
             }
         }
         printf("展开后标题行缩进: %s\n", bad ? "FAIL" : "OK");
+        if (bad) g_pv_fails++;
     }
 
     /* 置顶显示, 免得被别的窗口盖住 —— 抓屏取的是屏幕上真实画出来的像素 */
@@ -548,6 +616,7 @@ int main(void) {
         memset(&pt, 0, sizeof(pt));
         SendMessageW(g_hHistory, EM_POSFROMCHAR, (WPARAM)&pt, (LPARAM)g_folds[i].cp_head);
         int hit = ui_fold_hit(pt);
+        if (hit != i) g_pv_fails++;
         printf("hit test: 块 %d 标题行 (%ld,%ld) -> %d (期望 %d)%s\n",
                i, (long)pt.x, (long)pt.y, hit, i, hit == i ? "" : "  <-- FAIL");
         if (hit != i) continue;
@@ -555,6 +624,7 @@ int main(void) {
         SendMessageW(g_hHistory, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
         int collapsed = g_folds[i].collapsed;
         SendMessageW(g_hHistory, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
+        if (!(collapsed == 1 && !g_folds[i].collapsed)) g_pv_fails++;
         printf("  click toggle: 收起=%d -> 展开=%d %s\n",
                collapsed, g_folds[i].collapsed, (collapsed == 1 && !g_folds[i].collapsed) ? "[OK]" : "[FAIL]");
     }
@@ -603,5 +673,8 @@ int main(void) {
     ui_fold_reset();
     DestroyWindow(hwnd);
     if (g_hFontHist) DeleteObject(g_hFontHist);
-    return 0;
+    /* 退出码 = 失败数: make preview 的调用方 (人 / CI) 因此能把自检当门禁。
+     * d46e7f3 的教训 —— 当时所有自检都绿, 生产却是坏的。 */
+    if (g_pv_fails) printf("preview selftest: %d 项 FAIL\n", g_pv_fails);
+    return g_pv_fails ? 1 : 0;
 }
