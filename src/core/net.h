@@ -186,6 +186,10 @@ typedef struct {
  * 思考内容不累积 (见 StreamCtx 说明), 只统计长度。 */
 static void on_reasoning_delta(void *ud, const char *delta) {
     StreamCtx *ctx = (StreamCtx*)ud;
+    /* 空串必须当成"没有": 它一旦上屏就是一次 THINK 角色的空追加, 前端 do_append 见角色
+     * 切换会先 md_flush() 把正在攒的 AI 半行落地 —— 半行因此被冲成独立段落, 正式回答
+     * 表现为每行都从句子中间断开。方舟 coding v3 就是每片都带这个字段 (没在思考时给 "")。 */
+    if (!delta || !*delta) return;
     if (ctx->reasoning_len == 0) {
         while (*delta == '\r' || *delta == '\n') delta++;   /* 与 content 一致: 跳过前导空行 */
         if (!*delta) return;
@@ -215,6 +219,11 @@ static void close_reasoning_block(StreamCtx *ctx) {
  * 丢掉, 模型下一轮看不到自己说过什么; 界面照常显示完整内容。 */
 static void on_content_delta(void *ud, const char *delta) {
     StreamCtx *ctx = (StreamCtx*)ud;
+    /* 空串同样要挡在**闭合思考块之前**: 上面那种"两个字段都发、空着的那个给 ''"的服务端,
+     * 会在第一个思考分片之后就用一个空 content 把思考块提前闭合 —— 思考正文被切两段,
+     * 折叠块的正文也跟着残缺。真要收尾有两条可靠路径: 首个非空 content, 或本轮结束
+     * (agent.h 结尾的 close_reasoning_block), 都不依赖空串。 */
+    if (!delta || !*delta) return;
     /* 思考块收尾: 不闭合的话正式回答会接在思考内容的同一行上, 而且前端的折叠块
      * 以"整段"为单位, 会把正式回答一起折叠进去。 */
     close_reasoning_block(ctx);
@@ -277,6 +286,26 @@ static void stream_apply_tool_calls(StreamCtx *ctx, const JValue *tcs) {
             }
         }
     }
+}
+
+/* 把一片 delta 里的内容 (思考 / 正文 / 工具调用) 应用到 ctx。
+ * 单独抽出来是因为它藏着最容易踩的语义坑 —— "这个字段本片没内容"在不同服务端有两种
+ * 表达: 键不存在, 或键存在而值是空串 ""。方舟 coding v3 属后者, 每个分片都同时带
+ * reasoning_content 与 content, 没在输出的那个给 ""。json_as_str 对 "" 返回非 NULL,
+ * 于是"键存在就处理"的写法会在吐正文时每片都先空投一次 THINK; 那次空投带的是非 AI
+ * 角色, 前端 do_append 见角色切换会先 md_flush() 把正在攒的半行落地, 正式回答因此
+ * 每行都从句子中间断开。**空串一律按"没有"处理** —— 顺带也让空 content 不再提前闭合
+ * 思考块 (真要收尾有首个非空 content 与本轮结束两条可靠路径)。
+ * 抽成函数后测试可以直接喂真实形状的分片, 不用起网络。 */
+static void stream_apply_delta(StreamCtx *ctx, const JValue *delta) {
+    if (!ctx || !delta) return;
+    /* **先于 content 处理**: on_content_delta 开头要闭合思考块, 顺序反了会先发正文再补换行 */
+    const char *rc = json_as_str(json_obj_get(delta, "reasoning_content"));
+    if (rc && *rc) on_reasoning_delta(ctx, rc);
+    const char *content = json_as_str(json_obj_get(delta, "content"));
+    if (content && *content) on_content_delta(ctx, content);
+    const JValue *tcs = json_obj_get(delta, "tool_calls");
+    stream_apply_tool_calls(ctx, tcs);
 }
 
 /* 单次请求尝试 (无重试): 建立连接、发送、流式读取 SSE、解析 tool_calls。
@@ -426,14 +455,9 @@ static int http_post_stream_once(const char *url, const char *api_key,
                         const char *frs = json_as_str(json_obj_get(json_arr_at(choices, 0), "finish_reason"));
                         if (frs && *frs) snprintf(ctx->finish, sizeof(ctx->finish), "%s", frs);
                         const JValue *delta = json_obj_get(json_arr_at(choices, 0), "delta");
-                        /* 推理模型的思考内容: 与 content 并列的独立字段, **先于 content 处理** ——
-                         * on_content_delta 开头要把思考块收尾, 顺序反了就会先发正文再补换行。 */
-                        const char *rc = json_as_str(json_obj_get(delta, "reasoning_content"));
-                        if (rc) on_reasoning_delta(ctx, rc);
-                        const char *content = json_as_str(json_obj_get(delta, "content"));
-                        if (content) on_content_delta(ctx, content);
-                        const JValue *tcs = json_obj_get(delta, "tool_calls");
-                        stream_apply_tool_calls(ctx, tcs);
+                        /* 思考/正文/工具调用的应用规则见 stream_apply_delta —— 空串当"没有"
+                         * 那层判断必须留在那边, 这里不要自己再展开一遍。 */
+                        stream_apply_delta(ctx, delta);
                         /* usage (常在末片): 记下 prompt_tokens 供水位估算, 没有则保持 0 */
                         const JValue *usage = json_obj_get(root, "usage");
                         const JValue *pt = usage ? json_obj_get(usage, "prompt_tokens") : NULL;

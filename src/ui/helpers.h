@@ -536,6 +536,12 @@ static void do_append(const char *utf8, int role) {
     MultiByteToWideChar(CP_UTF8, 0, norm, -1, wbuf, wlen);
     free(norm);
 
+    /* 空内容直接返回: 它没有可显示的东西, 却会带走一整套副作用 —— 角色切换触发
+     * md_flush() 把正在攒的 AI 半行落地、下面的兜底再补一个换行。两者都会把半行从句子
+     * 中间切断, 用户看到的就是"正式回答每行都是半句"。服务端把"本片没内容"表达成空串
+     * delta 时就会这样 (core 已按空串=没有处理, 这里兜住其余来源)。 */
+    if (!wbuf[0]) { free(wbuf); return; }
+
     /* Markdown: 只有正式答案 (AI 角色) 走行缓冲渲染。切到别的角色前, 先把缓冲里的
      * 半行落地 —— 它属于刚结束的 AI 正文, 不落地就会在换角色后丢掉。
      * **必须赶在下面的兜底换行之前**: 半行是上一段 AI 正文的延续, 分隔换行属于

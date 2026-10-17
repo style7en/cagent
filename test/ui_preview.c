@@ -500,6 +500,59 @@ static void note_split_selftest(void) {
     printf("note split selftest: [%s]\n", ok ? "OK" : "FAIL");
 }
 
+/* 宽字符子串查找 (MinGW 的 wcsstr 在没引 <wchar.h> 时未必可见, 自己写三行更稳)。 */
+static const wchar_t *pv_wstrstr(const wchar_t *hay, const wchar_t *needle) {
+    if (!*needle) return hay;
+    for (const wchar_t *p = hay; *p; p++) {
+        const wchar_t *a = p, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return p;
+    }
+    return NULL;
+}
+
+/* 空串 delta 不得把 AI 半行切断 (换模型后"正式回答显示很怪"的那个症状)。
+ * 有的服务端每片都同时带 reasoning_content 与 content, 没在输出的那个给 ""; 那次空上屏
+ * 带的是非 AI 角色, do_append 见角色切换会 md_flush() 把正在攒的半行落地、再补一个换行
+ * —— 一句话因此被拆成两行, 通篇看下来就是每行都从句子中间断开。
+ * 走的是真实链路 (gui_emit 投递 + pq_pump 泵一遍), 断言的是**界面上的文本**: 半行与
+ * 后续内容必须是连续的一整句, 中间没有断行。 */
+static void empty_delta_selftest(void) {
+    cagent_emit = gui_emit;                 /* 真实钩子: PostMessage 入队 */
+    g_pq_n = 0;
+    long cp0 = ui_text_cp_len(g_hHistory);
+    cagent_emit("这是半句", CAGENT_ROLE_AI);
+    cagent_emit("", CAGENT_ROLE_THINK);     /* 服务端"本片没内容"的空串 */
+    cagent_emit("，后面接着说。\r\n", CAGENT_ROLE_AI);
+    pq_pump();
+    cagent_emit = NULL;
+
+    long cp1 = ui_text_cp_len(g_hHistory);
+    long n = cp1 - cp0;
+    if (n < 0) n = 0;
+    WCHAR *w = (WCHAR*)calloc((size_t)n + 4, sizeof(WCHAR));
+    int ok = 0;
+    if (w) {
+        TEXTRANGEW tr;
+        tr.chrg.cpMin = cp0;
+        tr.chrg.cpMax = cp1;
+        tr.lpstrText = w;
+        SendMessageW(g_hHistory, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+        WCHAR want[64];
+        memset(want, 0, sizeof(want));
+        utf8_to_wide("这是半句，后面接着说。", want, (int)(sizeof(want) / sizeof(WCHAR)));
+        ok = (pv_wstrstr(w, want) != NULL);
+        if (!ok) {
+            printf("  切成了: ");
+            for (long i = 0; i < n && i < 80; i++) printf("%04X ", (unsigned)w[i]);
+            printf("\n");
+        }
+        free(w);
+    }
+    if (!ok) g_pv_fails++;
+    printf("empty delta selftest: 空 THINK 未切断 AI 半行 [%s]\n", ok ? "OK" : "FAIL");
+}
+
 /* 插话队列 (inbox) 不变量: FIFO、8 条封顶、超长拒绝、take 失败不丢消息。
  * 这是排队语义的地基 —— gui_on_done 的 drain 指着它, 它坏了症状是"点了没反应"
  * (取不到) 或用户的指令被静默吞掉 (take 失败却把消息划走了)。 */
@@ -762,6 +815,7 @@ int main(void) {
     /* 回放自检放最后 —— 它会清空历史框并重置块表, 前面那些检查都还要用当前内容。
      * inbox/drain 是纯逻辑与投递契约, 不碰文档内容, 排在它前面。 */
     note_split_selftest();
+    empty_delta_selftest();
     inbox_selftest();
     drain_order_selftest();
     replay_selftest();

@@ -220,6 +220,26 @@ static int json_selftest(void) {
 }
 
 
+/* ---- 流式上屏捕获: 检查"哪条内容以哪个角色上了屏" ----
+ * 空串空投这类 bug 的后果不在最终文本里 (拼起来一字不差), 而在**角色序列**上 ——
+ * 一次多余的 THINK 上屏就会让前端把 AI 半行冲成独立段落。所以断言必须看序列, 不能看文本。 */
+static char g_emit_cap[4096];
+static int  g_emit_cap_len;
+static void emit_cap(const char *utf8, int role) {
+    int left = (int)sizeof(g_emit_cap) - g_emit_cap_len - 1;
+    if (left <= 8) return;
+    int n = snprintf(g_emit_cap + g_emit_cap_len, (size_t)left, "[%d]%s", role, utf8);
+    if (n > 0) g_emit_cap_len += (n < left ? n : left - 1);
+}
+/* 捕获串里某个角色的上屏次数 */
+static int emit_cap_role_count(int role) {
+    char tag[16];
+    snprintf(tag, sizeof(tag), "[%d]", role);
+    int n = 0;
+    for (const char *p = g_emit_cap; (p = strstr(p, tag)) != NULL; p++) n++;
+    return n;
+}
+
 static int run_all_tests(void) {
     int fails = 0;
     #define CHK(cond) do { if(!(cond)) { printf("FAIL: %s (line %d)\n", #cond, __LINE__); fails++; } } while(0)
@@ -536,6 +556,82 @@ static int run_all_tests(void) {
             CHK(c->content_buf[c->content_len] == '\0');
             free(c);
         }
+    }
+
+    /* ---- SSE: 空串字段不得产生"空投" (方舟 coding v3 的形状) ----
+     * 有的服务端每个分片都同时带 reasoning_content 与 content, 没在输出的那个给 ""。
+     * json_as_str 对 "" 返回非 NULL, "键存在就处理"的写法于是有两类后果:
+     *   ① 吐正文时每片先空投一次 THINK —— 那次空投是非 AI 角色, 前端 do_append 见角色
+     *      切换会 md_flush() 把正在攒的半行落地, 正式回答每行都被从句子中间切断;
+     *   ② 空 content 会在第一个思考分片之后就把思考块提前闭合, 思考正文被切成两段。
+     * 修法是"空串按没有处理", 回调内与解析处各挡一层; 下面的断言逐层覆盖。 */
+    {
+        void (*saved)(const char*, int) = cagent_emit;
+        cagent_emit = emit_cap;
+
+        /* --- 回调层: 直接喂空串 --- */
+        {
+            StreamCtx *c = (StreamCtx*)calloc(1, sizeof(StreamCtx));
+            CHK(c != NULL);
+            if (c) {
+                g_emit_cap_len = 0; g_emit_cap[0] = '\0';
+                on_reasoning_delta(c, "先想一下");
+                int before = emit_cap_role_count(CAGENT_ROLE_THINK);
+                on_reasoning_delta(c, "");                     /* 空串: 不得多上屏一次 */
+                on_content_delta(c, "");                       /* 空串: 不得闭合思考块 */
+                CHK(emit_cap_role_count(CAGENT_ROLE_THINK) == before);
+                CHK(c->reasoning_open == 1);                   /* 仍开着 —— 被提前闭合就错 */
+                on_content_delta(c, "正式回答");                /* 首个非空 content 才收尾 */
+                CHK(c->reasoning_open == 0);
+                CHK(strstr(g_emit_cap, "正式回答") != NULL);
+                free(c);
+            }
+        }
+
+        /* --- 解析层: 用真实分片形状走 stream_apply_delta --- */
+        {
+            StreamCtx *c = (StreamCtx*)calloc(1, sizeof(StreamCtx));
+            CHK(c != NULL);
+            if (c) {
+                g_emit_cap_len = 0; g_emit_cap[0] = '\0';
+                /* 前两片在思考 (content 为空串), 后两片在吐正文 (reasoning_content 为空串) */
+                const char *chunks[] = {
+                    "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"先看目录\"}}]}",
+                    "{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"，再读 Makefile。\"}}]}",
+                    "{\"choices\":[{\"delta\":{\"content\":\"项目结构如下\",\"reasoning_content\":\"\"}}]}",
+                    "{\"choices\":[{\"delta\":{\"content\":\"：src 与 test。\",\"reasoning_content\":\"\"}}]}",
+                };
+                for (int i = 0; i < 4; i++) {
+                    JValue *root = json_parse(chunks[i]);
+                    CHK(root != NULL);
+                    if (!root) continue;
+                    const JValue *d = json_obj_get(json_arr_at(json_obj_get(root, "choices"), 0), "delta");
+                    stream_apply_delta(c, d);
+                    if (i == 0) CHK(c->reasoning_open == 1);   /* 空 content 没把它闭掉 */
+                    json_free(root);
+                }
+                /* THINK 上屏 = 2 段思考正文 + 1 次闭合换行; 多出来就是空投 */
+                CHK(emit_cap_role_count(CAGENT_ROLE_THINK) == 3);
+                CHK(emit_cap_role_count(CAGENT_ROLE_THINK_HEAD) == 1);
+                CHK(emit_cap_role_count(CAGENT_ROLE_AI) == 2);
+                CHK(c->reasoning_open == 0);
+                /* 空投的直接形状: 某条上屏内容为空, 捕获串里就出现两个相邻的标记 "][" */
+                CHK(strstr(g_emit_cap, "][") == NULL);
+                /* 去掉标记 = 界面上看到的文本: 思考与正文各自都得是连续的一整段 */
+                char plain[4096];
+                size_t pn = 0;
+                for (const char *p = g_emit_cap; *p && pn + 1 < sizeof(plain); ) {
+                    if (p[0] == '[' && p[1] >= '0' && p[1] <= '9' && p[2] == ']') { p += 3; continue; }
+                    plain[pn++] = *p++;
+                }
+                plain[pn] = '\0';
+                CHK(strstr(plain, "先看目录，再读 Makefile。") != NULL);
+                CHK(strstr(plain, "项目结构如下：src 与 test。") != NULL);
+                free(c);
+            }
+        }
+
+        cagent_emit = saved;
     }
 
     /* ---- JSON: 递归深度上限, 不可让不可信输入栈溢出 ---- */
