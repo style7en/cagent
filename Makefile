@@ -133,8 +133,10 @@ $(MDTEST_TARGET): $(MDTEST_SRC) $(CORE_HDRS) $(UI_HDRS)
 # make preview: 渲染输出区排版 -> preview_out.bmp (人工看配色/缩进/段间距对不对)
 # -Wno-unused-*: 预览程序直接聚合整套 UI 代码, 但只用到其中一小部分 —— 单 TU 下其余
 # 部分必然"未被使用"。只在这里关, 别动主程序的告警开关。
+# 跑完删掉 ui_preview.exe (与 make test / mdtest 同规): BMP 是给人眼看的产物要留下,
+# 执行文件不必留在仓库根 —— 下次 make preview 重新编译, 代价可接受。
 preview: $(PREVIEW_TARGET)
-	./$(PREVIEW_TARGET)
+	./$(PREVIEW_TARGET); rc=$$?; rm -f $(PREVIEW_TARGET); exit $$rc
 
 $(PREVIEW_TARGET): $(PREVIEW_SRC) $(CORE_HDRS) $(UI_HDRS) src/main_gui.c
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable \
