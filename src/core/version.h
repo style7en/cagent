@@ -12,10 +12,19 @@
 #define CAGENT_VER_MAJOR 1
 #define CAGENT_VER_MINOR 2
 #define CAGENT_VER_PATCH 3
-#define CAGENT_VER_BUILD 0      /* 构建序号, 非正式发布可保持 0 */
+#define CAGENT_VER_BUILD 0      /* 构建序号, 非正式发布可保持 0; 不进人类可读版本串 */
 
-/* 人类可读版本串 (窄字符串); 宽串由它派生, 不要另写一份 */
-#define CAGENT_VERSION_STR "1.2.3"
+/* 字符串化两级跳: 先让实参整体宏展开, 再 # 成字面量 (直接 # 会得到 "CAGENT_VER_MAJOR") */
+#define CAGENT_STR_(x) #x
+#define CAGENT_STR(x)  CAGENT_STR_(x)
+
+/* 人类可读版本串 (窄字符串) —— 由上面三个分量**派生**, 不另手写一份:
+ * 以前这里手写 "1.2.3", 与分量是两个事实来源, 改了数字忘了改串就会漂移
+ * (app.rc 的 FILEVERSION 用分量, 界面/日志用串, 漂移时两边对不上)。
+ * 相邻字面量拼接 "1" "." "2" "." "3" 是 C 预处理的标准行为, windres 同样走 cpp。
+ * 宽串由它派生, 不要再写第三份。 */
+#define CAGENT_VERSION_STR \
+    CAGENT_STR(CAGENT_VER_MAJOR) "." CAGENT_STR(CAGENT_VER_MINOR) "." CAGENT_STR(CAGENT_VER_PATCH)
 
 /* 一句话定位 (窄字符串): "关于" 对话框等需要对外介绍的地方共用 */
 #define CAGENT_TAGLINE     "用 C 语言实现的极简 AI 编程 Agent, 零第三方依赖"

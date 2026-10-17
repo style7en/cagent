@@ -356,9 +356,10 @@ static int ui_fold_hit(POINTL pt) {
     return best;
 }
 
-/* 标题行首字符的展开/收起符号 —— **必须与 core 的 CAGENT_FOLD_GLYPH_OPEN/SHUT 一致**
- * (那边是窄字符串 UTF-8, 这边是宽字符)。两个都是单个 UTF-16 码元, 替换后标题行长度不变;
- * 长度一变, 正文起点和后续块的位置就全得重算。 */
+/* 标题行首字符的展开/收起符号 —— **必须与 core 的 CAGENT_FOLD_GLYPH_OPEN 一致**
+ * (那边是窄字符串 UTF-8, 这边是宽字符; C 没有 UTF-8->UTF-16 字面量转换, 只能两份手写)。
+ * 两个都是单个 UTF-16 码元, 替换后标题行长度不变; 长度一变, 正文起点和后续块的位置
+ * 就全得重算。收起态只存在于前端 —— core 发标题行时永远是展开态。 */
 #define UI_FOLD_GLYPH_OPEN  L"▾"
 #define UI_FOLD_GLYPH_SHUT  L"▸"
 

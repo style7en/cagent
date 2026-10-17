@@ -231,11 +231,8 @@ static void dispatch_tool(const char *name, const char *args_json, const char *f
         }
     } else if (!argsj) {
         /* 留全量取证: 长度 + finish_reason + 原文全文 (截断类 bug 看尾部即可定位) */
+        log_bad_tool_args(nm, finish, args_json);
         size_t alen = (args_json && args_json[0]) ? strlen(args_json) : 0;
-        log_line("[tool] arguments 非法 JSON: name=%s finish=%s len=%zu 疑似截断=%d",
-             nm, (finish && *finish) ? finish : "-", alen,
-             (finish && strcmp(finish, "length") == 0));
-        log_line("[tool] arguments 原文: %s", (args_json && args_json[0]) ? args_json : "(空)");
         if (args_json) log_check_utf8("tool.arguments", args_json, alen);
         /* 预览必须按 UTF-8 字符边界截取 (utf8_safe_copy), 否则 %.200s 会切半汉字,
          * 非法字节随 tool 结果进 messages → 下一次请求被服务端 400 invalid unicode */

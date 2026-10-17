@@ -802,10 +802,7 @@ static void agent_turn(const char *user_msg) {
                 } else {
                     c->bad_json = 1;
                     snprintf(c->args, sizeof(c->args), "{}");                /* 占位, 避免把坏串写进历史 */
-                    log_line("[tool] arguments 非法 JSON: name=%s finish=%s len=%zu 疑似截断=%d",
-                             c->name, ctx->finish[0] ? ctx->finish : "-",
-                             strlen(raw), strcmp(ctx->finish, "length") == 0);
-                    log_line("[tool] arguments 原文: %s", raw[0] ? raw : "(空)");
+                    log_bad_tool_args(c->name, ctx->finish, raw);
                 }
                 json_free(aj);
             }

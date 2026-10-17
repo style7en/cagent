@@ -138,6 +138,19 @@ static void log_line(const char *fmt, ...) {
     free(line);
 }
 
+/* tool_calls.arguments 非法 JSON 的统一留档。两个触发点共用一种日志长相:
+ * tools.h 执行前解析失败、agent.h 从 SSE 流重建 tool_calls 时校验失败 ——
+ * 过去两边各写一遍同样的两行, 排查同一种截断故障时分不出是哪个环节报的,
+ * 哪天改格式也会漏改一处。name 必填; finish / raw 允许为 NULL 或空串
+ * (分别归一成 "-" / "(空)", len 按归一后的原文算)。 */
+static void log_bad_tool_args(const char *name, const char *finish, const char *raw) {
+    const char *fs = (finish && *finish) ? finish : "-";
+    size_t rl = (raw && *raw) ? strlen(raw) : 0;
+    log_line("[tool] arguments 非法 JSON: name=%s finish=%s len=%zu 疑似截断=%d",
+             name, fs, rl, finish && strcmp(finish, "length") == 0);
+    log_line("[tool] arguments 原文: %s", rl ? raw : "(空)");
+}
+
 /* 坏字节落在第几条 messages (0-based, 与服务端 messages[i] 下标对齐)。
  * 旧实现用 memcmp("{\"role\"") 数出现次数, 有两个错: ① 计数从 1 起却声称 0-based,
  * 排查会看错消息; ② 扫全文, message 内容里字面出现的 {"role" 也被计入 (tools 段同理)。

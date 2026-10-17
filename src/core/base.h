@@ -50,12 +50,12 @@
  *
  * 首字符是折叠状态符号, 界面切换时只替换这**一个字符**: ▾(U+25BE) 与 ▸(U+25B8) 都是
  * 单个 UTF-16 码元, 替换后标题行长度不变 —— 否则正文的字符位置会跟着漂移, 而折叠块的
- * 位置索引表全靠字符位置定位。界面侧的宽字符版本见 ui/helpers.h 的 UI_FOLD_GLYPH_*。 */
+ * 位置索引表全靠字符位置定位。core 只**发出**展开态符号 (标题行诞生时即是展开的);
+ * 收起态符号只活在前端 (ui/helpers.h 的 UI_FOLD_GLYPH_OPEN/SHUT) —— 两边是两份字面量:
+ * C 没有 UTF-8->UTF-16 字面量转换, 只能各自写一份, 改动时必须同步。 */
 #define CAGENT_FOLD_GLYPH_OPEN  "▾"   /* 展开态 (内容可见) */
-#define CAGENT_FOLD_GLYPH_SHUT  "▸"   /* 收起态 */
 
-#define CAGENT_THINK_TITLE           CAGENT_FOLD_GLYPH_OPEN " 思考过程"
-#define CAGENT_THINK_TITLE_COLLAPSED CAGENT_FOLD_GLYPH_SHUT " 思考过程"
+#define CAGENT_THINK_TITLE      CAGENT_FOLD_GLYPH_OPEN " 思考过程"
 static void (*cagent_emit)(const char *utf8, int role) = NULL;  /* 输出一段文本 (role 区分角色) */
 static void (*cagent_on_done)(void) = NULL;                   /* 一轮 Agent 结束 */
 static void (*cagent_read_config_ui)(void) = NULL;            /* 从 UI 同步配置到全局 */

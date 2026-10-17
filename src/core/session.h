@@ -4,6 +4,10 @@
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
+/* 会话文件名的通配模式: 本模块的旧会话迁移/目录枚举与界面会话列表 (session_dlg.h,
+ * 经聚合头同一 TU 可见) 共用一份 —— 文件名约定一改, 两边必须同时跟着变。 */
+#define HISTORY_FILE_GLOB "history_*.json"
+
 /* ===== 配置文件 cagent.ini ===== */
 
 /* 取 exe 同目录下某文件的绝对路径 */
@@ -46,7 +50,7 @@ static CAGENT_MAYBE_UNUSED void migrate_legacy_sessions(void) {
     sessions_dir(dstdir, sizeof(dstdir));
     if (strcmp(root, dstdir) == 0) return;            /* 退回模式: 无处可搬 */
 
-    snprintf(pat, sizeof(pat), "%shistory_*.json", root);
+    snprintf(pat, sizeof(pat), "%s" HISTORY_FILE_GLOB, root);
     wchar_t wpat[PATHSZ];
     if (!utf8_to_wide(pat, wpat, (int)sizeof(wpat))) return;
     WIN32_FIND_DATAW fd;

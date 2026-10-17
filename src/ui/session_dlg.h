@@ -49,7 +49,7 @@ static void ws_from_filename(const char *path, char *out, size_t cap) {
 static int sess_enumerate(const char *dir) {
     g_sess_n = 0;
     char pat[PATHSZ];
-    snprintf(pat, sizeof(pat), "%shistory_*.json", dir);
+    snprintf(pat, sizeof(pat), "%s" HISTORY_FILE_GLOB, dir);
     wchar_t wpat[PATHSZ];
     if (!utf8_to_wide(pat, wpat, (int)sizeof(wpat))) return 0;
     WIN32_FIND_DATAW fd;
