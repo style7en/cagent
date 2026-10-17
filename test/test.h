@@ -722,12 +722,19 @@ static int run_all_tests(void) {
 
         /* 1. 正常写: 内容正确, 且不残留中间文件 */
         CHK(session_write_atomic(atomic, "WS", ",{\"role\":\"user\",\"content\":\"hi\"}") == 1);
-        buf[0] = '\0';
         { FILE *f = fopen_utf8(atomic, "rb");
-          if (f) { fread(buf, 1, sizeof(buf) - 1, f); fclose(f); } }
+          size_t rn = 0;
+          if (f) { rn = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); buf[rn] = '\0'; }   /* fread 后必须补终止 */
+          else buf[0] = '\0'; }
         CHK(strstr(buf, "\"workspace\":\"WS\"") != NULL);
         CHK(strstr(buf, "\"messages\":[") != NULL);
         CHK(strstr(buf, "hi") != NULL);
+        { JValue *pdoc = json_parse(buf);           /* 整文档必须仍是合法 JSON (文档收口
+                                                       已由 session_write_reasonings 统一负责) */
+          CHK(pdoc != NULL);
+          if (pdoc) { const JValue *r = json_obj_get(pdoc, "reasonings");
+                      CHK(r == NULL); }             /* 无思考存档: 连字段都不该写 */
+          json_free(pdoc); }
         CHK(GetFileAttributesW(wtmp) == INVALID_FILE_ATTRIBUTES);   /* .tmp 已随替换消失 */
 
         /* 2. 写入失败 (目标只读 -> MoveFileEx 拒绝): 旧内容完好, 新内容没混进去 */
@@ -736,13 +743,82 @@ static int run_all_tests(void) {
         SetFileAttributesW(wdst, FILE_ATTRIBUTE_NORMAL);            /* 复位, 否则删不掉 */
         buf[0] = '\0';
         { FILE *f = fopen_utf8(atomic, "rb");
-          if (f) { fread(buf, 1, sizeof(buf) - 1, f); fclose(f); } }
+          size_t rn = 0;
+          if (f) { rn = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); buf[rn] = '\0'; }
+          else buf[0] = '\0'; }
         CHK(strstr(buf, "hi") != NULL);        /* 旧内容原封不动 */
         CHK(strstr(buf, "NEW") == NULL);       /* 失败的那次没污染目标 */
         CHK(GetFileAttributesW(wtmp) == INVALID_FILE_ATTRIBUTES);   /* 失败路径也清掉了 .tmp */
 
         test_ws_rm("atomic.json");
         test_ws_rm("atomic.json.tmp");
+        test_ws_end();
+    }
+
+    /* ---- 思考旁路存档 (reasonings): 落盘/载入往返 + 对齐准入 ----
+     * messages 是纯净 OpenAI 格式, 思考正文在旁路数组里按 assistant 序号对齐
+     * (见 agent.h); 这里验证三件事: ① 正常往返 (长度对齐, null 占位不丢位);
+     * ② 文件里对不上 (长度 != assistant 条数) 就整份丢弃并补齐空位;
+     * ③ 旧格式文件 (无 reasonings 字段) 载入后也补齐空位 —— 后续新对话的
+     * 归档才不会挤进旧消息的槽位。 */
+    {
+        test_ws_begin();
+        char path[PATHSZ];
+        snprintf(path, sizeof(path), "%s\\reasoning_session.json", g_test_ws);
+
+        reset_conversation();
+        reasonings_reset();
+        reasonings_push("第一段思考");
+        reasonings_push(NULL);                          /* 无思考的 assistant 也要占位 */
+        reasonings_push("第三段思考\n第二行");
+        strcat(messages, ",{\"role\":\"user\",\"content\":\"hi\"}");
+        strcat(messages, ",{\"role\":\"assistant\",\"content\":\"a1\"}");
+        strcat(messages, ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":"
+                         "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"t\",\"arguments\":\"{}\"}}]}");
+        strcat(messages, ",{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"out\"}");
+        strcat(messages, ",{\"role\":\"assistant\",\"content\":\"a3\"}");
+        /* 喂原始形态 (含前导逗号, 与 history_save 相同) —— 会话写入端已统一负责剥逗号,
+         * 用例顺带验证这层防御真的存在 */
+        CHK(session_write_atomic(path, "WS", messages + strlen(g_system_prompt)) == 1);
+
+        char buf[4096];
+        unsigned int rn = 0;
+        { FILE *f = fopen_utf8(path, "rb");
+          if (f) { rn = (unsigned int)fread(buf, 1, sizeof(buf) - 1, f); fclose(f); } }
+        buf[rn] = '\0';        /* fread 前只置 buf[0], 读入成功后必须补终止, 否则 strstr 扫到栈残留 */
+        CHK(strstr(buf, "\"reasonings\":[\"") != NULL);     /* 字段已落盘 */
+        CHK(strstr(buf, "null") != NULL);                   /* NULL 占位原样写出 */
+
+        CHK(load_messages_from_text(buf) == 1);             /* 载入往返 */
+        CHK(g_reasoning_n == 3);
+        CHK(g_reasonings[0] && strcmp(g_reasonings[0], "第一段思考") == 0);
+        CHK(g_reasonings[1] == NULL);                       /* 占位回到原位 */
+        CHK(g_reasonings[2] && strstr(g_reasonings[2], "第二行") != NULL);
+
+        /* 对不上: 文件 reasonings 1 条 / assistant 2 条 -> 丢弃, 补齐 2 个空位 */
+        reset_conversation();
+        reasonings_reset();
+        CHK(load_messages_from_text(
+                "{\"workspace\":\"W\",\"messages\":["
+                "{\"role\":\"user\",\"content\":\"u1\"},"
+                "{\"role\":\"assistant\",\"content\":\"a1\"},"
+                "{\"role\":\"assistant\",\"content\":\"a2\"}],"
+                "\"reasonings\":[\"孤儿思考\"]}") == 1);
+        CHK(g_reasoning_n == 2);
+        CHK(g_reasonings[0] == NULL && g_reasonings[1] == NULL);
+
+        /* 旧格式 (无 reasonings 字段): 同样要补齐到 assistant 条数 */
+        reset_conversation();
+        reasonings_reset();
+        CHK(load_messages_from_text(
+                "{\"role\":\"user\",\"content\":\"u1\"},"
+                "{\"role\":\"assistant\",\"content\":\"a1\"}\r\n") == 1);
+        CHK(g_reasoning_n == 1);
+        CHK(g_reasonings[0] == NULL);
+
+        reasonings_reset();
+        reset_conversation();
+        test_ws_rm("reasoning_session.json");
         test_ws_end();
     }
 

@@ -63,9 +63,94 @@ static const char *g_system_prompt = g_prompt_default;
 
 static const char *ROLLBACK_HINT = "\r\n(本轮对话已回滚, 不影响后续对话; 已执行的文件改动不会自动撤销)\r\n";
 
+/* ===== 思考过程旁路存档 (reasonings) =====
+ *
+ * 推理模型的思考过程 (reasoning_content) 有两种"该不该留"的要求, 方向相反:
+ *   ① 发给模型: **绝不能带**。DeepSeek 明确要求多轮对话不要回传 reasoning_content;
+ *   ② 给用户看: 重载历史会话时**应该能看到** —— 业界惯例如此 (opencode 把 reasoning
+ *      作为消息的一等 part 落盘), 否则一段长思考刷新后就凭空消失了。
+ * 所以它必须**旁路**: 不进 messages (满足 ①), 但跟着会话文件落盘 (满足 ②)。
+ *
+ * 数据结构: 与 messages 里的 assistant **消息序号**一一对齐 —— reasonings[i] 是第 i 条
+ * assistant 消息的思考正文 (NULL = 这条没有)。用序号对齐而不是存进消息 JSON 里, 是为了
+ * 让"回传给模型的那份数据"结构完全不变: messages 照旧是纯净的 OpenAI 格式, 想带上思考
+ * 都无从下手。代价是**每次改写 messages 都必须同步维护这个数组**:
+ *   - 本轮新增 assistant -> reasonings_push (截断/无思考存 NULL 占位);
+ *   - 本轮回滚 (done) -> reasonings_trim_tail;
+ *   - 压缩 / 载入历史 -> reasonings_align_to (丢头或补 NULL 占位);
+ *   - 落盘与载入在 session.h (session_write_reasonings / session_load_reasonings),
+ *     文件里与 messages 同级存放, 数组长度必须等于文件里 assistant 条数。
+ *
+ * 内存: 只有推理模型才有内容, 非推理模型下 count 恒为 0, 零开销。 */
+#define REASONINGS_MAX 512
+static char *g_reasonings[REASONINGS_MAX];
+static int   g_reasoning_n;      /* 已归档条数 == 历史里 assistant 消息的条数 */
+
+static void reasonings_reset(void) {
+    for (int i = 0; i < g_reasoning_n; i++) { free(g_reasonings[i]); g_reasonings[i] = NULL; }
+    g_reasoning_n = 0;
+}
+
+/* 归档第 g_reasoning_n 条 assistant 消息的思考 (idx 必须正好落在末尾, 保证与消息序号对齐)。
+ * text 为空 / 已截断则归档 NULL 占位 —— 占位也要占, 否则后面的下标全错位。 */
+static void reasonings_push(const char *text) {
+    if (g_reasoning_n >= REASONINGS_MAX) {
+        /* 满了只能放弃。任何"丢最老/覆写"都会破坏与 assistant 消息的序号对齐,
+         * 错位的存档比没有存档更糟; 保存端检测到 g_reasoning_n != assistant 条数时
+         * 也不会落盘 (见 session.h 的 session_write_reasonings), 安全退化为无存档。 */
+        log_line("[think] 思考存档达到上限 %d 条, 本条起不再归档 (对齐失效, 不再落盘)", REASONINGS_MAX);
+        return;
+    }
+    g_reasonings[g_reasoning_n++] = (text && text[0]) ? strdup(text) : NULL;
+}
+
+/* 只丢尾部 count 条 (回滚用): 回滚总是截掉**最近**的若干条消息。 */
+static void reasonings_trim_tail(int count) {
+    while (count-- > 0 && g_reasoning_n > 0)
+        free(g_reasonings[--g_reasoning_n]);
+}
+
+/* 按删掉的 assistant 条数从头部丢 (压缩丢弃早期消息用)。 */
+static void reasonings_drop_head(int count) {
+    if (count <= 0) return;
+    if (count > g_reasoning_n) count = g_reasoning_n;
+    for (int i = 0; i < count; i++) free(g_reasonings[i]);
+    memmove(g_reasonings, g_reasonings + count,
+            (size_t)(g_reasoning_n - count) * sizeof(g_reasonings[0]));
+    g_reasoning_n -= count;
+}
+
+/* 头部补 count 条 NULL 占位 (载入旧格式 / 对齐用)。 */
+static void reasonings_pad_head(int count) {
+    if (count <= 0) return;
+    if (count > REASONINGS_MAX - g_reasoning_n) count = REASONINGS_MAX - g_reasoning_n;
+    if (count > 0) {
+        memmove(g_reasonings + count, g_reasonings,
+                (size_t)g_reasoning_n * sizeof(g_reasonings[0]));
+        memset(g_reasonings, 0, (size_t)count * sizeof(g_reasonings[0]));
+        g_reasoning_n += count;
+    }
+}
+
+/* 把数组长度对齐到"messages 里现有 assistant 条数": 尾部对应关系保持不动,
+ * 多的从头部丢 (压缩删了最早的若干 assistant), 少的头部补 NULL 占位
+ * (载入了没有思考存档的会话, 这里补齐空位)。
+ * **任何改写 messages 的操作 (压缩/载入) 之后都必须调一次** —— 不然后续 push
+ * 从错误的位置开始, 存档与消息从此全部错位。 */
+static void reasonings_align_to(int assistant_n) {
+    if (assistant_n <= 0) { reasonings_reset(); return; }
+    if (g_reasoning_n > assistant_n) reasonings_drop_head(g_reasoning_n - assistant_n);
+    else                             reasonings_pad_head(assistant_n - g_reasoning_n);
+}
+
+/* 数一段对话 JSON 里 assistant 消息的条数 —— 定义挪到 msg_count/msg_bounds/msg_role
+ * 之后 (见 msg_role 下方的实现; 这里只有前向声明, 供 reasonings 模块与本文件早前使用)。 */
+static int count_assistant_msgs(const char *conv);
+
 /* 初始化 messages 为只含 system prompt 的状态。 */
 static void reset_conversation(void) {
     snprintf(messages, BUFSZ, "%s", g_system_prompt);
+    reasonings_reset();      /* 会话重置 = 思考存档同步清空 (两者必须同生命周期) */
 }
 
 /* ===== 外置系统提示词 (exe 同目录的 SYSTEM_PROMPT 文件) ===== */
@@ -251,6 +336,20 @@ static void msg_role(const char *obj, size_t len, char *out, size_t cap) {
     }
 }
 
+/* 数一段对话 JSON 里 assistant 消息的条数 (压缩对齐 / 落盘判定用, 定义见上声明)。 */
+static int count_assistant_msgs(const char *conv) {
+    size_t n = msg_count(conv);
+    int cnt = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t s, e;
+        if (!msg_bounds(conv, i, &s, &e)) break;
+        char role[16];
+        msg_role(conv + s, e - s, role, sizeof(role));
+        if (strcmp(role, "assistant") == 0) cnt++;
+    }
+    return cnt;
+}
+
 /* 向 messages 尾部追加一段格式化 JSON。返回 1 成功; 容量不足返回 0
  * (vsnprintf 已做截断写入, 调用方按保存点回滚)。 */
 static int msg_append(const char *fmt, ...) {
@@ -414,7 +513,7 @@ static int compact_via_summary(int halve) {
                     sizeof(sctx->content_buf) - strlen(sctx->content_buf) - 1);
         summary = strdup(sctx->content_buf);
     }
-    free(sctx);
+    stream_ctx_free(sctx);      /* 摘要请求也可能走 reasoning 模型 —— 不许裸 free (泄漏 reasoning_buf) */
     if (!summary) return 0;
 
     /* 5. 拼装新 messages: SYSTEM + 摘要 user 消息 + 保留段原文。
@@ -503,6 +602,9 @@ static int compact_conversation(void) {
         /* 压缩改写了历史, 上次请求的 token 读数已失效 */
         g_last_prompt_tokens = 0;
         g_last_prompt_bytes = 0;
+        /* 压缩丢掉最早的若干 assistant 消息, 思考存档跟着丢同样多条 —— 尾部对应关系
+         * 不动 (保留段的 assistant 仍配原来的思考)。选数组的头部压缩条数就完成对齐。 */
+        reasonings_align_to(count_assistant_msgs(messages + strlen(g_system_prompt)));
     }
     return ok;
 }
@@ -532,6 +634,7 @@ static void agent_turn(const char *user_msg) {
     if (messages[0] == '\0') reset_conversation();
 
     size_t savepoint = strlen(messages);   /* 出错回滚到这里, 丢弃本轮 user message */
+    int reason_savepoint = g_reasoning_n;  /* 同上: 回滚时把本轮归档的思考一并丢掉 */
     int rolled_back = 0;
     int iter = 0;              /* 迭代序号: 首轮的水位检查已在上面做过 */
     int overflow_retries = 0;  /* 400 上下文超限后的"压缩重试"次数 */
@@ -633,7 +736,7 @@ static void agent_turn(const char *user_msg) {
 
         /* ctx 内含 1MB content_buf: 放堆, 不占工作线程的 1MB 栈。
          * 上一迭代已消费的 ctx 在此释放 (每迭代一个, 不能等 done 才释放)。 */
-        free(ctx);
+        stream_ctx_free(ctx);
         ctx = (StreamCtx*)calloc(1, sizeof(StreamCtx));
         if (!ctx) {
             emit_err("(内存不足, 本轮回滚)\r\n");
@@ -653,7 +756,9 @@ static void agent_turn(const char *user_msg) {
         /* 流可能整个结束在思考阶段 (没有 content), 这里兜底闭合那个思考块 */
         close_reasoning_block(ctx);
         if (ctx->reasoning_len > 0)
-            log_line("[think] 思考内容 %zu 字节 (仅上屏, 不写入 messages)", ctx->reasoning_len);
+            log_line("[think] 思考内容 %zu 字节%s (旁路存档, 不写入 messages)%s",
+                     ctx->reasoning_len, ctx->content_len ? "" : " (本轮无正文)",
+                     ctx->reasoning_trunc ? " — 超存档上限已截断, 本条不归档" : "");
 
         if (status == -2) {
             emit_note("(已取消)\r\n");
@@ -683,7 +788,7 @@ static void agent_turn(const char *user_msg) {
                 is_context_overflow_error(resp)) {
                 overflow_retries++;
                 emit_note("(服务端报告上下文超限, 正在压缩后重试...)\r\n");
-                free(ctx);
+                stream_ctx_free(ctx);
                 ctx = NULL;
                 if (compact_conversation()) {
                     log_line("[compact] 400超限触发 -> 成功, msgs_len=%zu", strlen(messages));
@@ -741,6 +846,10 @@ static void agent_turn(const char *user_msg) {
                         emit_err("(历史空间不足, 本轮回滚)\r\n");
                         reason = "历史空间不足 (assistant content 拼不进 messages)";
                         rolled_back = 1;
+                    } else {
+                        /* 消息进历史成功, 它的思考也随之归档 (序号对齐, 见 reasonings[])。
+                         * 截断的思考不存 —— 存半截反而与实际不符。 */
+                        reasonings_push(ctx->reasoning_trunc ? NULL : ctx->reasoning_buf);
                     }
                     free(esc);
                 } else {
@@ -993,10 +1102,13 @@ static void agent_turn(const char *user_msg) {
             rolled_back = 1;
             goto done;
         }
+        /* assistant 段拼装成功 = 这条消息真的进历史了, 思考随之归档 (序号对齐)。
+         * **必须放在 ok 判定之后**: 半截的 assistant 会被上面截掉, 那时归档就是错位。 */
+        reasonings_push(ctx->reasoning_trunc ? NULL : ctx->reasoning_buf);
     }
 done:
     /* 兜底释放: 取消/中途出错时这些堆缓冲可能还没释放 */
-    free(ctx);
+    stream_ctx_free(ctx);
     if (calls) {
         for (int i = 0; i < STREAM_CALLS_MAX; i++) free(calls[i].output);
         free(calls);
@@ -1008,6 +1120,8 @@ done:
      * 能对上到底走的哪条路径 (取消/内存/UTF-8/解析失败/HTTP)。只记一个 回滚=1 定位不了。 */
     if (rolled_back) {
         messages[savepoint] = '\0';
+        /* 对话回滚了, 这轮归档的思考也一并丢掉 —— 两者必须同步, 否则存档与消息错位 */
+        reasonings_trim_tail(g_reasoning_n - reason_savepoint);
         /* 对话回滚了, 但文件已经改了 —— 说清楚并列出改了哪些, 免得用户以为也还原了 */
         if (g_touched_files[0]) {
             char note[1200];

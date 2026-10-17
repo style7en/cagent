@@ -153,10 +153,23 @@ typedef struct {
 /* content 满时给截断标记预留的尾部空间 */
 #define CONTENT_TAIL_RESERVE 128
 
+/* 单轮思考正文的存档上限 (字节)。超了就当这一轮的思考不值得存 (残缺的思考存下来反而
+ * 与实际不符), 由上层跳过存档。512KB 足够覆盖正常推理模型的输出。 */
+#define REASONING_STORE_MAX (512u * 1024u)
+
 /* 流式上下文: 跨 http_post_stream 传递 */
 typedef struct {
     char content_buf[BUFSZ];   /* 累积完整 content 供 messages */
     size_t content_len;
+    /* 累积完整思考正文 (reasoning_content), 供**旁路存档**用 —— 给用户重载会话时回放,
+     * 绝不进 messages (见 agent.h 的 reasonings[] 说明)。放堆而非内联: 1MB content_buf
+     * 已经把 StreamCtx 撑得很大, 再加一个固定大缓冲只会更浪费, 思考体量又不可预期。
+     * 溢出时截断并置 reasoning_trunc, 交由上层决定是否存档 (内容不全不如不存)。
+     * 字节数 (写入游标) 共用下面 reasoning 结构区里的 reasoning_len —— 它与"上屏过多少
+     * 字节"本来就是同一个数, 两个字段反而会漂移。 */
+    char  *reasoning_buf;
+    size_t reasoning_cap;
+    int    reasoning_trunc;
     StreamToolCall calls[STREAM_CALLS_MAX];
     int n_calls;
     char finish[24];           /* stop / length / tool_calls / content_filter 等 */
@@ -170,20 +183,49 @@ typedef struct {
     int emitted;               /* 已向前端上屏过 AI 内容 (重试前据此回删) */
     int truncated;             /* content 超出缓冲上限, 尾部被丢弃 */
     /* 推理模型的思考过程 (DeepSeek-R1 等返回的 reasoning_content 字段)。
-     * **只上屏, 不累积、不进 messages** —— DeepSeek 明确要求多轮对话不要回传
-     * reasoning_content, 所以这里只记长度 (日志与诊断用), 不留正文:
-     * 既省一份可能上百 KB 的缓冲, 也从根上杜绝它被误写进历史。 */
-    size_t reasoning_len;      /* 本次响应收到的思考内容字节数 (UTF-8) */
+     * **只上屏与旁路存档, 不进 messages** —— DeepSeek 明确要求多轮对话不要回传
+     * reasoning_content, 所以 messages 是"纯净 OpenAI 格式", 想带上思考都无从下手;
+     * 正文落在 reasoning_buf (堆, 按需增长, 上限 REASONING_STORE_MAX), 重载历史会话时
+     * 由 reasonings[] 回放给人看, 随 ctx 释放 (见 stream_ctx_free)。 */
+    size_t reasoning_len;      /* 思考内容累计字节数 (UTF-8), 即 reasoning_buf 的写入游标 */
     int    reasoning_open;     /* 思考块标题行已发, 正文还没闭合 (收尾时要补换行) */
     char   reasoning_last;     /* 思考内容的最后一个字符, 用于判断要不要补换行 */
     struct { char id[256]; char name[64]; } dropped[STREAM_CALLS_MAX]; /* 超上限被丢弃的调用 */
     int n_dropped;
 } StreamCtx;
 
+/* 释放 StreamCtx 持有的堆缓冲。**ctx 一律用这个释放, 不要裸 free** —— 思考缓冲是堆上
+ * 按需增长的, 漏掉就是每次迭代 (每个 StreamCtx) 泄漏一份。 */
+static void stream_ctx_free(StreamCtx *ctx) {
+    if (!ctx) return;
+    free(ctx->reasoning_buf);
+    free(ctx);
+}
+
+/* 累积一段思考正文。超过 REASONING_STORE_MAX 后截断并置标志 —— 存残缺的思考不如不存
+ * (重载后看到的思考会与实际不符), 由上层据 reasoning_trunc 决定跳过存档。 */
+static void reasoning_accumulate(StreamCtx *ctx, const char *delta) {
+    size_t dl = strlen(delta);
+    if (ctx->reasoning_trunc) return;
+    if (ctx->reasoning_len + dl + 1 > REASONING_STORE_MAX) { ctx->reasoning_trunc = 1; return; }
+    if (ctx->reasoning_len + dl + 1 > ctx->reasoning_cap) {
+        size_t ncap = ctx->reasoning_cap ? ctx->reasoning_cap * 2 : 4096;
+        if (ncap < ctx->reasoning_len + dl + 1) ncap = ctx->reasoning_len + dl + 1;
+        if (ncap > REASONING_STORE_MAX) ncap = REASONING_STORE_MAX;
+        char *nb = (char*)realloc(ctx->reasoning_buf, ncap);
+        if (!nb) { ctx->reasoning_trunc = 1; return; }   /* 内存不足: 当作截断, 不存 */
+        ctx->reasoning_buf = nb;
+        ctx->reasoning_cap = ncap;
+    }
+    memcpy(ctx->reasoning_buf + ctx->reasoning_len, delta, dl);
+    ctx->reasoning_len += dl;
+    ctx->reasoning_buf[ctx->reasoning_len] = '\0';
+}
+
 /* reasoning_content delta 回调: 增量上屏 (THINK 角色), 首个增量前先发块标题。
  * 标题行是块折叠/展开的抓手 —— 前端的块索引表按它定位, 所以文案与"▾"符号是接口的一部分,
  * 改之前先看 ui/helpers.h 的 ui_fold_*。
- * 思考内容不累积 (见 StreamCtx 说明), 只统计长度。 */
+ * 同一份正文两条去向: 原样上屏, 以及旁路累积到 reasoning_buf (供会话存档, 不进 messages)。 */
 static void on_reasoning_delta(void *ud, const char *delta) {
     StreamCtx *ctx = (StreamCtx*)ud;
     /* 空串必须当成"没有": 它一旦上屏就是一次 THINK 角色的空追加, 前端 do_append 见角色
@@ -197,9 +239,12 @@ static void on_reasoning_delta(void *ud, const char *delta) {
         ctx->reasoning_open = 1;
     }
     if (cagent_emit) { cagent_emit(delta, CAGENT_ROLE_THINK); ctx->emitted = 1; }
+    /* 旁路累积, **只这里加 reasoning_len**: 上屏之后 (上屏是"必须成功"的路径, 累积失败
+     * 只影响存档)。字节计数、buf 游标、reasoning_last 全部同步于这份正文, 别处再 += 就
+     * 双份计数。 */
+    reasoning_accumulate(ctx, delta);
     size_t dl = strlen(delta);
     if (dl) ctx->reasoning_last = delta[dl - 1];
-    ctx->reasoning_len += dl;
 }
 
 /* 闭合思考块: 补一个换行收尾, 幂等 (已闭合则什么都不做)。

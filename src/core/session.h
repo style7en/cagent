@@ -193,6 +193,38 @@ static size_t first_object_end(const char *s) {
     return 0;
 }
 
+/* 从已解析的会话文件重建思考旁路存档。数组只在"长度恰好 == messages 里 assistant
+ * 条数且不超内存上限"时才采用 —— 对不上的一律丢弃, 宁可回放不出思考, 也不让
+ * 错位存档混进来; 最后用 reasonings_align_to 把数组补齐到 assistant 条数
+ * (旧格式文件 / 对不上的文件在这里补成全 NULL), 后续新对话的归档才不会错位。 */
+static void session_load_reasonings(const JValue *root) {
+    g_reasoning_n = 0;              /* load_messages_from_text 前面已 reset, 这里兜底 */
+    const JValue *msgs = json_obj_get(root, "messages");
+    if (!msgs || msgs->type != J_ARR) return;
+    int n_ass = 0;
+    for (size_t i = 0; i < msgs->arr.n; i++) {
+        const char *r = json_as_str(json_obj_get(json_arr_at(msgs, i), "role"));
+        if (r && strcmp(r, "assistant") == 0) n_ass++;
+    }
+    const JValue *rr = json_obj_get(root, "reasonings");
+    if (rr && rr->type == J_ARR && rr->arr.n > 0) {
+        if (rr->arr.n == (size_t)n_ass && n_ass <= REASONINGS_MAX) {
+            for (size_t i = 0; i < rr->arr.n; i++) {
+                const JValue *it = json_arr_at(rr, i);
+                reasonings_push((it && it->type == J_STR && it->str && it->str[0]) ? it->str : NULL);
+            }
+        } else {
+            /* 对不上 (长度 != assistant 条数) 或超内存上限: 整份丢弃, 宁可回放不出思考
+             * 也不让错位存档混进来 —— 但下面的补齐永远要做 */
+            log_line("[session] 会话文件思考存档不可用 (%zu 条 / assistant %d 条%s), 丢弃",
+                     rr->arr.n, n_ass, n_ass > REASONINGS_MAX ? ", 超内存上限" : "");
+        }
+    }
+    /* **无论存档有没有被采用, 都要补齐到 assistant 条数** (未采用 = 全 NULL 占位):
+     * 不然后续新对话第一条 assistant 的归档会挤进旧消息的槽位, 从此错位 */
+    reasonings_align_to(n_ass);
+}
+
 /* 在 text 中定位 "messages":[ ... ] 数组内部内容区间 (字符串/嵌套感知)。
  * 输出内部起点 (首 '[' 之后) 与逻辑终点 (末 ']' 之前) 下标; 找不到返回 -1。 */
 static long find_messages_inner(const char *t, long *out_start, long *out_end) {
@@ -241,6 +273,7 @@ static int load_messages_from_text(const char *text) {
                 json_free(root);
                 return 0;
             }
+            session_load_reasonings(root);   /* 思考旁路存档: 载入即对齐 (见函数说明) */
             json_free(root);
             return 1;
         }
@@ -259,9 +292,48 @@ static int load_messages_from_text(const char *text) {
     if (strncmp(conv, "{\"role\":", 8) == 0 &&
         strlen(messages) + strlen(conv) < BUFSZ - 1) {
         strcat(messages, conv);
+        /* 旧格式文件没有思考存档字段, 也必须把数组补到 assistant 条数 (全 NULL 占位)
+         * —— 不然后续新对话第一条 assistant 的归档会挤进旧消息的槽位, 从此错位 */
+        reasonings_align_to(count_assistant_msgs(messages + strlen(g_system_prompt)));
         return 1;
     }
     return 0;   /* 无法识别: 视为无有效历史, 从新对话开始 */
+}
+
+/* ===== 思考旁路存档的落盘 / 载入 =====
+ * 数据本体与对齐不变量见 agent.h 的 reasonings[]; 这里只管出入会话文件。
+ * 文件格式: {"workspace":..., "messages":[...], "reasonings":[null,"...",...]}
+ * reasonings 数组与 messages 里的 **assistant 消息**一一对齐 (与 user/tool 无关)。 */
+
+/* 落盘判定与写入。**文档收口 "]}" 由本函数负责**, 每条出口 (含"决定不写") 都必须
+ * 把它写到位 —— 载入方 json_parse 的合法性与这里一一对应。返回 1 成功, 包含两种
+ * "决定不写"的情况:
+ *   - 对齐失效 (数组长度 != 文件里 assistant 条数): 跳过写数组, 回放安全退化成无思考;
+ *   - 没有任何非空条目 (会话自始没产生过思考): 跳过, 省掉一串 null 的大 JSON 数组。
+ * 写出中途某条转义失败 (几乎只在 OOM): 就地降级为 null —— 数组长度对齐比条目完整
+ * 更重要, 错位会让之后的整份存档永久失效。真正的 I/O 失败返回 0, 上层回整份原子写。 */
+static int session_write_reasonings(FILE *f, const char *conv) {
+    int n_ass = count_assistant_msgs(conv);
+    if (g_reasoning_n != n_ass) {
+        if (g_reasoning_n > 0)
+            log_line("[session] 思考存档对齐失效 (数组 %d / assistant %d 条), 本次不落盘",
+                     g_reasoning_n, n_ass);
+        return (fputs("]}", f) >= 0);            /* 只写文档收口 */
+    }
+    int have = 0;
+    for (int i = 0; i < g_reasoning_n; i++)
+        if (g_reasonings[i] && g_reasonings[i][0]) { have = 1; break; }
+    if (!have) return (fputs("]}", f) >= 0);
+    if (fprintf(f, "],\"reasonings\":[") <= 0) return 0;
+    for (int i = 0; i < g_reasoning_n; i++) {
+        if (i > 0 && fputc(',', f) == EOF) return 0;
+        char *esc = g_reasonings[i] ? json_escape_alloc(g_reasonings[i]) : NULL;
+        if (!esc) { if (fputs("null", f) == EOF) return 0; continue; }
+        int ok = fprintf(f, "\"%s\"", esc) > 0;
+        free(esc);
+        if (!ok) return 0;
+    }
+    return (fprintf(f, "]}") > 0);              /* 数组收口 + 文档收口一起完成 */
 }
 
 /* 原子写会话文件: 先写 <原名>.tmp, 内容完整落盘后再整体替换目标。
@@ -271,6 +343,9 @@ static int load_messages_from_text(const char *text) {
  * 同卷上 MoveFileExW 的替换是原子的: 旧文件在新内容完整落盘之前一个字节都不动。
  * 任一步失败都删掉 .tmp 并保持目标原样, 返回 0 让调用方上报。 */
 static int session_write_atomic(const char *path, const char *workspace_esc, const char *conv) {
+    /* conv 是"messages 数组内部内容"—— 允许并且**必须**容忍带前导逗号的历史形态
+     * (messages 里的对话以 ",{" 开头)。在写入端统一剥掉, 而不是靠每个调用方自觉。 */
+    if (*conv == ',') conv++;
     char tmp[MAX_PATH + 8];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     wchar_t wtmp[MAX_PATH + 8], wdst[MAX_PATH];
@@ -279,17 +354,19 @@ static int session_write_atomic(const char *path, const char *workspace_esc, con
 
     FILE *f = fopen_utf8(tmp, "wb");
     if (!f) return 0;
-    /* workspace_esc 只含转义内容不带引号, 此处必须自己补上 */
+    /* workspace_esc 只含转义内容不带引号, 此处必须自己补上。文档收口 "]}" 由
+     * session_write_reasonings 统一负责 (它可能还要在数组后再写 reasonings 字段)。 */
     int ok = (fprintf(f, "{\"workspace\":\"%s\",\"messages\":[", workspace_esc) > 0);
     if (ok) ok = (fputs(conv, f) >= 0);
-    if (ok) ok = (fputs("]}", f) >= 0);
+    if (ok) ok = session_write_reasonings(f, conv);
     if (fclose(f) != 0) ok = 0;                 /* 磁盘满在这时才暴露, 不能只看写入调用 */
     if (!ok) { DeleteFileW(wtmp); return 0; }   /* 目标保持不动 */
     if (!MoveFileExW(wtmp, wdst, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(wtmp); return 0; }
     return 1;
 }
 
-/* 保存历史: 自描述格式 {"workspace":...,"messages":[...]}, 仅存对话部分。 */
+/* 保存历史: 自描述格式 {"workspace":...,"messages":[...],"reasonings":[...]} (仅存对话部分;
+ * reasonings 是思考旁路存档, 对齐与准入条件见 session_write_reasonings)。 */
 static void history_save(void) {
     size_t skip = strlen(g_system_prompt);
     if (strlen(messages) < skip) skip = strlen(messages);  /* 防越界 (messages 未初始化时) */
@@ -302,7 +379,8 @@ static void history_save(void) {
         build_new_session_path(g_history_file, sizeof(g_history_file));
     const char *path = g_history_file;
     /* 覆盖前备份上次内容。有了原子写, 它不再是"防写坏"的补丁, 而是"回退到上一轮"的入口:
-     * 存的是一份能正常加载的完整历史, 比 .tmp 兜底更有用。 */
+     * 存的是一份能正常加载的完整历史, 比 .tmp 兜底更有用。
+     * (conv 的前导逗号由 session_write_atomic 内部统一剥, 见那里的说明。) */
     {
         wchar_t wsrc[MAX_PATH], wbak[MAX_PATH];
         if (utf8_to_wide(path, wsrc, MAX_PATH) &&
@@ -311,7 +389,6 @@ static void history_save(void) {
             CopyFileW(wsrc, wbak, FALSE);
         }
     }
-    if (conv[0] == ',') conv++;                 /* 数组内部不需要前导逗号 */
     char *wse = json_escape_alloc(g_workspace);
     if (!wse) return;
     int ok = session_write_atomic(path, wse, conv);
@@ -420,6 +497,7 @@ static CAGENT_MAYBE_UNUSED void history_replay(void) {
     JValue *root = json_parse(arr);
     free(arr);
     if (!root || root->type != J_ARR) { if (root) json_free(root); return; }
+    size_t a_seq = 0;   /* 已回放的 assistant 计数 —— thinking 存档按它对齐 */
     for (size_t i = 0; i < root->arr.n; i++) {
         const JValue *m = root->arr.items[i];
         if (m->type != J_OBJ) continue;
@@ -439,6 +517,18 @@ static CAGENT_MAYBE_UNUSED void history_replay(void) {
             cagent_emit(line, CAGENT_ROLE_USER);
             free(line);
         } else if (strcmp(r, "assistant") == 0) {
+            /* **思考过程回放** (旁路数组, 见 agent.h 的 reasonings[]): 本条 assistant 有
+             * 存档就先发思考块 —— 角色序列与实时路径同构 (THINK_HEAD 标题 + THINK 正文
+             * + 必要的收尾换行), 前端按 THINK_HEAD 识别折叠块, 改符号先看两边的契约。
+             * 计数 aa 对每条 assistant +1 (无存档也一样), 存档下标才能对上。 */
+            size_t aa = a_seq++;
+            if (aa < (size_t)g_reasoning_n && g_reasonings[aa] && g_reasonings[aa][0]) {
+                cagent_emit(CAGENT_THINK_TITLE "\r\n", CAGENT_ROLE_THINK_HEAD);
+                cagent_emit(g_reasonings[aa], CAGENT_ROLE_THINK);
+                size_t tln = strlen(g_reasonings[aa]);
+                if (g_reasonings[aa][tln-1] != '\n' && g_reasonings[aa][tln-1] != '\r')
+                    cagent_emit("\r\n", CAGENT_ROLE_THINK);   /* 与 close_reasoning_block 同一条规则 */
+            }
             /* 正文可能为空 (只有 tool_calls 的那一轮), 所以这里**不能**拿空 content 提前跳过 */
             if (*ct) {
                 char *line = (char*)malloc(strlen(ct) + 8);
