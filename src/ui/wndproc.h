@@ -37,6 +37,7 @@ static void layout(HWND hwnd) {
     int lbl_w = dp(80);
     int top_h = row_h * 4 + gap * 5;
     int btn_w = dp(80);
+    int stop_w = dp(80);      /* 停止按钮: 与发送并列, 等宽 */
     int ws_btn_w = dp(72);
     int new_w = dp(80);
     int sess_w = dp(80);
@@ -45,7 +46,7 @@ static void layout(HWND hwnd) {
     int status_h = dp(20);
     int status_y = H - status_h - dp(2);
     int input_y  = status_y - gap - input_h;
-    int input_w = W - btn_w - gap * 3;
+    int input_w = W - btn_w - stop_w - gap * 4;
 
     for (int i = 0; i < 3; i++) {
         int y = gap + i * (row_h + gap);
@@ -72,6 +73,7 @@ static void layout(HWND hwnd) {
     ui_history_pad(g_hHistory, W - gap * 2, input_y - gap - top_h);
     MoveWindow(g_hInput, gap, input_y, input_w, input_h, TRUE);
     MoveWindow(g_hSend,  gap * 2 + input_w, input_y, btn_w, input_h, TRUE);
+    MoveWindow(g_hStop,  gap * 3 + input_w + btn_w, input_y, stop_w, input_h, TRUE);
     MoveWindow(g_hStatus, gap, status_y, W - gap * 2, status_h, TRUE);
 }
 
@@ -250,6 +252,12 @@ static LRESULT CALLBACK InputProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(ID_SEND, BN_CLICKED), 0);
         return 0;
     }
+    /* Esc = 停止 (与主流 agent 一致)。走 ID_STOP 的真实处理: 空闲时处理器自己no-op,
+     * 不必在这里判 g_running。Edit 控件本身不吃 Esc, 不存在吞掉原有行为的问题。 */
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
+        SendMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(ID_STOP, BN_CLICKED), 0);
+        return 0;
+    }
     if (msg == WM_CHAR && wp == VK_RETURN) {
         if (!(GetKeyState(VK_SHIFT) & 0x8000)) return 0;
     }
@@ -352,6 +360,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_SEND, NULL, NULL);
         SendMessageW(g_hSend, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
+        /* 停止是独立按钮: 与发送分开, 运行中点亮、空闲禁用 (ui_buttons_* 管状态)。
+         * 没有"运行中把发送按钮改成停止"那套了 —— 发送永远可点: 空闲发新轮,
+         * 运行中把文字排队成插话 (见 WM_COMMAND 的 ID_SEND 分支)。 */
+        g_hStop = CreateWindowW(L"BUTTON", L"停止",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_STOP, NULL, NULL);
+        SendMessageW(g_hStop, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+        EnableWindow(g_hStop, FALSE);
+
         g_hNew = CreateWindowW(L"BUTTON", L"新建会话",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_NEW_BTN, NULL, NULL);
@@ -415,14 +432,47 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_COMMAND:
+        /* 「发送」永远可点: 空闲 -> 发新轮; 运行中 -> 有文字就**排队** (插话),
+         * 空则无事可做。**不再有"运行中把发送按钮临时改成停止"那套** ——
+         * 停止是「停止」按钮与 Esc 的独立职责 (见下面的 ID_STOP)。 */
         if (LOWORD(wp) == ID_SEND && HIWORD(wp) == BN_CLICKED) {
             if (g_running) {
-                InterlockedExchange(&g_cancel, 1);
-                SetWindowTextW(g_hSend, L"停止中...");
-                EnableWindow(g_hSend, FALSE);
-                emit_note("(正在停止, 需等当前工具执行完毕...)\r\n");
+                int wlen = GetWindowTextLengthW(g_hInput);
+                if (wlen > 0) {
+                    wchar_t *wbuf = (wchar_t*)malloc((size_t)(wlen + 1) * sizeof(wchar_t));
+                    if (wbuf) {
+                        GetWindowTextW(g_hInput, wbuf, wlen + 1);
+                        int need = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, NULL, 0, NULL, NULL);
+                        char *u8 = need > 0 ? (char*)malloc((size_t)need) : NULL;
+                        if (u8) {
+                            WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, u8, need, NULL, NULL);
+                            if (inbox_push(u8)) {
+                                /* 入队即清空输入框: 用户看到"话已递出去", 按钮带上队计数 */
+                                SetWindowTextW(g_hInput, L"");
+                                ui_buttons_running();
+                            } else {
+                                /* 队满 (INBOX_MAX) 或超长 (INBOX_SLOT): 拒绝并说明,
+                                 * 文字留在输入框 —— 不静默截断用户的指令 */
+                                SetWindowTextW(g_hStatus, L"排队已满或内容过长, 未入队");
+                            }
+                            free(u8);
+                        }
+                        free(wbuf);
+                    }
+                }
             } else {
                 start_task(hwnd);
+            }
+            return 0;
+        }
+        /* 「停止」: 一点即请求取消当前轮 (g_cancel 在迭代/工具间隙被检查, 见 agent.h)。
+         * 只影响当前轮 —— 排队里的插话照旧在轮末自动发出: 那是用户清醒时打好的指令,
+         * 不该被一次取消吞掉。 */
+        if (LOWORD(wp) == ID_STOP && HIWORD(wp) == BN_CLICKED) {
+            if (g_running) {
+                InterlockedExchange(&g_cancel, 1);
+                ui_buttons_stopping();
+                emit_note("(正在停止, 需等当前工具执行完毕...)\r\n");
             }
             return 0;
         }

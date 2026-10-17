@@ -69,8 +69,12 @@ SCENARIOS = {
     "tool2": [sse_step(tool_calls=[("read_file", '{"path":"a.txt"}'),
                                    ("read_file", '{"path":"b.txt"}')]),
               sse_step("两个文件都读完了。")],
-    # 慢速滴流 (停止按钮测试): 40 块 × 0.3s = 12s 流
+    # 慢速滴流 (停止按钮测试): 120 字 ÷ 12 字/块 × 0.3s ≈ 3s 流
     "drip": [sse_step("慢慢输出" * 30, delay=0.3)],
+    # 插话排队: 第 1 轮同 drip (~3s, 给测试留出运行中输入的时间), 第 2 轮是排队的那条,
+    # 立即回复 —— 验证"排队不打断, 轮末自动发出"
+    "interject": [sse_step("慢慢输出" * 30, delay=0.3),
+                  sse_step("插队的消息已收到并回复。")],
     # 重试: 500 ×2 后成功
     "err500x2": [err_step(500, "internal server error"),
                  err_step(500, "internal server error"),

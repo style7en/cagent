@@ -75,33 +75,20 @@ static void start_task(HWND hwnd) {
 
     SetWindowTextW(g_hInput, L"");
 
-    /* 回显用户输入到历史框 (USER 角色: 前端按"用户消息"样式渲染 —— 蓝底加粗, 见 ui/helpers.h)。
-     * 不加"你："前缀: 样式本身已经说清了这是谁说的, 前缀只是噪音。
-     * 与 session.h 的回显一致, 不带前导换行: 上一块若没收尾段落, do_append 的
-     * g_last_no_lf 兜底会补; 带了的代价是每条用户消息前多出一个吃 USER 段前距的空段
-     * (约 90px 空白)。 */
-    {
-        size_t ul = strlen(task->user_msg);
-        char *uecho = (char*)malloc(ul + 16);
-        if (uecho) {
-            snprintf(uecho, ul + 16, "%s\r\n", task->user_msg);
-            gui_emit(uecho, CAGENT_ROLE_USER);
-            free(uecho);
-        }
-    }
+    /* 回显用户输入到历史框 (USER 角色: 前端按"用户消息"样式渲染 —— 蓝底加粗)。
+     * 措辞/前缀/换行的取舍见 hooks.h 的 ui_echo_user; 插话的消费路径共用它。 */
+    ui_echo_user(task->user_msg);
 
     InterlockedExchange(&g_running, 1);
-    SetWindowTextW(g_hSend, L"停止");
-    EnableWindow(g_hSend, TRUE);
+    ui_buttons_running();   /* 发送按钮可用 (此刻队为空, 标签即"发送"); 停止按钮解禁 */
     g_hThread = CreateThread(NULL, 0, agent_thread, task, 0, NULL);
     if (!g_hThread) {
-        /* 线程创建失败: 必须把 UI 状态回滚, 否则 g_running 恒为 1、按钮停在"停止",
+        /* 线程创建失败: 必须把 UI 状态回滚, 否则 g_running 恒为 1、停止按钮常亮、
          * agent_thread 永不执行 -> gui_on_done 永不回调, 界面卡死在"运行中"。
          * task 由 agent_thread 释放, 这里失败只能自己释放, 否则泄漏。 */
         free(task);
         InterlockedExchange(&g_running, 0);
-        SetWindowTextW(g_hSend, L"发送");
-        EnableWindow(g_hSend, TRUE);
+        ui_buttons_idle();
         SetFocus(g_hInput);
         emit_err("(启动后台线程失败, 请重试)\r\n");
     }

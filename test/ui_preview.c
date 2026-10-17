@@ -500,6 +500,99 @@ static void note_split_selftest(void) {
     printf("note split selftest: [%s]\n", ok ? "OK" : "FAIL");
 }
 
+/* 插话队列 (inbox) 不变量: FIFO、8 条封顶、超长拒绝、take 失败不丢消息。
+ * 这是排队语义的地基 —— gui_on_done 的 drain 指着它, 它坏了症状是"点了没反应"
+ * (取不到) 或用户的指令被静默吞掉 (take 失败却把消息划走了)。 */
+static void inbox_selftest(void) {
+    char buf[INBOX_SLOT];
+    static char big[INBOX_SLOT + 1];       /* 静态: 64KB+ 不往线程栈上压 */
+    int ok = 1;
+    /* 分阶段结果: FAIL 时打印, 一眼看出坏在哪一环 (初始化成 0 = 未执行) */
+    int ph_fifo = 0, ph_empty = 0, ph_cap = 0, ph_len = 0, ph_fill = 0;
+
+    g_inbox_n = 0;
+    /* FIFO: 依次入队, 取出必须原序 */
+    {
+        ph_fifo = inbox_push("第一条") && inbox_push("第二条") && inbox_push("第三条")
+               && (g_inbox_n == 3);
+        static const char *want[3] = { "第一条", "第二条", "第三条" };
+        for (int i = 0; i < 3; i++) {
+            if (!inbox_take(buf, sizeof(buf))) { ph_fifo = 0; break; }
+            if (strcmp(buf, want[i]) != 0) ph_fifo = 0;
+        }
+        ok &= ph_fifo;
+    }
+    /* 空队列 take 不到: 返回 0, 且不碰状态 */
+    ph_empty = (inbox_take(buf, sizeof(buf)) == 0) && (g_inbox_n == 0);
+    ok &= ph_empty;
+
+    /* cap 太小也 take 不到, 消息必须原样留在队里 (绝不静默丢弃) */
+    g_inbox_n = 0;
+    ph_cap = inbox_push("第一条") && (inbox_take(buf, 4) == 0) && (g_inbox_n == 1)
+          && (strcmp(g_inbox[0], "第一条") == 0);
+    ok &= ph_cap;
+
+    /* 长度边界: INBOX_SLOT-1 可入 (要含 NUL), == INBOX_SLOT 拒绝 */
+    g_inbox_n = 0;
+    memset(big, 'A', sizeof(big));
+    big[INBOX_SLOT - 1] = '\0';            /* 长度 INBOX_SLOT-1 */
+    ph_len = inbox_push(big) && (g_inbox_n == 1) && inbox_take(buf, sizeof(buf))
+          && (strlen(buf) == (size_t)INBOX_SLOT - 1);
+    big[INBOX_SLOT - 1] = 'A';             /* 先把上一个用例截掉的那格补回来 */
+    big[INBOX_SLOT] = '\0';                /* 长度 INBOX_SLOT: 没有 NUL 的位置了 */
+    ph_len &= (inbox_push(big) == 0);
+    ok &= ph_len;
+
+    /* 封顶: 第 INBOX_MAX+1 条拒绝 */
+    g_inbox_n = 0;
+    ph_fill = 1;
+    for (int i = 0; i < INBOX_MAX; i++) ph_fill &= inbox_push("x");
+    ph_fill &= (g_inbox_n == INBOX_MAX) && (inbox_push("溢出") == 0)
+            && (g_inbox_n == INBOX_MAX);   /* 拒绝不动已有队列 */
+
+    /* 空串不入队 */
+    g_inbox_n = 0;
+    ph_fill &= (inbox_push("") == 0) && (inbox_push(NULL) == 0);
+    ok &= ph_fill;
+
+    g_inbox_n = 0;
+    if (!ok) g_pv_fails++;
+    printf("inbox selftest: FIFO/封顶 %d/超长拒绝/take 不丢 [%s] (fifo=%d empty=%d cap=%d len=%d fill=%d)\n",
+           INBOX_MAX, ok ? "OK" : "FAIL", ph_fifo, ph_empty, ph_cap, ph_len, ph_fill);
+}
+
+/* drain 投递顺序: ui_drain_inbox 必须先投 FOLDEND (折上一轮答案的尾块), 再投插话回显 ——
+ * 反了用户会看到"自己的插话插在上一轮答案上面"。两条都走 PostMessage, 由上面的
+ * MyPostMessageW 记进 g_pq, 逐条断言类型 / 角色 / 文本。
+ * gui_on_done 剩下的部分是线程编排 (原地再开一轮、g_running 保持 1), 由 e2e T022
+ * 走真实二进制守护; 这里锁死的是消息契约 —— d46e7f3 的教训: 收尾消息赶在正文入队前,
+ * 同步直调的桩测不出来, 必须像现在这样把投递原样记下来按序查。 */
+static void drain_order_selftest(void) {
+    char buf[INBOX_SLOT];
+    int ok = 1;
+
+    g_pq_n = 0;
+    g_inbox_n = 0;
+    ok &= inbox_push("插一句话");
+    ok &= ui_drain_inbox(buf, sizeof(buf));
+    ok &= (strcmp(buf, "插一句话") == 0);
+    ok &= (g_pq_n == 2);                                   /* 恰好两条投递 */
+    if (ok && g_pq[0].msg != WM_APP_FOLDEND) ok = 0;       /* 先折尾块 */
+    if (ok && g_pq[1].msg != WM_APP_APPEND)  ok = 0;       /* 再回显 */
+    if (ok && g_pq[1].wp  != (WPARAM)CAGENT_ROLE_USER) ok = 0;
+    if (ok && (!g_pq[1].txt || strcmp(g_pq[1].txt, "插一句话\r\n") != 0)) ok = 0;
+    /* txt 是 gui_emit strdup 出来的: 不 pump 的自检要自己放回去 (pq_pump 会 free) */
+    for (int i = 0; i < g_pq_n; i++) if (g_pq[i].txt) free(g_pq[i].txt);
+    g_pq_n = 0;
+
+    /* 队列空: 一条投递都不该有 (空转不能污染输出区) */
+    ok &= (ui_drain_inbox(buf, sizeof(buf)) == 0);
+    ok &= (g_pq_n == 0);
+
+    if (!ok) g_pv_fails++;
+    printf("drain order selftest: FOLDEND -> APPEND(USER) [%s]\n", ok ? "OK" : "FAIL");
+}
+
 int main(void) {
     enable_dpi_awareness();
     LoadLibraryW(L"Msftedit.dll");     /* 注册 RICHEDIT50W 控件类 */
@@ -666,8 +759,11 @@ int main(void) {
                (long)p1.dxStartIndent, (long)p2.dxStartIndent);
     }
 
-    /* 回放自检放最后 —— 它会清空历史框并重置块表, 前面那些检查都还要用当前内容 */
+    /* 回放自检放最后 —— 它会清空历史框并重置块表, 前面那些检查都还要用当前内容。
+     * inbox/drain 是纯逻辑与投递契约, 不碰文档内容, 排在它前面。 */
     note_split_selftest();
+    inbox_selftest();
+    drain_order_selftest();
     replay_selftest();
 
     ui_fold_reset();

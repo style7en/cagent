@@ -20,6 +20,7 @@
 #define ID_WS_BTN   1013   /* 浏览按钮 */
 #define ID_SESS_BTN 1014   /* 加载会话按钮 */
 #define ID_STATUS   1015   /* 状态栏: 显示模型此刻在做什么 (等待响应/生成中/执行工具/重试中) */
+#define ID_STOP     1016   /* 停止按钮: 与发送彻底分开 (见 wndproc.h 的插话设计) */
 #define ID_SESS_LB  2001   /* 会话列表 ListBox */
 #define ID_SESS_OK  2002   /* 载入 */
 #define ID_SESS_CAN 2003   /* 取消 */
@@ -200,8 +201,25 @@ static void md_feed(const WCHAR *w);
 static long md_flush(void);
 static int  md_pending(void);
 
+/* ===== 插话排队 (运行中发送的消息) =====
+ * 主流 agent (Claude Code / Codex / Cursor) 的"边跑边打字": 模型思考/执行期间用户照旧
+ * 能输入, 按下发送**不打断当前轮**, 消息进队; 当前轮正常结束后自动开下一轮发给模型。
+ * 停止是独立按钮/Esc 的职责, 与发送彻底分开 —— 所以输入框运行中也从不禁用。
+ *
+ * 容量与槽位: 8 条封顶 (一般插话一次一条, 8 条已是极端); 单槽 64KB —— 聊天输入到这个
+ * 量级已是病态, 再长拒绝入队 (文字留在输入框, 不静默截断用户的指令)。
+ * 不用 BUFSZ(1MB) 当槽位: 8 条就是 8MB 静态缓冲, 而 BUFSZ 是给 messages 整体用的。
+ *
+ * 锁: push 在 UI 线程 (发送按钮), take 在工作线程 (gui_on_done 的 drain), 必须互斥。
+ * SRWLOCK 可静态初始化, 与 log.h 的 g_log_lock 同一手法。 */
+#define INBOX_MAX  8
+#define INBOX_SLOT (64 * 1024)
+static char g_inbox[INBOX_MAX][INBOX_SLOT];
+static int  g_inbox_n;
+static SRWLOCK g_inbox_lock = SRWLOCK_INIT;
+
 /* ===== GUI 状态 ===== */
-static HWND g_hHistory, g_hInput, g_hSend, g_hNew, g_hSess;
+static HWND g_hHistory, g_hInput, g_hSend, g_hStop, g_hNew, g_hSess;
 static void show_session_dialog(HWND owner);
 static void show_about(HWND owner);
 static HWND g_hCfg[3];                 /* [url, key, model] */

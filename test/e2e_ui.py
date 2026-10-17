@@ -46,7 +46,8 @@ SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
 BI_RGB = 0
 
-ID_HISTORY, ID_INPUT, ID_SEND = 1001, 1002, 1003
+ID_HISTORY, ID_INPUT, ID_SEND, ID_STOP = 1001, 1002, 1003, 1016
+ID_STATUS = 1015                            # 状态栏: 重试等瞬时状态在这里, 不在输出区
 ID_NEW_BTN, ID_CFG_BASE = 1004, 1005          # cfg: 1005 url, 1006 key, 1007 model
 ID_WS_EDIT = 1012
 
@@ -218,7 +219,7 @@ class App:
             r = RECT()
             user32.GetWindowRect(h, byref(r))
             self.ctrls[cid] = (h, r)
-        return ID_INPUT in self.ctrls and ID_SEND in self.ctrls
+        return ID_INPUT in self.ctrls and ID_SEND in self.ctrls and ID_STOP in self.ctrls
 
     def activate(self):
         user32.ShowWindow(self.hwnd, 9)   # SW_RESTORE
@@ -331,6 +332,9 @@ class App:
         buf = ctypes.create_unicode_buffer(cap)
         n = user32.SendMessageTimeoutW(h, WM_GETTEXT, cap, buf, 2, 2000, None)
         return buf.value if n is not None else ""
+
+    def enabled(self, cid):
+        return bool(user32.IsWindowEnabled(self.ctrls[cid][0]))
 
     # ---- 截图 (PrintWindow -> BMP 存档) ----
     def screenshot(self, fname):
@@ -492,37 +496,44 @@ def T005_并行工具调用(app):
 
 @case("drip")
 def T006_点停止_取消会话(app):
-    """慢流期间点[停止] -> (已取消) -> 按钮复位"""
+    """慢流期间点[停止]按钮 -> (已取消) -> 两枚按钮各自复位;
+    发送按钮全程是[发送], 运行中不再被劫持成[停止]"""
     app.send_message("慢慢说")
     time.sleep(1.5)
-    assert app.text(ID_SEND) == "停止", "运行中按钮应显示[停止]"
-    app.click(ID_SEND)
+    assert app.text(ID_STOP) == "停止", "运行中独立停止按钮应点亮"
+    assert app.enabled(ID_STOP), "运行中停止按钮应可用"
+    assert app.text(ID_SEND) == "发送", "运行中发送按钮应保持[发送] (插话语义)"
+    app.click(ID_STOP)
     app.wait_hist("已取消", timeout=30)
-    app.wait(lambda: app.text(ID_SEND) == "发送", 10, "取消后按钮未复位")
+    app.wait(lambda: app.text(ID_STOP) == "停止" and not app.enabled(ID_STOP), 10,
+             "取消后停止按钮未复位 (文本与禁用态)")
+    app.wait(lambda: app.text(ID_SEND) == "发送", 10, "取消后发送按钮未复位")
 
 
 @case("err500x2")
 def T007_服务端500重试后成功(app):
-    """500×2 -> 指数退避 -> 第 3 次成功; 界面有[服务端错误]提示"""
+    """500×2 -> 指数退避 -> 第 3 次成功; 重试状态走**状态栏** (状态栏重构:
+    瞬时状态属于"此刻在做什么", 不再进输出区污染对话)"""
     t0 = time.time()
     app.send_message("重试我")
+    # 退避窗口内状态栏文案可见 (2s/4s), 轮询抓取 —— 收尾后它会变回"就绪"
+    app.wait(lambda: "服务端错误" in app.text(ID_STATUS), 10, "状态栏未提示服务端错误重试")
     app.wait_hist("第三次尝试成功", timeout=40)
     log = app.log_text()
     assert log.count("[http] 瞬时错误重试") == 2, "应重试 2 次: %s" % log[-600:]
-    assert "服务端错误" in app.text(ID_HISTORY), "界面应提示服务端错误重试"
     assert mock_count("err500x2") == 3
     assert time.time() - t0 > 5, "退避间隔应累计 >5s (2s+4s)"
 
 
 @case("err429_ra")
 def T008_限流429_尊重RetryAfter(app):
-    """429 + Retry-After: 8 -> 等待 8s (服务端说了算) -> 恢复"""
+    """429 + Retry-After: 8 -> 等待 8s (服务端说了算) -> 恢复; 状态栏提示[被限流]"""
     app.send_message("限流我")
+    app.wait(lambda: "被限流" in app.text(ID_STATUS), 15, "状态栏未提示限流重试")
     app.wait_hist("限流恢复后的回复", timeout=45)
     log = app.log_text()
     assert "wait=8000" in log, "未按 Retry-After 等 8s: %s" % log[-600:]
     assert "ra=8" in log
-    assert "请求限流" in app.text(ID_HISTORY), "界面应提示[请求限流]"
 
 
 @case("err429_quota")
@@ -552,10 +563,10 @@ def T011_鉴权失败401(app):
 
 @case("trunc")
 def T012_流截断触发重试(app):
-    """200 但无 [DONE] -> 判定流中断 -> 重试拿全量"""
+    """200 但无 [DONE] -> 判定流中断 -> 重试拿全量; 状态栏提示[响应流中断]"""
     app.send_message("截断我")
+    app.wait(lambda: "响应流中断" in app.text(ID_STATUS), 10, "状态栏未提示流中断重试")
     app.wait_hist("重试后拿到完整回复", timeout=40)
-    assert "响应流中断" in app.text(ID_HISTORY)
     assert mock_count("trunc") == 2
 
 
@@ -601,15 +612,19 @@ def T015_超大输入完整送达(app):
 
 
 @case("drip")
-def T016_连按回车_不重复发送(app):
-    """快速两次回车: 第一次启动会话, 第二次命中 g_running 走取消路径;
-    关键断言: 绝不产生第二次请求 (防双发)"""
+def T016_连按回车_空输入不重复发送(app):
+    """快速两次回车: 第一次启动会话并清空输入框, 第二次框已空 -> 无事可做;
+    关键断言: 绝不产生第二次请求 (防双发), 也绝不误取消 (无[已取消])"""
     app.click_input_and_type("连按回车")
     app.press_enter()
     app.press_enter()
-    app.wait_hist("已取消", timeout=30)
-    app.wait(lambda: app.text(ID_SEND) == "发送", 10, "取消后按钮未复位")
+    time.sleep(1.5)
     assert mock_count("drip") == 1, "连按回车导致重复发送, 请求 %d 次" % mock_count("drip")
+    hist = app.text(ID_HISTORY)
+    assert "已取消" not in hist, "运行中回车误走了取消路径"
+    assert app.text(ID_SEND) == "发送", "空输入入队不应改变按钮: %r" % app.text(ID_SEND)
+    app.wait_hist("慢慢输出", timeout=30)
+    app.wait(lambda: app.text(ID_SEND) == "发送", 10, "按钮未复位")
 
 
 @case("bigargs")
@@ -631,27 +646,29 @@ def T017_大参数工具_不截断(app):
 
 @case("resetconn")
 def T018_服务端断开连接_网络类重试(app):
-    """请求发出后服务端一字节不回直接断连 -> 网络类错误 -> 退避重试成功"""
+    """请求发出后服务端一字节不回直接断连 -> 网络类错误 -> 退避重试成功;
+    状态栏提示[网络错误]"""
     t0 = time.time()
     app.send_message("断我")
+    app.wait(lambda: "网络错误" in app.text(ID_STATUS), 10, "状态栏未提示网络错误重试")
     app.wait_hist("断线重连后的回复", timeout=45)
     log = app.log_text()
     assert "[http] 瞬时错误重试" in log, "断连未被当作可重试错误: %s" % log[-600:]
-    assert "网络瞬时错误" in app.text(ID_HISTORY), "界面应提示[网络瞬时错误]"
     assert mock_count("resetconn") == 2
     assert time.time() - t0 > 1.5, "应有退避等待 (基数 2s)"
 
 
 @case("trunc")
 def T019_半截回复_重试前回删(app):
-    """流式上屏的半截内容必须在重试前被回删: 最终历史无残留、无重复段"""
+    """流式上屏的半截内容必须在重试前被回删: 最终历史无残留、无重复段;
+    重试提示在状态栏 (响应流中断)"""
     app.send_message("截断我")
+    app.wait(lambda: "响应流中断" in app.text(ID_STATUS), 10, "状态栏未提示流中断重试")
     app.wait_hist("重试后拿到完整回复", timeout=40)
     hist = app.text(ID_HISTORY)
     assert "半截回复" not in hist, "半截内容未被回删, 仍残留在历史区"
     assert hist.count("重试后拿到完整回复") == 1, "完整回复出现 %d 次 (重试拼接重复)" % \
         hist.count("重试后拿到完整回复")
-    assert "响应流中断" in hist
     assert mock_count("trunc") == 2
 
 
@@ -663,7 +680,7 @@ def T020_窗口拉伸后布局与功能(app):
     wr = app.window_rect()
     w_min, h_min = wr.right - wr.left, wr.bottom - wr.top
     assert w_min >= 560 and h_min >= 400, "极小尺寸未被钳制: %dx%d" % (w_min, h_min)
-    for cid in (ID_INPUT, ID_SEND, ID_HISTORY):
+    for cid in (ID_INPUT, ID_SEND, ID_STOP, ID_HISTORY):
         h, r = app.ctrls[cid]
         assert r.right > r.left and r.bottom > r.top, "控件 %d 退化为零面积" % cid
         assert r.left >= wr.left and r.right <= wr.right and \
@@ -672,7 +689,7 @@ def T020_窗口拉伸后布局与功能(app):
     app.wait_hist("第二次对话回复 OK", timeout=20)
     app.resize(1600, 1000)
     wr = app.window_rect()
-    for cid in (ID_INPUT, ID_SEND, ID_HISTORY):
+    for cid in (ID_INPUT, ID_SEND, ID_STOP, ID_HISTORY):
         h, r = app.ctrls[cid]
         assert r.left >= wr.left and r.right <= wr.right and \
                r.top >= wr.top and r.bottom <= wr.bottom, "拉大后控件 %d 越界" % cid
@@ -693,9 +710,9 @@ def T021_DPICHANGED_四步链路(app):
     expected = 720 * 96 // 96 + 40      # dp(720)@96 + 外框余量
     assert abs(w - expected) < 80, "DPI 切到 96 后窗口宽 %d, 期望 ≈%d" % (w, expected)
     assert "[ui] DPI 切换" in app.log_text(), "日志无 DPI 切换记录"
-    assert ID_INPUT in app.ctrls and ID_SEND in app.ctrls, "DPI 切换后控件丢失"
+    assert ID_INPUT in app.ctrls and ID_SEND in app.ctrls and ID_STOP in app.ctrls, "DPI 切换后控件丢失"
     wr = app.window_rect()
-    for cid in (ID_INPUT, ID_SEND, ID_HISTORY):
+    for cid in (ID_INPUT, ID_SEND, ID_STOP, ID_HISTORY):
         h, cr = app.ctrls[cid]
         assert cr.left >= wr.left and cr.right <= wr.right and \
                cr.top >= wr.top and cr.bottom <= wr.bottom, "DPI 切换后控件 %d 越界" % cid
@@ -703,6 +720,31 @@ def T021_DPICHANGED_四步链路(app):
     app.wait_hist("DPI 切换后的回复", timeout=20)
     assert mock_count("chat3") == 1
     app.screenshot("T021_dpi96.bmp")
+
+
+@case("interject")
+def T022_插话排队_本轮结束自动发出(app):
+    """插话 (运行中继续输入): 发送 = 入队不打断, 按钮显示[发送 (1)]、输入框清空;
+    本轮结束后插话按 FIFO 回显并自动开下一轮, 最终回复抵达, 按钮复位。
+    停止按钮全程是独立分工, 不参与本路径。"""
+    app.send_message("第一轮慢慢说")
+    time.sleep(1.2)
+    assert app.text(ID_SEND) == "发送", "入队前按钮不应带计数: %r" % app.text(ID_SEND)
+    app.click_input_and_type("插一句话")
+    app.click(ID_SEND)
+    assert app.text(ID_SEND) == "发送 (1)", "插话入队后按钮应计数: %r" % app.text(ID_SEND)
+    assert app.text(ID_INPUT) == "", "入队后输入框应清空"
+    app.wait_hist("插队的消息已收到并回复", timeout=30)
+    hist = app.text(ID_HISTORY)
+    assert "插一句话" in hist, "插话未回显到历史区"
+    assert "慢慢输出" in hist, "第一轮回复应完整上屏 (排队不应打断它)"
+    body = mock_last_body("interject")
+    last_user = [m for m in body["messages"] if m.get("role") == "user"][-1]
+    assert "插一句话" in last_user["content"], \
+        "排队消息未作为下一轮 user 消息发出: %s" % json.dumps(body, ensure_ascii=False)[-300:]
+    assert mock_count("interject") == 2, "插话应触发第二次请求, 实际 %d" % mock_count("interject")
+    app.wait(lambda: app.text(ID_SEND) == "发送", 10, "插话发完按钮未复位")
+    app.screenshot("T022_interject.bmp")
 
 
 # ================================================================ 运行器
