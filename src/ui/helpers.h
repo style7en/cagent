@@ -269,10 +269,15 @@ static long ui_replace_styled(HWND h, long start, long end, const WCHAR *w, int 
 /* ===== 可折叠块 (思考过程 / 工具调用) =====
  * 数据与契约见 ui/state.h 的 UiFoldBlock。这里只放操作。 */
 
+/* 释放一个块持有的所有正文副本。三个丢弃路径 (reset / drop_oldest / trim_from) 共用 ——
+ * 收起态的块把正文 malloc 在 segs[].text 里, 漏一条就是一次内存泄漏。 */
+static void ui_fold_free_block(UiFoldBlock *b) {
+    for (int s = 0; s < b->n_segs; s++) { free(b->segs[s].text); b->segs[s].text = NULL; }
+    b->n_segs = 0;
+}
+
 static void ui_fold_reset(void) {
-    for (int i = 0; i < g_fold_n; i++)
-        for (int s = 0; s < g_folds[i].n_segs; s++)
-            free(g_folds[i].segs[s].text);
+    for (int i = 0; i < g_fold_n; i++) ui_fold_free_block(&g_folds[i]);
     g_fold_n = 0;
 }
 
@@ -280,13 +285,18 @@ static void ui_fold_reset(void) {
  * head_cp 在这里**实测**而不是写死常量 —— 工具块的标题行长度随工具名变化,
  * 而且"一个段落标记算几个 cp"这件事 RichEdit 各版本口径不一, 实测比猜可靠:
  * 这个值错了, 该块正文的起点就全偏。 */
-/* 丢掉**最老的**一个块 (索引表满了的时候)。
- * 必须释放它持有的正文副本: 收起态的块把正文 malloc 在 segs[].text 里, 直接 memmove
- * 覆盖会把它漏掉 —— 长会话每挤掉一块就漏一份, 会话越长漏得越多。 */
+/* 丢掉**最老的**一个块 (索引表满了的时候)。三条丢弃路径都走 ui_fold_free_block 释放正文。
+ *
+ * 两条写进注释的边界 (都是可接受的权衡, 但必须写明):
+ * ① 点击被丢块的标题行会命中**相邻剩余块**: 命中测试按"最近行"取块, 被丢块的标题还
+ *    在文档里但已不在索引里, 点它会把旁边那块切换了。旧行为是命中它自己 —— 概率低
+ *    (只发生在滚回几屏之前、且正好点到被丢块的标题), 但行为确实变了。
+ * ② 被丢块若是**展开态** (用户特意点开过、user_toggled), 它的正文会永久摊开且不可再
+ *    收。"老块通常已是收起态"只是大概率, 不是保证 —— 滚回去把早期块展开再聊长会话,
+ *    就可能踩到。 */
 static void ui_fold_drop_oldest(void) {
     if (g_fold_n <= 0) return;
-    UiFoldBlock *b = &g_folds[0];
-    for (int s = 0; s < b->n_segs; s++) { free(b->segs[s].text); b->segs[s].text = NULL; }
+    ui_fold_free_block(&g_folds[0]);
     memmove(g_folds, g_folds + 1, (size_t)(g_fold_n - 1) * sizeof(UiFoldBlock));
     g_fold_n--;
 }
@@ -337,7 +347,7 @@ static void ui_fold_extend(int role, long cp_added) {
 static void ui_fold_trim_from(long cp) {
     while (g_fold_n > 0 && g_folds[g_fold_n - 1].cp_head >= cp) {
         UiFoldBlock *b = &g_folds[--g_fold_n];
-        for (int s = 0; s < b->n_segs; s++) free(b->segs[s].text);
+        ui_fold_free_block(b);
     }
 }
 
@@ -390,7 +400,8 @@ static long ui_fold_cut_start(const UiFoldBlock *b) {
  * 为什么需要这个"兜底重设": 折叠/展开都是在**段边界**上插入或删除内容, 而 RichEdit 对
  * "插入点落在段边界时算作哪一段"的处理会让相邻段落的缩进/留白被带跑 —— 实测展开第 N 块
  * 之后, 第 N+1 块的标题行缩进从 0 变成 240 twips (正是输出块的缩进值)。
- * ui_insert_styled 里已经存/恢复了一道, 但规则太绕、容易漏; 块数有上限 (64), 直接按角色
+ * ui_insert_styled 里已经存/恢复了一道, 但规则太绕、容易漏; 块数有上限 (UI_FOLD_MAX,
+ * 满了挤掉最老的, 见 ui_fold_new), 直接按角色
  * 把标题行重设一遍, 比逐处推演 RichEdit 的继承行为可靠得多。
  * 只动 SPACEBEFORE/SPACEAFTER/STARTINDENT (见 ui_para_for_role), 不碰行距。 */
 static void ui_fold_refresh_heads(void) {

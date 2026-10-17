@@ -532,6 +532,12 @@ static void fold_cap_selftest(void) {
                        ",{\"role\":\"tool\",\"content\":\"out %d\"}", i, i, i);
         fputs(",{\"role\":\"assistant\",\"content\":\"done\"}]}", f);
         fclose(f);
+    } else {
+        /* 写不出临时文件就提前收场: 否则会走到"缺文件静默早退", 把 IO 故障误诊为
+         * 折叠机制失效 (断言虽不崩溃, 报告却会指错方向)。 */
+        g_pv_fails++;
+        printf("fold cap selftest: 会话文件写不出 (%s) [FAIL]\n", path);
+        return;
     }
 
     g_active_ws[0] = '\0';
