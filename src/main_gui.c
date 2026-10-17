@@ -9,6 +9,7 @@
  *   dpi         高 DPI: per-monitor v2 感知 + 统一缩放 dp()/dp_at() (必须排在布局模块之前)
  *   hooks       宿主钩子实现: 输出投递 / 一轮结束 / 配置同步
  *   helpers     UI 辅助: Edit 读写(UTF-8) 与 RichEdit 分角色追加
+ *   md          AI 正文的简单 Markdown 渲染 (依赖 helpers 的 ui_insert_ex)
  *   task        启动一轮 Agent: 配置校验 / 工作目录 / 线程派发
  *   wndproc     布局 / 输入框子类 / 主窗口过程 / 历史框子类
  *   session_dlg 会话选择对话框: 枚举 / 自绘列表 / 载入
@@ -32,6 +33,7 @@
 #include "ui/dpi.h"          /* dp() 被下面的布局模块使用, 必须排在其前 */
 #include "ui/hooks.h"
 #include "ui/helpers.h"
+#include "ui/md.h"          /* 依赖 helpers 的 ui_insert_ex, 必须排在其后 */
 #include "ui/task.h"
 #include "ui/wndproc.h"
 #include "ui/session_dlg.h"

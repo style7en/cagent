@@ -108,6 +108,7 @@ static void sess_apply_selected(const char *path) {
     SetWindowTextW(g_hHistory, L"");
     g_last_role = -1;        /* 清空后追加状态作废 (见 ui/state.h) */
     g_last_no_lf = 0;
+    md_reset();              /* Markdown 行缓冲/围栏状态跟着作废 */
     ui_fold_reset();         /* 折叠块的位置索引也跟着作废 */
     /* 清空会把段落格式一并复位(实测行距会跳回 RichEdit 的自然行距, 比我们设的松),
      * 缩放比也可能被重置 —— 所以紧接着把这两项重新下发一次。 */

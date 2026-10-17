@@ -461,6 +461,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetWindowTextW(g_hHistory, L"");
                 g_last_role = -1;        /* 清空后追加状态作废 */
                 g_last_no_lf = 0;
+                md_reset();              /* Markdown 行缓冲/围栏状态跟着作废 */
                 ui_fold_reset();         /* 折叠块的位置索引也跟着作废 */
                 emit_note("(新会话已创建。旧会话文件保留, 可通过 [加载会话] 恢复)\r\n");
                 SetFocus(g_hInput);
@@ -571,6 +572,9 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_APP_STREAM) {
+        /* 新分段 / 回删都要废掉 Markdown 行缓冲: 缓冲里是没上屏的半行, 文档刚被
+         * 改写, 它接着拼上去就是错文本 (旧答案的残尾)。回删分支还要连带围栏状态。 */
+        md_reset();
         if (wp == 1) {
             g_stream_chars = 0;
         } else if (g_stream_chars > 0) {
@@ -591,8 +595,11 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_APP_FOLDEND) {
-        /* 一轮结束: 把最后一个块也按默认收起 (用户手动展开过的不动)。
+        /* 一轮结束: 先把 Markdown 行缓冲里的半行落地 (它是本段答案的结尾, 不落地
+         * 就永远停在缓冲里 —— 用户看不到, 历史会话回放时也对不上), 再把最后一个块
+         * 按默认收起 (用户手动展开过的不动)。
          * 折叠会让文档变短, 此时滚动位置可能悬在半空, 顺手滚回末尾。 */
+        g_stream_chars += md_flush();
         ui_fold_collapse(g_fold_n - 1);
         SendMessageW(h, WM_VSCROLL, SB_BOTTOM, 0);
         return 0;

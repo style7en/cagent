@@ -88,11 +88,16 @@ TEST_TARGET = cagent_test.exe
 TEST_CFLAGS = -Isrc -Itest
 TEST_LDFLAGS = -lcomctl32 -lwinhttp -lcrypt32 -lshell32 -lole32 -luuid
 
+# Markdown 渲染器边界单测: 桩掉 SendMessageW, 不建窗口 (无 UI 断言)
+# -Wno-unused-*: 聚合进来的 UI 模块大部分函数本测试用不到, 与 preview 同理
+MDTEST_SRC = test/md_test.c
+MDTEST_TARGET = md_test.exe
+
 # 输出区排版的离屏预览: 把角色样式渲染成 BMP, 人眼检查 (验证工具, 不进产品二进制)
 PREVIEW_SRC = test/ui_preview.c
 PREVIEW_TARGET = ui_preview.exe
 
-.PHONY: all clean test preview
+.PHONY: all clean test mdtest preview
 
 all: $(GUI_TARGET)
 
@@ -116,6 +121,14 @@ test: $(TEST_TARGET)
 
 $(TEST_TARGET): $(TEST_SRC) $(TEST_HDRS) $(CORE_HDRS)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) -o $@ $(TEST_SRC) $(LDFLAGS) $(TEST_LDFLAGS)
+
+# make mdtest: 跑 Markdown 边界单测 (失败则 make 返回非 0)
+mdtest: $(MDTEST_TARGET)
+	./$(MDTEST_TARGET); rc=$$?; rm -f $(MDTEST_TARGET); exit $$rc
+
+$(MDTEST_TARGET): $(MDTEST_SRC) $(CORE_HDRS) $(UI_HDRS)
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable \
+	      -Isrc -o $@ $(MDTEST_SRC) $(LDFLAGS) $(TEST_LDFLAGS) -lgdi32 -luser32
 
 # make preview: 渲染输出区排版 -> preview_out.bmp (人工看配色/缩进/段间距对不对)
 # -Wno-unused-*: 预览程序直接聚合整套 UI 代码, 但只用到其中一小部分 —— 单 TU 下其余

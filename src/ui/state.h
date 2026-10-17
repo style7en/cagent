@@ -188,6 +188,18 @@ static int    ui_fold_hit(POINTL pt);
 static void   ui_fold_toggle(int idx);
 static void   ui_fold_trim_from(long cp);
 
+/* ===== Markdown 渲染 (只作用于 AI 正式答案) =====
+ * 前向声明, 实现见 ui/md.h —— 它排在 helpers.h 之后 (要用那里的 ui_insert_ex),
+ * 而 helpers.h 的 do_append 又要调这里, 所以走声明而不是调整 include 顺序。
+ *   md_reset   清空行缓冲与围栏状态: 重试回删 / 新分段 / 清空历史框之后必须调
+ *   md_feed    喂一段 AI 文本: 完整行立即解析上屏, 半行留在缓冲里
+ *   md_flush   把缓冲里的半行落地 (不补换行), 返回插入的 cp 数
+ *   md_pending 行缓冲里有没有未落地的半行 */
+static void md_reset(void);
+static void md_feed(const WCHAR *w);
+static long md_flush(void);
+static int  md_pending(void);
+
 /* ===== GUI 状态 ===== */
 static HWND g_hHistory, g_hInput, g_hSend, g_hNew, g_hSess;
 static void show_session_dialog(HWND owner);

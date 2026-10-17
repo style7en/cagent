@@ -21,7 +21,8 @@
 #include "../src/main_gui.c"
 
 /* 示例对话: 覆盖全部角色, 一张图就能看出配色、缩进、留白是否成体系。
- * 文案贴近真实运行时的样子 (含思考块、工具调用的两行结构、拒绝执行、错误提示)。 */
+ * 文案贴近真实运行时的样子 (含思考块、工具调用的两行结构、拒绝执行、错误提示),
+ * 末尾附一段正式答案的 Markdown 渲染 (行级/行内标记、围栏块 —— 只有 AI 角色参与解析)。 */
 static const struct { const char *text; int role; } kSample[] = {
     { "\r\n分析当前项目\r\n",                                          CAGENT_ROLE_USER },
     { "思考中…\r\n",                                                  CAGENT_ROLE_NOTE },
@@ -44,6 +45,19 @@ static const struct { const char *text; int role; } kSample[] = {
     { "× edit_file\r\n",                                              CAGENT_ROLE_ERR },
     { "未执行: arguments 超过 8KB 上限\r\n",                           CAGENT_ROLE_ERR },
     { "(请求限流, 等待后重试...)\r\n",                                 CAGENT_ROLE_NOTE },
+    /* ---- Markdown 渲染: 只有正式答案 (AI) 参与解析, 旁白/工具调用不参与 ---- */
+    { "## 构建方式\r\n",                                            CAGENT_ROLE_AI },
+    { "\r\n",                                                      CAGENT_ROLE_AI },
+    { "项目用 **MinGW-w64 + make** 构建, *单编译单元*, 零第三方依赖。\r\n", CAGENT_ROLE_AI },
+    { "关键命令是 `make` 与 `make test`, 见 [仓库说明](https://example.com)。\r\n", CAGENT_ROLE_AI },
+    { "字面星号写作 \\*esc\\*, 不当斜体; ``a`b`` 反引号按 CommonMark 配对。\r\n", CAGENT_ROLE_AI },
+    { "\r\n",                                                      CAGENT_ROLE_AI },
+    { "> 引用: 输出区底色 RGB(247,247,247) 上, 标记灰不得浅于 110。\r\n", CAGENT_ROLE_AI },
+    { "1. 折叠靠删文本/插回模拟\r\n2. 位置一律用 cp\r\n",              CAGENT_ROLE_AI },
+    { "\r\n",                                                      CAGENT_ROLE_AI },
+    { "---\r\n",                                                   CAGENT_ROLE_AI },
+    { "```make\r\nall: cagent.exe\r\n\t$(MAKE) -C src test\r\n```\r\n", CAGENT_ROLE_AI },
+    { "\r\n**粗体套 `代码`** 与 ***粗斜*** 也要分清。\r\n",           CAGENT_ROLE_AI },
 };
 
 /* 32 位 DIB -> BMP 文件。DIB section 用**正高度**(自下而上), 与 BMP 文件的内存布局
@@ -419,11 +433,12 @@ int main(void) {
     dpi_init();
     g_dpi = dpi_system();              /* 与真实运行一致: 按本机主屏 DPI 渲染 */
 
-    /* 客户区 720x500 逻辑像素 (WS_POPUP: 窗口区 = 客户区)。
-     * 尺寸按逻辑像素写, 物理尺寸随本机 DPI 走 —— 200% 屏上就是 1440x1000 真实像素,
+    /* 客户区 720x780 逻辑像素 (WS_POPUP: 窗口区 = 客户区)。
+     * 尺寸按逻辑像素写, 物理尺寸随本机 DPI 走 —— 200% 屏上就是 1440x1560 真实像素,
      * 于是这张图看到的就是用户在 200% 下看到的密度。
-     * 高度要够装下整段示例: 装不下的部分会被滚出可视区, 预览就看不全了。 */
-    int W = dp(720), H = dp(500);
+     * 高度要够装下整段示例 (含末尾的 Markdown 板块): 装不下的部分会被滚出可视区,
+     * 预览就看不全了。 */
+    int W = dp(720), H = dp(820);
 
     WNDCLASSW wc;
     memset(&wc, 0, sizeof(wc));
@@ -502,6 +517,10 @@ int main(void) {
     /* 置顶显示, 免得被别的窗口盖住 —— 抓屏取的是屏幕上真实画出来的像素 */
     SetWindowPos(hwnd, HWND_TOPMOST, 40, 40, W, H, SWP_SHOWWINDOW);
     UpdateWindow(hwnd);
+
+    /* 展开全部块之后滚位停在"收起态文档"的底部 (ui_fold_toggle 恢复的是展开前的滚位),
+     * 末尾几行会滚出可视区。出图前滚到底, 预览才看得全。 */
+    SendMessageW(g_hHistory, WM_VSCROLL, SB_BOTTOM, 0);
 
     render_to_bmp(g_hHistory, "preview_out.bmp", W, H);
 
