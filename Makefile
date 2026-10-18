@@ -100,10 +100,9 @@ MDTEST_TARGET = $(OUT_DIR)/md_test.exe
 PREVIEW_SRC = test/ui_preview.c
 PREVIEW_TARGET = $(OUT_DIR)/ui_preview.exe
 
-# test/out 产物目录: 链接前先存在 (order-only 依赖, 目录 mtime 变化不触发重编)
-$(OUT_DIR):
-	@mkdir -p $@
-
+# 注意: 目录创建规则**必须放在 all 之后** —— make 的默认目标是文件里第一个
+# target, 放在变量区会把默认目标从 all(cagent.exe) 抢走 (实测: `make` 只建了
+# test/out 就收工)。target 规则只依赖它, 用 order-only 依赖调用。
 .PHONY: all clean test mdtest preview
 
 all: $(GUI_TARGET)
@@ -118,6 +117,10 @@ $(GUI_RES): res/app.rc res/app.ico res/app.manifest $(CORE_HDRS)
 
 $(GUI_TARGET): $(GUI_SRC) $(CORE_HDRS) $(UI_HDRS) $(GUI_RES)
 	$(CC) $(CFLAGS) -o $@ $< $(GUI_RES) $(LDFLAGS) $(GUI_LDFLAGS)
+
+# test/out 产物目录: 链接前先存在 (order-only 依赖, 目录 mtime 变化不触发重编)
+$(OUT_DIR):
+	@mkdir -p $@
 
 # make test: 编译并运行回归测试 (失败则 make 返回非 0)
 # make test: 跑离线回归测试, **退出码 = 失败数**。
