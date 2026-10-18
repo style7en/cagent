@@ -17,7 +17,10 @@ static void ui_history_pad(HWND h, int w, int hh) {
     rc.right  = w  - dp(10);
     rc.bottom = hh - dp(8);
     SendMessageW(h, EM_SETRECT, 0, (LPARAM)&rc);
-    /* 同样不带 erase: EM_SETRECT 会全文档重排, 重排后重画一帧即可, 擦背景只会添空窗 */
+    /* 不带 erase: EM_SETRECT 会全文档重排, 重排后重画一帧即可, 擦背景只会添空窗。
+     * 注: 试过把这步包进 WM_SETREDRAW 批 —— **无效**: RichEdit 对 EM_SETRECT 的
+     * 重排强制同步重画, 不吃重绘开关 (ui_hist_flicker_probe.c 实测包不包都是
+     * 5 次重画 + 相同的帧间漂移), 所以保持原样, 别留假装有用的批。 */
     RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
@@ -86,11 +89,62 @@ static void layout(HWND hwnd) {
 
 /* ===== 字体与行距 (跨显示器 DPI 变化时要整体重做) ===== */
 
+/* 字体的 em 高折算成 CHARFORMAT 的 yHeight (twips)。
+ * 为什么不能直接 "像素 * 1440 / dpi": yHeight 是 **em 高**, 而字体是按**格高**
+ * (CreateFontW 的 lfHeight = dp(px)) 建的 —— 实测 (test/ui_dpi_style_probe.c):
+ * 36px 格高的 YaHei, RichEdit 由 WM_SETFONT 推导出的默认 yHeight 是 210 twips
+ * (= em 28px), 而"像素*1440/dpi"公式给 270, 大 27% (与本项目"不给 run 写死
+ * CFM_SIZE"是同一条教训的反面: em≠格)。
+ * em 的量法也实测过: 36px 字体的 TEXTMETRIC 是 tmHeight=36 / tmInternalLeading=8,
+ * **tmHeight - tmInternalLeading = 28** 与 RichEdit 的推导一致 (tmAscent+tmDescent
+ * 给 36 = 格高, 不对; 那是 internal leading 把格子撑高的部分)。
+ * DC 用屏幕 DC: 字体度量是**像素**值, 与 DC 的 DPI 无关; 折算倍率用 g_dpi
+ * (字体本来就是按目标窗口的 g_dpi 建的)。 */
+static LONG ui_font_em_twips(HFONT f) {
+    if (!f) return 0;
+    LONG em = 0;
+    HDC dc = GetDC(NULL);
+    if (dc) {
+        HGDIOBJ old = SelectObject(dc, f);
+        TEXTMETRICW tm;
+        if (GetTextMetricsW(dc, &tm)) em = tm.tmHeight - tm.tmInternalLeading;
+        SelectObject(dc, old);
+        ReleaseDC(NULL, dc);
+    }
+    if (em <= 0) return 0;
+    return (LONG)((LONGLONG)em * 1440 / (g_dpi ? g_dpi : 96));
+}
+
+/* 给输出区设默认字符格式 (字号 + 字体名)。WM_CREATE 与 ui_fonts_rebuild
+ * (跨显示器换字体) 两条路都走这里。**不要对 RichEdit 用 WM_SETFONT**: 实测
+ * (test/ui_dpi_style_probe.c) 它会把全文档每个 run 的字符格式打回默认 ——
+ * bold / 下划线 / 颜色一起丢 (用户消息 7C440C+粗+下划线 -> 纯黑)。症状之所以
+ * 是"某些情况下": DPI 切换只 wipe **切换前**已有的 run, 之后新插入的内容样式
+ * 照常, 于是旧内容集体褪色、新内容正常。
+ * 改用 EM_SETCHARFORMAT(SCF_ALL): 同一探针实测 run 的显式格式**原样保留**,
+ * 默认字号只作用于不写死字号的 run (本项目从不给 run 设 CFM_SIZE, 即全部正文
+ * 都跟着默认走, DPI 缩放正由此而来)。yHeight 按 em 高算, 见 ui_font_em_twips。 */
+static void ui_history_default_font(HWND h) {
+    if (!h || !g_hFontHist) return;
+    CHARFORMAT2W cf;
+    memset(&cf, 0, sizeof(cf));
+    cf.cbSize = sizeof(cf);
+    cf.dwMask  = CFM_SIZE | CFM_FACE;
+    cf.yHeight = ui_font_em_twips(g_hFontHist);
+    wcscpy(cf.szFaceName, CAGENT_UI_FACE);
+    SendMessageW(h, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+    /* WM_SETFONT 的 lParam=TRUE 原本负责重画, 换接口后自己补: 不带 erase */
+    RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
 static BOOL CALLBACK ui_font_cb(HWND h, LPARAM lp) {
     (void)lp;
     /* 输出区用独立字体, 其余控件共用界面字体 */
-    SendMessageW(h, WM_SETFONT,
-                 (WPARAM)(GetDlgCtrlID(h) == ID_HISTORY ? g_hFontHist : g_hFont), TRUE);
+    if (GetDlgCtrlID(h) == ID_HISTORY) {
+        ui_history_default_font(h);
+        return TRUE;
+    }
+    SendMessageW(h, WM_SETFONT, (WPARAM)g_hFont, TRUE);
     return TRUE;
 }
 
@@ -128,6 +182,9 @@ static void ui_para_reflow(HWND h, UINT old_dpi, UINT new_dpi) {
     if (!h || !old_dpi || !new_dpi || old_dpi == new_dpi) return;
     int n = (int)SendMessageW(h, EM_GETLINECOUNT, 0, 0);
     if (n <= 0) return;
+    /* 逐段缩放 = 上千次 EM_SETPARAFORMAT, 每次都可能触发重绘 —— 不批的话 DPI
+     * 切换全程在抽; 批末一次自然重画收尾。行数/选区的查询照常做, 与批无关。 */
+    ui_hist_batch_begin();
     LONG sel_s = 0, sel_e = 0;
     SendMessageW(h, EM_GETSEL, (WPARAM)&sel_s, (LPARAM)&sel_e);
     for (int i = 0; i < n; i++) {
@@ -155,6 +212,7 @@ static void ui_para_reflow(HWND h, UINT old_dpi, UINT new_dpi) {
         SendMessageW(h, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
     }
     SendMessageW(h, EM_SETSEL, sel_s, sel_e);
+    ui_hist_batch_end(0);
 }
 
 /* 收紧历史框行距: 用 PARAFORMAT2 设"精确"行距 = 字身格高 + HIST_LINE_EXTRA,
@@ -168,6 +226,9 @@ static void ui_para_reflow(HWND h, UINT old_dpi, UINT new_dpi) {
  * 所以清空历史框之后必须重新调一次本函数。 */
 static void ui_history_parafmt(HWND h) {
     if (!h) return;
+    /* 全选改行距 = 整文档重排: 与 clear (SetWindowText) 连着跑时两次重画,
+     * 并成一批只出终态一帧。 */
+    ui_hist_batch_begin();
     LONG sel_s = 0, sel_e = 0;
     SendMessageW(h, EM_GETSEL, (WPARAM)&sel_s, (LPARAM)&sel_e);
     SendMessageW(h, EM_SETSEL, 0, -1);
@@ -187,6 +248,7 @@ static void ui_history_parafmt(HWND h) {
     SendMessageW(h, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
     SendMessageW(h, EM_SETSEL, sel_s, sel_e);
     SendMessageW(h, EM_SETMODIFY, FALSE, 0);
+    ui_hist_batch_end(0);   /* 新建/清空路径随后还有别的重画源, 不强行抢一帧 */
 }
 
 /* ===== 输出区字号缩放 (Ctrl + 滚轮) ===== */
@@ -220,10 +282,9 @@ static void ui_history_zoom(HWND hist, int steps) {
     if (n > HIST_LPX_MAX) n = HIST_LPX_MAX;
     if (n == g_hist_lpx) return;                 /* 已到上下限: 不做无谓的缩放 */
     g_hist_lpx = n;
-    SendMessageW(hist, WM_SETREDRAW, FALSE, 0);
+    ui_hist_batch_begin();
     ui_history_zoom_apply(hist);
-    SendMessageW(hist, WM_SETREDRAW, TRUE, 0);
-    RedrawWindow(hist, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    ui_hist_batch_end(1);
 }
 
 /* Ctrl+滚轮 -> 缩放输出区字号; 返回非 0 表示该消息已被消费。
@@ -396,7 +457,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD | WS_VISIBLE | WS_VSCROLL |
             ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
             0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_HISTORY, NULL, NULL);
-        SendMessageW(g_hHistory, WM_SETFONT, (WPARAM)g_hFontHist, TRUE);
+        ui_history_default_font(g_hHistory);   /* 不是 WM_SETFONT, 见该函数注释 */
         ui_history_parafmt(g_hHistory);
         /* 输出区底色略深于输入框(见 state.h 的 HIST_BG)。必须走 EM_SETBKGNDCOLOR ——
          * RichEdit 不是 STATIC, 不会来问 WM_CTLCOLORSTATIC, 那边返回的画刷对它无效。
@@ -741,14 +802,12 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
     }
-    /* Ctrl+滚轮缩放输出区字号; 其余滚轮动作照旧交回原过程(滚动)并补一次重画。
-     * 重画不带 erase: 滚一下擦一次整屏, 快速滚动时会看到底色一闪一闪。 */
+    /* Ctrl+滚轮缩放输出区字号; 其余滚轮动作照旧交回原过程(滚动)。
+     * **滚动/按键不再补全客户区重画** (2026-10-18 第二轮取证): 那次补画是 NULL 矩形
+     * = 整框重绘, 长文档 + 大窗口下一次几十毫秒、跨显示帧, 快速滚动等于把撕裂上屏;
+     * 而滚动本来只需重画新露出来的一两条 (ScrollWindow 位移 + 露条重画), 交给自然
+     * WM_PAINT 就够, 且 RichEdit 自己填背景, 不擦就不会闪。流式追加末尾的
+     * WM_VSCROLL(SB_BOTTOM) 同样只滚动、不补画。 */
     if (msg == WM_MOUSEWHEEL && ui_zoom_wheel(wp)) return 0;
-    if (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL ||
-        msg == WM_KEYDOWN || msg == WM_KEYUP) {
-        LRESULT r = CallWindowProcW(g_oldHistoryProc, h, msg, wp, lp);
-        RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-        return r;
-    }
     return CallWindowProcW(g_oldHistoryProc, h, msg, wp, lp);
 }

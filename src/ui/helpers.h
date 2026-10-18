@@ -502,15 +502,44 @@ static void ui_fold_paint_once(void) {
     RedrawWindow(g_hHistory, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
-/* 折叠/展开 + 重画的完整路径: 整段文档变更包在 WM_SETREDRAW(FALSE) 里, 末尾一次性
- * 同步重画。中间态的 EM_REPLACESEL / EM_SETPARAFORMAT 一步都不会上屏, 用户看到的是
+/* ===== 批量变更: 嵌套计数, 中间帧不上屏 =====
+ * 流式追加 (do_append) 一片 delta 里是 EM_SETSEL/EM_SETCHARFORMAT/EM_REPLACESEL/
+ * EM_SETPARAFORMAT 一串 SendMessage, 外加 EM_SCROLLCARET + WM_VSCROLL(SB_BOTTOM)
+ * 双滚动; 而 HistoryProc 对每个 WM_VSCROLL 还补一次**全客户区** RedrawWindow。
+ * 不批的代价 (ui_hist_flicker_probe.c 实测, 374KB 真实会话): 每片 delta = 2 次
+ * 重画; 每次 EM_SETRECT 重排 = 5 次重画且视图在帧间漂移 (27092→27163px,
+ * resize 时看得见的抽动)。高速流式下输出区等于在持续全量重画, 就是"闪"的体感来源。
+ *
+ * **用计数而不是裸 SETREDRAW**: do_append 里的 ui_fold_collapse 自带一对
+ * SETREDRAW(FALSE/TRUE) (走 ui_fold_set), 内层若再无条件置 TRUE, 批会被提前
+ * 解开, 中间帧照旧上屏 —— 那就白批了。嵌套时内层只增减计数, 最外层关闭时才
+ * 恢复重绘并统一收尾。 */
+static int g_hist_noredraw;
+
+static void ui_hist_batch_begin(void) {
+    if (!g_hHistory) return;                                /* md_test 等无窗口场景 */
+    if (g_hist_noredraw++ == 0) SendMessageW(g_hHistory, WM_SETREDRAW, FALSE, 0);
+}
+
+/* force_paint: 批末是否补一次不带 erase 的同步重画出终态。**恒为 1** ——
+ * 0 这条路堵着 (见 do_append 的注释): SETREDRAW(FALSE) 期间攒下的更新区会被
+ * RichEdit 自己吃掉, 不出现在窗口更新区里, 自然 WM_PAINT 等不来。
+ * 折叠/重排/轮次收尾/流式追加, 一律批末一次同步重画, 与折叠路径同一代价。 */
+static void ui_hist_batch_end(int force_paint) {
+    if (!g_hHistory || g_hist_noredraw == 0) return;
+    if (--g_hist_noredraw > 0) return;                      /* 内层关闭: 交给外层收尾 */
+    SendMessageW(g_hHistory, WM_SETREDRAW, TRUE, 0);
+    if (force_paint) ui_fold_paint_once();
+}
+
+/* 折叠/展开 + 重画的完整路径: 整段文档变更包进批量批, 末尾一次性同步重画。
+ * 中间态的 EM_REPLACESEL / EM_SETPARAFORMAT 一步都不会上屏, 用户看到的是
  * 旧状态直接过渡到新状态, 没有逐段刷出来的过程, 也没有擦背景的空白帧。 */
 static void ui_fold_set(int idx, int collapse) {
     if (idx < 0 || idx >= g_fold_n) return;
-    SendMessageW(g_hHistory, WM_SETREDRAW, FALSE, 0);
-    int changed = ui_fold_apply(idx, collapse);
-    SendMessageW(g_hHistory, WM_SETREDRAW, TRUE, 0);
-    if (changed) ui_fold_paint_once();
+    ui_hist_batch_begin();
+    ui_fold_apply(idx, collapse);
+    ui_hist_batch_end(1);     /* 收没收京都画一次: 无 erase 且内容不变, 多画一帧无代价 */
 }
 
 /* 用户点击切换: 记下"这个块被手动动过", 之后不再自动折叠 (见 state.h 的 user_toggled)。
@@ -524,15 +553,14 @@ static void ui_fold_toggle(int idx) {
     g_folds[idx].user_toggled = 1;
     POINT scroll;
     memset(&scroll, 0, sizeof(scroll));
-    /* 取滚动位、改文档、恢复滚动位三步必须包在同一对 WM_SETREDRAW 里: 折叠路径的重绘
-     * 本就发生在恢复滚动位那一步 (RichEdit 文档长度变化后会自己挪一次滚动条), 把它
-     * 留在批处理外面就相当于又多一次独立重画 —— 批处理白做, 还是会闪。 */
-    SendMessageW(g_hHistory, WM_SETREDRAW, FALSE, 0);
+    /* 取滚动位、改文档、恢复滚动位三步必须包在同一批里: 折叠路径的重绘本就发生在
+     * 恢复滚动位那一步 (RichEdit 文档长度变化后会自己挪一次滚动条), 把它留在批外
+     * 就等于又多一次独立重画 —— 批处理白做, 还是会闪。 */
+    ui_hist_batch_begin();
     SendMessageW(g_hHistory, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
     ui_fold_apply(idx, !g_folds[idx].collapsed);
     SendMessageW(g_hHistory, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
-    SendMessageW(g_hHistory, WM_SETREDRAW, TRUE, 0);
-    ui_fold_paint_once();
+    ui_hist_batch_end(1);
 }
 
 /* 按"默认折叠"收起第 idx 块 (块结束时调用)。用户手动展开过的不动 —— 别把人家特意
@@ -549,12 +577,26 @@ static void ui_fold_collapse(int idx) {
  * WM_APP_FOLDEND 触发; 回放路径以前漏了这一步, 于是同一段对话只因"重新载入"终态
  * 就不一样 —— 实时里最后一个工具块是收起的, 从会话列表加载回来它却摊开着。 */
 static void ui_turn_tail(void) {
+    /* 整段收尾包进一层批量: 半行落地 + 折最后一个块 + 滚末尾, 三个操作各自的
+     * 重绘合成一帧 (md_flush 与 ui_fold_collapse 内部的批会嵌套计数, 见
+     * ui_hist_batch_begin)。WM_VSCROLL 会经过 HistoryProc, 那儿的补画被
+     * g_hist_noredraw 挡掉, 终态由下面的 end(1) 一次画出。 */
+    ui_hist_batch_begin();
     g_stream_chars += md_flush();
     ui_fold_collapse(g_fold_n - 1);
     SendMessageW(g_hHistory, WM_VSCROLL, SB_BOTTOM, 0);
+    ui_hist_batch_end(1);
 }
 
-/* 主线程处理: UTF-8 -> UTF-16, LF 补 CRLF, 按角色着色/缩进后追加到历史框末尾。 */
+/* 主线程处理: UTF-8 -> UTF-16, LF 补 CRLF, 按角色着色/缩进后追加到历史框末尾。
+ *
+ * **流式追加刻意不批、也不强制全框重画** (2026-10-18 第二轮取证): 批过的版本
+ * 每片只剩一次重画, 但那一次是全客户区 —— 最大化 + 长文档时一次几十毫秒,
+ * 跨显示帧, DWM 把画到一半的内容上屏, 闪照旧 (用户实测: 每片 2→1 次仍闪)。
+ * 现在交给控件自己的自然重绘: EM_REPLACESEL 只弄脏新增那一行, 每片就是一次
+ * 小块重画, 再快也画得完, 不跨帧; 呈现的原子性由主窗 WS_EX_COMPOSITED 兜底 ——
+ * 折叠/缩放/resize 这些重活反正要全画, 靠整窗合成一次上屏 (见 ui/state.h)。
+ * 折叠序列的批量 (ui_hist_batch_*) 保留: 那是真正要"中间态不上屏"的多步手术。 */
 static void do_append(const char *utf8, int role) {
     size_t in_len = strlen(utf8);
     char *norm = (char*)malloc(in_len * 2 + 1);

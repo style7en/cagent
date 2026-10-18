@@ -51,8 +51,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
 
     /* 标题栏只写名字, 不带版本号: 版本在「关于」(系统菜单) 与 exe 文件属性里, 标题栏里
      * 那串数字每次发版都要跟着改, 且对用户没有信息量。 */
-    /* 初次创建用系统 DPI 估个尺寸即可 —— WM_CREATE 里会按窗口真正落在的那块屏重算 */
-    HWND hwnd = CreateWindowW(L"CagentGuiWnd", L"cagent",
+    /* 初次创建用系统 DPI 估个尺寸即可 —— WM_CREATE 里会按窗口真正落在的那块屏重算。
+     * ex 样式 = CAGENT_WND_EXSTYLE (WS_EX_COMPOSITED): 整窗离屏合成, 单帧原子上屏
+     * —— 这是"输出区闪"的根治手段 (依据见 state.h 注释)。 */
+    HWND hwnd = CreateWindowExW(CAGENT_WND_EXSTYLE, L"CagentGuiWnd", L"cagent",
         CAGENT_WND_STYLE,
         CW_USEDEFAULT, CW_USEDEFAULT, dp(720), dp(560),
         NULL, NULL, hInst, NULL);

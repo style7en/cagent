@@ -32,6 +32,23 @@
  * AdjustWindowRectEx 只看影响外框的样式, WS_CLIPCHILDREN 不影响计算结果, 故三处共用安全。 */
 #define CAGENT_WND_STYLE (WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN)
 
+/* 主窗口**扩展**样式: 整棵窗口树 (含全部子控件) 离屏合成后**一次性**呈现。
+ *
+ * 根因链 (2026-10-18 两轮取证): 减重画次数只能降概率, 根除不了闪 —— 输出区
+ * 最大化 + 长文档时, **一次全客户区重画要几十毫秒, 跨显示帧**, DWM 会把画到
+ * 一半的内容上屏, 用户看到的就是撕裂式闪烁 (用户实测反馈: 每片从 2 次降到
+ * 1 次仍闪)。让呈现原子化 (整帧合成完再一次 BitBlt 上屏) 才能根除。
+ * 附带效应: EM_SETRECT 重排的 5 次中间帧 (RichEdit 不吃 WM_SETREDRAW, 批不掉)
+ * 也不再上屏 —— resize 时的抽动一并解决。
+ *
+ * 代价: 任一子控件重画都会触发一次整窗合成 (一次大 memcpy + 全部子控件重绘到
+ * 缓冲)。换来的是**任何单帧重画多慢都不闪**。配合流式的小块自然重绘
+ * (helpers.h 的 do_append 注释), 稳态成本只有一次合成。
+ *
+ * 注意: WS_EX_COMPOSITED 只是 ex 样式, **不影响 AdjustWindowRectEx 的外框计算**,
+ * 所以两处 dpi_adjust_rect 的 exstyle 传 0 是对的, 别跟着改。 */
+#define CAGENT_WND_EXSTYLE (WS_EX_COMPOSITED)
+
 /* ===== 系统菜单命令 (WM_SYSCOMMAND) =====
  * 「关于」挂在窗口的系统菜单上 —— 主窗口没有菜单栏, 而标题栏问号按钮(WS_EX_CONTEXTHELP)
  * 与最小化/最大化互斥(实测加了它问号根本不画), 所以系统菜单是这里放"关于"的标准位置:
