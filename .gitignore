@@ -59,9 +59,12 @@ test/ui_input_flicker_probe.c
 test/ui_hist_flicker_probe.c
 test/ui_dpi_style_probe.c
 test/ui_glyph_probe.c
+test/ui_userbg_probe.c
 test/cue_probe.manifest
 test/cue_probe.rc
 
 # ui_*_probe 的取证 BMP/PNG (探针产物, 不入库)
 glyph_*.bmp
 glyph_*.png
+userbg_*.bmp
+userbg_*.png
