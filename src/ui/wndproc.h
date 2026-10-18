@@ -115,23 +115,28 @@ static LONG ui_font_em_twips(HFONT f) {
     return (LONG)((LONGLONG)em * 1440 / (g_dpi ? g_dpi : 96));
 }
 
-/* 给输出区设默认字符格式 (字号 + 字体名)。WM_CREATE 与 ui_fonts_rebuild
- * (跨显示器换字体) 两条路都走这里。**不要对 RichEdit 用 WM_SETFONT**: 实测
- * (test/ui_dpi_style_probe.c) 它会把全文档每个 run 的字符格式打回默认 ——
- * bold / 下划线 / 颜色一起丢 (用户消息 7C440C+粗+下划线 -> 纯黑)。症状之所以
- * 是"某些情况下": DPI 切换只 wipe **切换前**已有的 run, 之后新插入的内容样式
- * 照常, 于是旧内容集体褪色、新内容正常。
- * 改用 EM_SETCHARFORMAT(SCF_ALL): 同一探针实测 run 的显式格式**原样保留**,
- * 默认字号只作用于不写死字号的 run (本项目从不给 run 设 CFM_SIZE, 即全部正文
- * 都跟着默认走, DPI 缩放正由此而来)。yHeight 按 em 高算, 见 ui_font_em_twips。 */
+/* 给输出区设默认字符格式的**字号**。WM_CREATE 与 ui_fonts_rebuild (跨显示器换字体)
+ * 两条路都走这里。**不要对 RichEdit 用 WM_SETFONT**: 实测 (test/ui_dpi_style_probe.c)
+ * 它会把全文档每个 run 的字符格式打回默认 —— bold / 下划线 / 颜色一起丢。
+ *
+ * 改用 EM_SETCHARFORMAT(SCF_ALL) 后又抓到第二层 (test/ui_glyph_probe.c 实测):
+ * SCF_ALL 的 **CFM_FACE 会改写每一个 run 的 face**, 不只是"默认格式" ——
+ *   ① ▾/▸ 是雅黑缺字形 (U+25BE/25B8) 被 msftedit 字体链接成 "Segoe UI Symbol"
+ *      存进 run 的, 一改就被打回雅黑 -> 豆腐块。DPI 切换后思考/工具标题集体变
+ *      小方块、点击标题(重写 glyph)才恢复, 正是用户报的现象;
+ *   ② 等宽 run (Consolas: 工具参数 / markdown 行内代码 / 围栏) 同样被打回雅黑,
+ *      静默丢失等宽。
+ * 而 bold/underline/颜色实测能被 SCF_ALL 保住, 只有 face 不能 —— 所以这里
+ * **只设 CFM_SIZE**: 本项目每个 run 插入时都显式带了 face (role_cf 必设
+ * CFM_FACE), 默认 face 没有任何内容依赖; 只有字号需要跟着 DPI 走 (run 一律
+ * 不写死 CFM_SIZE, 全靠默认字号缩放, 见 helpers.h 的 ui_insert_ex 注释)。 */
 static void ui_history_default_font(HWND h) {
     if (!h || !g_hFontHist) return;
     CHARFORMAT2W cf;
     memset(&cf, 0, sizeof(cf));
     cf.cbSize = sizeof(cf);
-    cf.dwMask  = CFM_SIZE | CFM_FACE;
+    cf.dwMask  = CFM_SIZE;
     cf.yHeight = ui_font_em_twips(g_hFontHist);
-    wcscpy(cf.szFaceName, CAGENT_UI_FACE);
     SendMessageW(h, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
     /* WM_SETFONT 的 lParam=TRUE 原本负责重画, 换接口后自己补: 不带 erase */
     RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
