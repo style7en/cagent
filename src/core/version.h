@@ -11,7 +11,7 @@
 
 #define CAGENT_VER_MAJOR 1
 #define CAGENT_VER_MINOR 2
-#define CAGENT_VER_PATCH 4
+#define CAGENT_VER_PATCH 5
 #define CAGENT_VER_BUILD 0      /* 构建序号, 非正式发布可保持 0; 不进人类可读版本串 */
 
 /* 字符串化两级跳: 先让实参整体宏展开, 再 # 成字面量 (直接 # 会得到 "CAGENT_VER_MAJOR") */
