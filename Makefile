@@ -66,13 +66,16 @@ CFLAGS  = -Wall -Wextra -Wshadow -Wformat=2 -Wlogical-op \
 LDFLAGS = -s -Wl,--nxcompat -Wl,--dynamicbase -Wl,--high-entropy-va \
           $(STACK_LDFLAGS)
 
-# 源码全部在 src/, 资源在 res/, 回归测试在 test/; 编译产物留在仓库根 ——
+# 源码全部在 src/, 资源在 res/, 回归测试在 test/; **产品**编译产物留在仓库根 ——
 # 程序的"数据根"就是 exe 所在目录 (core/session.h 的 get_exe_dir_utf8 用它定位
 # cagent.ini / sessions\ / log\ / SYSTEM_PROMPT), 所以 exe 不能挪进子目录,
 # 否则配置文件会跟着跑到那里去。
+# 但 **test/ 源码生成的产物**(回归测试 exe / mdtest / preview / 各排查探针的 exe
+# 与它们吐出的 BMP/JSON 临时文件)一律落 test/out/, 不散在工程根。
 GUI_TARGET = cagent.exe
 GUI_SRC = src/main_gui.c
 GUI_RES = app.res
+OUT_DIR = test/out
 
 # 子模块头: 核心按功能拆在 src/core/, 界面拆在 src/ui/
 CORE_HDRS = src/cagent_core.h $(wildcard src/core/*.h)
@@ -84,18 +87,22 @@ GUI_LDFLAGS = -mwindows -lcomctl32 -lwinhttp -lcrypt32 -lshell32 -lole32 -luuid
 # -Isrc 找 cagent_core.h, -Itest 找同套件的 test.h
 TEST_SRC = test/main.c
 TEST_HDRS = test/test.h
-TEST_TARGET = cagent_test.exe
+TEST_TARGET = $(OUT_DIR)/cagent_test.exe
 TEST_CFLAGS = -Isrc -Itest
 TEST_LDFLAGS = -lcomctl32 -lwinhttp -lcrypt32 -lshell32 -lole32 -luuid
 
 # Markdown 渲染器边界单测: 桩掉 SendMessageW, 不建窗口 (无 UI 断言)
 # -Wno-unused-*: 聚合进来的 UI 模块大部分函数本测试用不到, 与 preview 同理
 MDTEST_SRC = test/md_test.c
-MDTEST_TARGET = md_test.exe
+MDTEST_TARGET = $(OUT_DIR)/md_test.exe
 
 # 输出区排版的离屏预览: 把角色样式渲染成 BMP, 人眼检查 (验证工具, 不进产品二进制)
 PREVIEW_SRC = test/ui_preview.c
-PREVIEW_TARGET = ui_preview.exe
+PREVIEW_TARGET = $(OUT_DIR)/ui_preview.exe
+
+# test/out 产物目录: 链接前先存在 (order-only 依赖, 目录 mtime 变化不触发重编)
+$(OUT_DIR):
+	@mkdir -p $@
 
 .PHONY: all clean test mdtest preview
 
@@ -119,28 +126,28 @@ $(GUI_TARGET): $(GUI_SRC) $(CORE_HDRS) $(UI_HDRS) $(GUI_RES)
 test: $(TEST_TARGET)
 	./$(TEST_TARGET); rc=$$?; rm -f $(TEST_TARGET); exit $$rc
 
-$(TEST_TARGET): $(TEST_SRC) $(TEST_HDRS) $(CORE_HDRS)
+$(TEST_TARGET): $(TEST_SRC) $(TEST_HDRS) $(CORE_HDRS) | $(OUT_DIR)
 	$(CC) $(CFLAGS) $(TEST_CFLAGS) -o $@ $(TEST_SRC) $(LDFLAGS) $(TEST_LDFLAGS)
 
 # make mdtest: 跑 Markdown 边界单测 (失败则 make 返回非 0)
 mdtest: $(MDTEST_TARGET)
 	./$(MDTEST_TARGET); rc=$$?; rm -f $(MDTEST_TARGET); exit $$rc
 
-$(MDTEST_TARGET): $(MDTEST_SRC) $(CORE_HDRS) $(UI_HDRS)
+$(MDTEST_TARGET): $(MDTEST_SRC) $(CORE_HDRS) $(UI_HDRS) | $(OUT_DIR)
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable \
 	      -Isrc -o $@ $(MDTEST_SRC) $(LDFLAGS) $(TEST_LDFLAGS) -lgdi32 -luser32
 
-# make preview: 渲染输出区排版 -> preview_out.bmp (人工看配色/缩进/段间距对不对)
+# make preview: 渲染输出区排版 -> test/out/preview_out.bmp (人工看配色/缩进/段间距对不对)
 # -Wno-unused-*: 预览程序直接聚合整套 UI 代码, 但只用到其中一小部分 —— 单 TU 下其余
 # 部分必然"未被使用"。只在这里关, 别动主程序的告警开关。
-# 跑完删掉 ui_preview.exe (与 make test / mdtest 同规): BMP 是给人眼看的产物要留下,
-# 执行文件不必留在仓库根 —— 下次 make preview 重新编译, 代价可接受。
+# 跑完删掉 ui_preview.exe (与 make test / mdtest 同规): BMP 是给人眼看的产物要留下
+# (在 test/out/ 下), 执行文件不必留着 —— 下次 make preview 重新编译, 代价可接受。
 preview: $(PREVIEW_TARGET)
 	./$(PREVIEW_TARGET); rc=$$?; rm -f $(PREVIEW_TARGET); exit $$rc
 
-$(PREVIEW_TARGET): $(PREVIEW_SRC) $(CORE_HDRS) $(UI_HDRS) src/main_gui.c
+$(PREVIEW_TARGET): $(PREVIEW_SRC) $(CORE_HDRS) $(UI_HDRS) src/main_gui.c | $(OUT_DIR)
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable \
 	      -Isrc -o $@ $(PREVIEW_SRC) $(LDFLAGS) $(TEST_LDFLAGS) -lgdi32 -luser32
 
 clean:
-	@rm -rf $(GUI_TARGET) $(GUI_RES) $(TEST_TARGET) $(PREVIEW_TARGET)
+	@rm -rf $(GUI_TARGET) $(GUI_RES) $(OUT_DIR)

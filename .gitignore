@@ -68,3 +68,6 @@ glyph_*.bmp
 glyph_*.png
 userbg_*.bmp
 userbg_*.png
+
+# test/ 源码的产物目录 (回归/mdtest/preview/探针的 exe 与临时 BMP/JSON)
+test/out/

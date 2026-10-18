@@ -458,7 +458,7 @@ static void replay_selftest(void) {
     /* 会话文件是自描述 JSON (workspace + messages), 见 core/session.h 的
      * load_messages_from_text; 末尾那条 assistant 让会话以"工具调用之后还有正文"
      * 收尾 —— 此时最后一个折叠块仍是工具块, 正是收尾要管的对象。 */
-    const char *path = "preview_replay_session.json";
+    const char *path = "test/out/preview_replay_session.json";
     FILE *f = fopen(path, "wb");
     if (f) {
         fputs("{\"workspace\":\".\",\"messages\":["
@@ -521,7 +521,7 @@ static WCHAR *pv_doc_text(void) {
  * 必须证明**文档末尾那个块**在表里 —— 给它一个只会在这里出现的输出文本, 断言它被
  * 折掉了 (文档里搜不到), 再展开又能搜到。 */
 static void fold_cap_selftest(void) {
-    const char *path = "preview_foldcap_session.json";
+    const char *path = "test/out/preview_foldcap_session.json";
     int nblk = UI_FOLD_MAX + 8;                 /* 必定溢出, 逼出"表满"这条路径 */
     FILE *f = fopen(path, "wb");
     if (f) {
@@ -848,7 +848,7 @@ static void input_tip_selftest(void) {
             ReleaseDC(g_hInput, dc);
         }
     }
-    int px_plain = pv_dark_band(g_hInput, 0, -1, "preview_input.bmp");
+    int px_plain = pv_dark_band(g_hInput, 0, -1, "test/out/preview_input.bmp");
     /* 聚焦: 原生 cue 会消失, 我们必须照旧显示 (用户正一边打字一边看排队条目) */
     SetFocus(g_hInput);
     int px_focus = pv_dark_band(g_hInput, 0, -1, NULL);
@@ -985,6 +985,10 @@ int main(void) {
     dpi_init();
     g_dpi = dpi_system();              /* 与真实运行一致: 按本机主屏 DPI 渲染 */
 
+    /* 所有产物落 test/out/ (与 test 源码产物同一个目录, 不散在工程根) */
+    CreateDirectoryA("test", NULL);
+    CreateDirectoryA("test/out", NULL);
+
     /* 客户区 720x780 逻辑像素 (WS_POPUP: 窗口区 = 客户区)。
      * 尺寸按逻辑像素写, 物理尺寸随本机 DPI 走 —— 200% 屏上就是 1440x1560 真实像素,
      * 于是这张图看到的就是用户在 200% 下看到的密度。
@@ -1076,7 +1080,7 @@ int main(void) {
      * 末尾几行会滚出可视区。出图前滚到底, 预览才看得全。 */
     SendMessageW(g_hHistory, WM_VSCROLL, SB_BOTTOM, 0);
 
-    render_to_bmp(g_hHistory, "preview_out.bmp", W, H);
+    render_to_bmp(g_hHistory, "test/out/preview_out.bmp", W, H);
 
     /* 诊断: cp_head 到底指向哪段文本 —— 命中测试的 x 坐标在块 2/3 上是 33 而不是 1,
      * 但段落缩进读出来又是 0, 两者矛盾, 说明索引位置本身不对。 */
@@ -1120,7 +1124,7 @@ int main(void) {
         for (int i = 0; i < g_fold_n; i++) if (g_folds[i].kind == UI_FOLD_TOOL) tool_idx = i;
         if (tool_idx < 0) tool_idx = g_fold_n - 1;
         ui_fold_toggle(tool_idx);
-        render_to_bmp(g_hHistory, "preview_folded.bmp", W, H);
+        render_to_bmp(g_hHistory, "test/out/preview_folded.bmp", W, H);
         ui_fold_toggle(tool_idx);
     }
 
