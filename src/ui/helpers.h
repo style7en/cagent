@@ -505,10 +505,13 @@ static void ui_fold_paint_once(void) {
 /* ===== 批量变更: 嵌套计数, 中间帧不上屏 =====
  * 流式追加 (do_append) 一片 delta 里是 EM_SETSEL/EM_SETCHARFORMAT/EM_REPLACESEL/
  * EM_SETPARAFORMAT 一串 SendMessage, 外加 EM_SCROLLCARET + WM_VSCROLL(SB_BOTTOM)
- * 双滚动; 而 HistoryProc 对每个 WM_VSCROLL 还补一次**全客户区** RedrawWindow。
- * 不批的代价 (ui_hist_flicker_probe.c 实测, 374KB 真实会话): 每片 delta = 2 次
+ * 双滚动。不批的代价 (ui_hist_flicker_probe.c 实测, 374KB 真实会话): 每片 delta = 2 次
  * 重画; 每次 EM_SETRECT 重排 = 5 次重画且视图在帧间漂移 (27092→27163px,
  * resize 时看得见的抽动)。高速流式下输出区等于在持续全量重画, 就是"闪"的体感来源。
+ *
+ * (注: HistoryProc 里"给每个 WM_VSCROLL 补全客户区 RedrawWindow"的分支在
+ *  WS_EX_COMPOSITED 那一轮已删除 —— 那是快速滚动时的撕裂源。现在的语义只剩
+ *  折叠/重排/轮次收尾这类**多步手术**需要批, 流式已改回小块自然重绘。)
  *
  * **用计数而不是裸 SETREDRAW**: do_append 里的 ui_fold_collapse 自带一对
  * SETREDRAW(FALSE/TRUE) (走 ui_fold_set), 内层若再无条件置 TRUE, 批会被提前

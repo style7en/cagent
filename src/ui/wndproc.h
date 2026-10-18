@@ -132,11 +132,16 @@ static LONG ui_font_em_twips(HFONT f) {
  * 不写死 CFM_SIZE, 全靠默认字号缩放, 见 helpers.h 的 ui_insert_ex 注释)。 */
 static void ui_history_default_font(HWND h) {
     if (!h || !g_hFontHist) return;
+    LONG yh = ui_font_em_twips(g_hFontHist);
+    /* em 度量拿不到 (GetDC/GetTextMetrics 失败) 时 yh<=0 —— 绝不能把 0 字号
+     * 经 SCF_ALL 下发给全文档 (RichEdit 对 0 字高行为未定义)。此时保持原样,
+     * 宁可DPI切换后字号不变, 不可让正文消失。 */
+    if (yh <= 0) return;
     CHARFORMAT2W cf;
     memset(&cf, 0, sizeof(cf));
     cf.cbSize = sizeof(cf);
     cf.dwMask  = CFM_SIZE;
-    cf.yHeight = ui_font_em_twips(g_hFontHist);
+    cf.yHeight = yh;
     SendMessageW(h, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
     /* WM_SETFONT 的 lParam=TRUE 原本负责重画, 换接口后自己补: 不带 erase */
     RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
