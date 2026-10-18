@@ -26,7 +26,7 @@
  * 与界面解耦: 通过一组宿主钩子 (cagent_emit / cagent_on_done / cagent_read_config_ui)
  * 与前端交互, 因此 Win32 GUI 复用同一段 Agent 循环。
  *
- * 设计取向 (对齐 pi.dev 的极简理念): 仅 4 个工具 (bash/read/write/edit_file), 无权限弹窗,
+ * 设计取向 (对齐 pi.dev 的极简理念): 仅 5 个工具 (bash/read/write/edit_file + 技能加载 load_skill), 无权限弹窗,
  * 无轮次上限, 由模型自行决定何时停止, 用户随时可用停止按钮取消。
  *
  * 使用方式: 前端 .c 文件 #include 本头文件, 并在调用 agent_thread / agent_turn

@@ -1,5 +1,5 @@
 /*
- * core/tools.h - 结构化工具: execute_bash / read_file / write_file / edit_file
+ * core/tools.h - 结构化工具: execute_bash / read_file / write_file / edit_file / load_skill
  *
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  */

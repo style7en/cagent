@@ -30,7 +30,7 @@ cagent/
 │   │   ├── net.h       # WinHTTP 与 SSE 流式解析
 │   │   ├── encoding.h  # OEM(GBK) → UTF-8 转码
 │   │   ├── workspace.h # 工作目录解析、越界限制、UTF-8 文件/路径
-│   │   ├── tools.h     # 结构化工具: execute_bash / read_file / write_file / edit_file
+│   │   ├── tools.h     # 结构化工具: execute_bash / read_file / write_file / edit_file / load_skill
 │   │   ├── agent.h     # Agent 循环: LLM <-> 工具调用、取消与回滚
 │   │   ├── session.h   # 会话持久化: 存取 / 回放 / 多会话命名
 │   │   └── config.h    # ini 配置读写
