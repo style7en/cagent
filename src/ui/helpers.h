@@ -322,7 +322,7 @@ static void ui_fold_new(int kind, long cp_before, long cp_after) {
 static void ui_fold_extend(int role, long cp_added) {
     if (g_fold_n <= 0 || cp_added <= 0) return;
     UiFoldBlock *b = &g_folds[g_fold_n - 1];
-    if (b->collapsed) return;          /* 收起态下不该再有正文追加 (流式中已禁用折叠) */
+    if (b->collapsed) return;          /* 收起态下不该再有正文追加 (运行中最后一块不可折, 见 ui_fold_clickable) */
     int takes = (b->kind == UI_FOLD_THINK && role == CAGENT_ROLE_THINK)
              || (b->kind == UI_FOLD_TOOL  && (role == CAGENT_ROLE_ARGS ||
                                               role == CAGENT_ROLE_OUTPUT));
@@ -380,6 +380,21 @@ static int ui_fold_hit(POINTL pt) {
         if (d <= line_h && d < best_d) { best_d = d; best = i; }
     }
     return best;
+}
+
+/* 这一块现在能不能点开/收起。running 由调用方传 (HistoryProc 传 g_running) ——
+ * 不在 helpers 里直接读那个全局: 纯 UI 的测试骨架 (test/md_test.c) 只聚合它用到的几个
+ * ui 头, 不包含 core/state.h。
+ *
+ * 唯一不能点的是**运行中正在增长的最后一块**: 流式增量永远插到文档末尾、只延长最后一块
+ * (见 ui_fold_extend), 前提就是"这块一定是展开态" —— 中途把它收起来, 下一片增量就会接在
+ * 标题行后面, 索引与文档立刻对不上 (之后展开还会把存档正文重插一遍)。等这一轮结束再折它。
+ * 其余(已写完的)块随时可点: 折叠只会平移后续块的 cp_head (见 ui_fold_apply), 而增量插入
+ * 每次都现算文档末尾, 两边互不干扰 —— 运行中恰恰是最想看"刚才那个命令输出了什么"的时候。 */
+static int ui_fold_clickable(int idx, int running) {
+    if (idx < 0 || idx >= g_fold_n) return 0;
+    if (running && idx == g_fold_n - 1) return 0;
+    return 1;
 }
 
 /* 标题行首字符的展开/收起符号 —— **必须与 core 的 CAGENT_FOLD_GLYPH_OPEN 一致**

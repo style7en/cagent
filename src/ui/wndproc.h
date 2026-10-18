@@ -717,23 +717,28 @@ static LRESULT CALLBACK HistoryProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     /* 点击折叠块的标题行 -> 收起/展开。
-     * **流式进行中不响应**: 正文正在往文档末尾追加, 此时收起会让后续增量直接接在标题行
-     * 后面, 块的状态和内容就对不上了。等这一轮结束再折叠。 */
+     * **运行中只放过已写完的块**: 正在生成的那一块由 ui_fold_clickable 挡掉 —— 它的正文
+     * 还在往文档末尾追加, 收起来会让下一片增量直接接在标题行后面, 块的状态和内容就再也
+     * 对不上了。等这一轮结束再折它。 */
     if (msg == WM_LBUTTONDOWN) {
         POINTL pt;
         pt.x = (LONG)(short)LOWORD(lp);
         pt.y = (LONG)(short)HIWORD(lp);
         int idx = ui_fold_hit(pt);
-        if (idx >= 0 && !g_running) { ui_fold_toggle(idx); return 0; }
+        if (ui_fold_clickable(idx, g_running)) { ui_fold_toggle(idx); return 0; }
     }
-    /* 悬停在标题行上给手型, 提示"这里能点" */
-    if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT && !g_running) {
+    /* 悬停在**可点**的标题行上给手型, 提示"这里能点"。运行中正在生成的那一块不给 ——
+     * 与点击行为保持一致: 不给手型就是"现在别点"的信号。 */
+    if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT) {
         POINT p;
         if (GetCursorPos(&p) && ScreenToClient(h, &p)) {
             POINTL pt;
             pt.x = p.x;
             pt.y = p.y;
-            if (ui_fold_hit(pt) >= 0) { SetCursor(LoadCursor(NULL, IDC_HAND)); return TRUE; }
+            if (ui_fold_clickable(ui_fold_hit(pt), g_running)) {
+                SetCursor(LoadCursor(NULL, IDC_HAND));
+                return TRUE;
+            }
         }
     }
     /* Ctrl+滚轮缩放输出区字号; 其余滚轮动作照旧交回原过程(滚动)并补一次重画。

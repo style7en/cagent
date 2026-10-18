@@ -775,6 +775,13 @@ static int pv_weq(const wchar_t *a, const wchar_t *b) {
     return *a == *b;
 }
 
+/* 宽字符长度 (同上, 不依赖 wcslen 可见性) */
+static int pv_wstrlen(const wchar_t *s) {
+    int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
 /* 输入框占位提示 ("后续任务" 清单, hooks.h 的 ui_inbox_tip / wndproc.h 的 ui_input_draw_tip):
  *   ① 文本契约: 队列空没有占位; 有队列时格式为 "后续任务:\\n· 每条一行";
  *     每条按**字符数**截到 INBOX_TIP_MAXCH, 超出补 "..." (正好等于上限则不补);
@@ -873,6 +880,103 @@ static void input_tip_selftest(void) {
            " | 像素 空=%d 聚焦=%d 有正文首行=%d 次行=%d [%s]\n",
            ph_empty, ph_fmt, ph_multiline, ph_bound,
            px_plain, px_focus, px_text_top, px_text_low, ok ? "OK" : "FAIL");
+}
+
+/* 把第 idx 块的标题行滚进可视区, 返回一个"落在该标题行上"的客户区点 (返回 0 = 读不到)。
+ * 命中测试依赖"标题行当前可见": 滚出可视区的行 y 是负的, 点不到 (点击本来就点不到看不见的行)。
+ *
+ * 用 EM_LINESCROLL 把它滚到顶, 而不是 EM_SCROLLCARET —— 后者在预览窗口里实测不动视图
+ * (视图停在先前滚动测试留下的位置, 于是所有块都读成 y=-3870, 断言全部假失败)。滚到顶后
+ * 行 y 可能因内边距略小于 0, 所以钳到客户区内, 再偏移半行取"行中心"当点击点。 */
+static int pv_title_pt(int idx, POINTL *out) {
+    long cp = g_folds[idx].cp_head;
+    long line  = (long)SendMessageW(g_hHistory, EM_EXLINEFROMCHAR, 0, (LPARAM)cp);
+    long first = (long)SendMessageW(g_hHistory, EM_GETFIRSTVISIBLELINE, 0, 0);
+    if (line >= 0 && first >= 0)
+        SendMessageW(g_hHistory, EM_LINESCROLL, 0, (LPARAM)(line - first));
+
+    memset(out, 0, sizeof(*out));
+    if (SendMessageW(g_hHistory, EM_POSFROMCHAR, (WPARAM)out, (LPARAM)cp) == -1) return 0;
+
+    RECT rc;
+    GetClientRect(g_hHistory, &rc);
+    int line_h = dp(g_hist_lpx + HIST_LINE_EXTRA);
+    int cy = (int)out->y + line_h / 2;          /* 行中心: 命中窗口是"标题行上下各一行" */
+    if (cy < 0) cy = 0;
+    if (cy > rc.bottom - 1) cy = rc.bottom - 1;
+    out->y = cy;
+    if (out->x < 0) out->x = 0;
+    return 1;
+}
+
+/* 运行中的折叠点击策略: **已写完的块可点, 正在生成的那一块不可点**。
+ *
+ * 起因是"运行中想看工具输出却点不动" —— 旧实现一刀切 (g_running 时全部忽略), 而真正
+ * 不能折的只有还在往文档末尾追加正文的最后一块 (它必须是展开态, 见 ui_fold_extend)。
+ * 这里走**真实的 HistoryProc** (WM_LBUTTONDOWN + 真实命中测试), 并断言**文档文本**:
+ * 折叠的本质就是"正文从文档里消失", 只看 collapsed 标志会漏掉"标志改了、文档没动"这类
+ * 索引错位。展开再收起一轮还要逐字节还原, 否则就是折叠路径把内容啃坏了。 */
+static void fold_running_selftest(void) {
+    if (g_fold_n < 2) { printf("fold running selftest: 跳过 (块数 %d < 2)\n", g_fold_n); return; }
+    int ok = 1, last = g_fold_n - 1;
+    int ph_idle = 1, ph_run = 1, ph_fold = 0, ph_restore = 0, ph_block = 0;
+
+    /* ① 策略表 (running 显式传 0/1; 下面的点击才走真实 HistoryProc, 它读 g_running) */
+    for (int i = 0; i < g_fold_n; i++)
+        if (!ui_fold_clickable(i, 0)) ph_idle = 0;
+    for (int i = 0; i < g_fold_n; i++) {
+        int want = (i != last);
+        if (ui_fold_clickable(i, 1) != want) {
+            ph_run = 0;
+            printf("  运行中块 %d 可点=%d (期望 %d) [FAIL]\n", i, ui_fold_clickable(i, 1), want);
+        }
+    }
+    g_running = 1;              /* 模拟"这一轮还在跑" */
+
+    /* ② 全摊开, 后面才有"点一下收起来"的余地 */
+    for (int i = 0; i < g_fold_n; i++) if (g_folds[i].collapsed) ui_fold_toggle(i);
+
+    /* ③ 运行中点**已写完的**块: 必须真收起 (正文从文档里消失) */
+    int tgt = -1;
+    POINTL pt;
+    memset(&pt, 0, sizeof(pt));
+    for (int i = 0; i < last; i++) if (pv_title_pt(i, &pt)) { tgt = i; break; }
+
+    WCHAR *doc0 = pv_doc_text();
+    if (tgt >= 0 && doc0) {
+        SendMessageW(g_hHistory, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
+        WCHAR *doc1 = pv_doc_text();
+        ph_fold = (ui_fold_hit(pt) == tgt) && g_folds[tgt].collapsed && doc1
+               && (pv_wstrlen(doc1) < pv_wstrlen(doc0));
+        /* ④ 再点一次展开: 文档必须逐字节还原 */
+        SendMessageW(g_hHistory, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
+        WCHAR *doc2 = pv_doc_text();
+        ph_restore = doc2 && pv_weq(doc2, doc0) && !g_folds[tgt].collapsed;
+        if (!ph_fold)      printf("  运行中点块 %d: 未收起或正文未消失 [FAIL]\n", tgt);
+        if (!ph_restore)   printf("  再点开块 %d: 文档未逐字节还原 [FAIL]\n", tgt);
+        free(doc1);
+        free(doc2);
+    }
+
+    /* ⑤ 运行中点**最后一块** (正文还在追加): 必须什么都不发生 —— 点击前先把它滚进可视区,
+     * 否则"没反应"只是没点到, 断言会假通过。 */
+    if (pv_title_pt(last, &pt)) {
+        WCHAR *before = pv_doc_text();
+        SendMessageW(g_hHistory, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
+        WCHAR *after = pv_doc_text();
+        ph_block = (ui_fold_hit(pt) == last) && !g_folds[last].collapsed
+                && before && after && pv_weq(before, after);
+        if (!ph_block) printf("  运行中点最后一块 (%d): 文档被改动了 [FAIL]\n", last);
+        free(before);
+        free(after);
+    }
+    free(doc0);
+    g_running = 0;
+
+    ok = ph_idle && ph_run && ph_fold && ph_restore && ph_block;
+    if (!ok) g_pv_fails++;
+    printf("fold running selftest: 空闲可点=%d 运行中策略=%d 历史块可折=%d 还原=%d 末块挡住=%d [%s]\n",
+           ph_idle, ph_run, ph_fold, ph_restore, ph_block, ok ? "OK" : "FAIL");
 }
 
 int main(void) {
@@ -1058,6 +1162,7 @@ int main(void) {
     inbox_selftest();
     drain_order_selftest();
     input_tip_selftest();      /* 占位提示: 文本契约 + 真控件渲染 (顺带出 preview_input.bmp) */
+    fold_running_selftest();   /* 运行中的折叠点击策略 (最后一块挡住, 历史块可点) */
     replay_selftest();
     fold_cap_selftest();
 
