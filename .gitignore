@@ -43,6 +43,8 @@ docs/
 
 # 代码审查报告 (本地生成, 与本机记忆同类, 不入库)
 CODE_REVIEW.md
+code-review.md
+整体代码审查.md
 
 # E2E UI 测试运行物证 (每次运行生成, 不入库)
 test/e2e_artifacts/
