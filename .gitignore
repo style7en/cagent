@@ -58,6 +58,7 @@ test/ui_flicker_probe.c
 test/ui_input_flicker_probe.c
 test/ui_hist_flicker_probe.c
 test/ui_dpi_style_probe.c
+test/ui_glyph_probe.c
 test/cue_probe.manifest
 test/cue_probe.rc
 
