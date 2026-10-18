@@ -13,6 +13,35 @@ static size_t tool_output_cap(void) {
     return (size_t)v;
 }
 
+/* ===== read_file 首次预览 + 续读缓存 (大文件旁路) =====
+ * 目的: 150KB 的 plane.html 这类大文件, 若每次 read_file 都把块内容原样写进
+ * 对话历史, 历史会随"反复读/反复改"一路膨胀到 API 上限 (曾出现 body 160KB 后
+ * 每轮必 400 invalid arguments)。策略:
+ *   - 首次读 (offset=0): 只回传文件**头部若干 KB** (FILE_HEAD_PREVIEW) + 文件
+ *     大小/总块数等元信息, 不让全文进上下文;
+ *   - 续读 (offset>0): 只有**紧接着上次缓存位置**的首块 (读方向连续、文件未变)
+ *     才折叠进缓存 —— 该块的完整内容不再进历史, 只回传短标记
+ *     "(该段内容已缓存到 cagent 会话, 本轮可继续按 offset 读取)"。模型读到
+ *     标记就知道"内容已在眼前 (本会话上一条)", 直接继续下一块即可。
+ *   - 缓存是**一次性、单条、跨轮有效**的 (见 agent.h 工具执行前清缓存):
+ *     只服务"同文件、从头向下"的顺序读取, 任何换文件 / 回读旧段 / 新会话
+ *     都不命中, 也就不会把旧内容错误地当作当前上下文。
+ * 该旁路对**所有后端一视同仁** (按文件结构判据, 与提供商无关), Gemini 的
+ * thought_signature 回传与 tool result 完整性一行都不动。
+ */
+#define FILE_HEAD_PREVIEW   (6 * 1024)   /* 首次读回传的头部上限; 默认约等于 TOOL_OUTPUT_CAP 的 1/3 */
+
+/* 全局缓存 (agent.h 工具执行前清空; 载入历史 / 压缩 / 重置也会清) */
+static char  g_read_cur_path[PATHSZ] = "";
+static long long g_read_cur_next = -1;   /* 上次读到的下一个字节偏移; -1=无缓存 */
+static long long g_read_cur_total = -1;  /* 上次读时的文件总大小 */
+
+static void read_cache_clear(void) {
+    g_read_cur_path[0] = '\0';
+    g_read_cur_next = -1;
+    g_read_cur_total = -1;
+}
+
 /* 记录本轮改动过的文件: 对话可以回滚, 已落盘的改动不能, 回滚提示里要列清楚。 */
 static void touch_file(const char *path) {
     size_t used = strlen(g_touched_files);
@@ -44,7 +73,17 @@ static void tool_read_file(const char *path, long long offset) {
         snprintf(tool_out, BUFSZ, "(读取失败: offset %lld 超出文件范围)", offset);
         return;
     }
+    /* 先取文件总大小 (供元信息与"读方向是否连续"判定; 失败则 -1) */
+    long long total = -1;
+    if (_fseeki64(f, 0, SEEK_END) == 0) total = _ftelli64(f);
+    if (total >= 0 && _fseeki64(f, offset, SEEK_SET) != 0) { fclose(f); snprintf(tool_out, BUFSZ, "(读取失败)"); return; }
+
     size_t cap = tool_output_cap();
+    /* 首次读 (offset=0) 且文件大于首块预算: 只回传头部预览, 不进全文。
+     * 续读 (offset>0) 不受此限, 仍按工具输出上限逐块读。 */
+    if (offset == 0 && total > (long long)FILE_HEAD_PREVIEW)
+        cap = (size_t)FILE_HEAD_PREVIEW;
+
     size_t raw = fread(tool_out, 1, cap, f);
     size_t used = raw;   /* 从文件实际消费的字节数 (含为对齐字符边界跳过的续字节) */
     if (offset > 0 && raw > 0) {
@@ -64,19 +103,37 @@ static void tool_read_file(const char *path, long long offset) {
     }
     /* 文件总大小与是否还有剩余 (fseek 失败则 total 未知; used 含跳过的续字节) */
     int more = 0;
-    long long total = -1;
-    if (_fseeki64(f, 0, SEEK_END) == 0) {
-        total = _ftelli64(f);
+    if (total >= 0)
         more = (total > (long long)offset + (long long)used);
-    } else {
+    else
         more = (raw == cap);
-    }
     fclose(f);
     tool_out[n] = '\0';
     if (raw == 0) {
         snprintf(tool_out, BUFSZ, "(offset %lld 处已无内容; 文件共 %lld 字节)",
                  offset, total > 0 ? total : offset);
         return;
+    }
+    /* 续读且"紧接着上次缓存位置"的首块 (读方向连续、文件未变): 折叠进缓存,
+     * 内容不再进历史, 只回传短标记 (与历史占位 READ_CACHED_PLACEHOLDER 一致,
+     * 界面看到它 = "该块内容在本会话前文已出现过, 未重复刷屏")。
+     * 任何换文件/回读旧段都不命中。命中后缓存进度推进到本块末尾,
+     * 下一块 (offset=本块末尾) 仍命中折叠, 全程只有首读进历史。 */
+    if (offset > 0 && total >= 0 &&
+        g_read_cur_path[0] && strcmp(g_read_cur_path, path) == 0 &&
+        g_read_cur_next == offset && g_read_cur_total == total) {
+        g_read_cur_next = (long long)offset + (long long)used;   /* 推进进度 */
+        snprintf(tool_out, BUFSZ, "%s", READ_CACHED_PLACEHOLDER);
+        return;
+    }
+    /* 更新缓存: 只记录"连续读的进度" (任何换文件/回读都重新建档, 让后续同向续读仍命中) */
+    if (total >= 0) {
+        size_t cpl = strlen(path);
+        if (cpl < PATHSZ) {
+            memcpy(g_read_cur_path, path, cpl + 1);
+            g_read_cur_next = (long long)offset + (long long)used;
+            g_read_cur_total = total;
+        }
     }
     if (more) {
         char note[320];

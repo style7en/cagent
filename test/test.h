@@ -1075,7 +1075,9 @@ static int run_all_tests(void) {
     {
         test_ws_begin();
 
-        /* 20KB 文件: 默认 16KB 上限必须截断并给出续读 offset */
+        /* 20KB 文件: 首读只回头部预览 (FILE_HEAD_PREVIEW), 续读首块命中缓存折叠,
+         * 跳过缓存位置的续读走正常逐块读取 (含 END)。
+         * 大文件旁路: 折叠块的完整内容只在会话本地缓存, 不回传进历史。 */
         {
             char *big = (char*)malloc(20004);
             if (big) {
@@ -1085,18 +1087,23 @@ static int run_all_tests(void) {
                 tool_write_file("big.txt", big);
                 free(big);
             }
-            size_t cap = tool_output_cap();
+            read_cache_clear();
+            size_t preview = FILE_HEAD_PREVIEW;
             tool_read_file("big.txt", 0);
-            CHK(strstr(tool_out, "已截断") != NULL);
+            CHK(strstr(tool_out, "已截断") != NULL);   /* 首读只回预览, 必然截断 */
             {
                 char hint[64];
-                snprintf(hint, sizeof(hint), "offset=%zu", cap);
-                CHK(strstr(tool_out, hint) != NULL);      /* 提示里给下一次的 offset */
+                snprintf(hint, sizeof(hint), "offset=%zu", preview);
+                CHK(strstr(tool_out, hint) != NULL);   /* 提示给下一次的 offset */
             }
-            /* 续读: 从上次的 offset 拿到剩余部分 (含 END, 无截断提示) */
-            tool_read_file("big.txt", (long long)tool_output_cap());
+            /* 续读: 从首读的 offset 继续, 命中缓存折叠 -> 不回传内容, 只有占位标记 */
+            tool_read_file("big.txt", (long long)preview);
+            CHK(strstr(tool_out, READ_CACHED_PLACEHOLDER) != NULL);
+            CHK(strstr(tool_out, "END") == NULL);      /* 折叠块内容不在回传里 */
+
+            /* 跳过缓存位置 (读方向不连续): 不命中折叠, 正常读回含 END 的尾部 */
+            tool_read_file("big.txt", 16000);
             CHK(strstr(tool_out, "END") != NULL);
-            CHK(strstr(tool_out, "已截断") == NULL);
 
             /* 超出文件末尾: 明确说明, 不报错 */
             tool_read_file("big.txt", 999999);
