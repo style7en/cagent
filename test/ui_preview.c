@@ -686,8 +686,9 @@ static void inbox_selftest(void) {
 }
 
 /* drain 投递顺序: ui_drain_inbox 必须先投 FOLDEND (折上一轮答案的尾块), 再投插话回显 ——
- * 反了用户会看到"自己的插话插在上一轮答案上面"。两条都走 PostMessage, 由上面的
- * MyPostMessageW 记进 g_pq, 逐条断言类型 / 角色 / 文本。
+ * 反了用户会看到"自己的插话插在上一轮答案上面"; 最后还要投一条 WM_APP_INBOX 让输入框的
+ * 占位清单少掉这一条 (漏了它, 排队条目会留在输入框上挂着不消失)。
+ * 两条正文都走 PostMessage, 由上面的 MyPostMessageW 记进 g_pq, 逐条断言类型 / 角色 / 文本。
  * gui_on_done 剩下的部分是线程编排 (原地再开一轮、g_running 保持 1), 由 e2e T022
  * 走真实二进制守护; 这里锁死的是消息契约 —— d46e7f3 的教训: 收尾消息赶在正文入队前,
  * 同步直调的桩测不出来, 必须像现在这样把投递原样记下来按序查。 */
@@ -700,11 +701,13 @@ static void drain_order_selftest(void) {
     ok &= inbox_push("插一句话");
     ok &= ui_drain_inbox(buf, sizeof(buf));
     ok &= (strcmp(buf, "插一句话") == 0);
-    ok &= (g_pq_n == 2);                                   /* 恰好两条投递 */
+    ok &= (g_pq_n == 3);                                   /* 恰好三条投递 */
     if (ok && g_pq[0].msg != WM_APP_FOLDEND) ok = 0;       /* 先折尾块 */
     if (ok && g_pq[1].msg != WM_APP_APPEND)  ok = 0;       /* 再回显 */
     if (ok && g_pq[1].wp  != (WPARAM)CAGENT_ROLE_USER) ok = 0;
     if (ok && (!g_pq[1].txt || strcmp(g_pq[1].txt, "插一句话\r\n") != 0)) ok = 0;
+    if (ok && g_pq[2].msg != WM_APP_INBOX)   ok = 0;       /* 最后刷占位清单 */
+    if (ok && g_pq[2].h != g_hInput)         ok = 0;       /* 投给输入框, 不是输出区 */
     /* txt 是 gui_emit strdup 出来的: 不 pump 的自检要自己放回去 (pq_pump 会 free) */
     for (int i = 0; i < g_pq_n; i++) if (g_pq[i].txt) free(g_pq[i].txt);
     g_pq_n = 0;
@@ -714,7 +717,162 @@ static void drain_order_selftest(void) {
     ok &= (g_pq_n == 0);
 
     if (!ok) g_pv_fails++;
-    printf("drain order selftest: FOLDEND -> APPEND(USER) [%s]\n", ok ? "OK" : "FAIL");
+    printf("drain order selftest: FOLDEND -> APPEND(USER) -> INBOX [%s]\n", ok ? "OK" : "FAIL");
+}
+
+/* 数控件当前像素里"深色" (R < 200) 的个数, 只统计横向条带 y ∈ [y0, y1); y1 < 0 = 到底。
+ * 判据与 test/ui_cue_probe.c 一致 (占位是灰字 + 白底, 画没画出来一数就知道)。
+ *
+ * 走 BitBlt 到内存 DIB 再数, 与下面的 render_to_bmp 同一条路径 —— **不要用 GetPixel**:
+ * 控件刚显示出来时窗口 DC 上读到的是未更新区域, 实测恒 0 (图里明明有字), 会把
+ * "占位没画"误判成失败。bmp_path 非空则顺带存图给人眼复核。 */
+static int pv_dark_band(HWND h, int y0, int y1, const char *bmp_path) {
+    RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+
+    RECT rc;
+    GetClientRect(h, &rc);
+    int w = rc.right, hh = rc.bottom;
+    if (w <= 0 || hh <= 0) return 0;
+    if (y1 < 0 || y1 > hh) y1 = hh;
+    if (y0 < 0) y0 = 0;
+
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = hh;      /* 正高度: 内存首行 = 图像末行 */
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void *bits = NULL;
+    HBITMAP hbm = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!hbm || !bits) return 0;
+    HDC mem = CreateCompatibleDC(NULL);
+    HGDIOBJ old = SelectObject(mem, hbm);
+    HDC src = GetDC(h);
+    int n = 0;
+    if (src && BitBlt(mem, 0, 0, w, hh, src, 0, 0, SRCCOPY)) {
+        /* DIB 是自下而上的: 内存行 r 对应客户区 y = hh-1-r */
+        for (int y = y0; y < y1; y++) {
+            const unsigned char *row = (const unsigned char*)bits + (size_t)(hh - 1 - y) * (size_t)w * 4u;
+            for (int x = 0; x < w; x++)
+                if (row[x * 4] < 200) n++;      /* [0]=B [1]=G [2]=R */
+        }
+        if (bmp_path) save_bmp32(bmp_path, w, hh, bits);
+    }
+    if (src) ReleaseDC(h, src);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    DeleteObject(hbm);
+    if (bmp_path) printf("%s %dx%d 条带 y[%d,%d) 深色像素 %d\n", bmp_path, w, hh, y0, y1, n);
+    return n;
+}
+
+/* 宽字符相等 (MinGW 下 wcscmp 未必可见, 与上面的 pv_wstrstr 同理由自己写) */
+static int pv_weq(const wchar_t *a, const wchar_t *b) {
+    while (*a && *b && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+/* 输入框占位提示 ("后续任务" 清单, hooks.h 的 ui_inbox_tip / wndproc.h 的 ui_input_draw_tip):
+ *   ① 文本契约: 队列空没有占位; 有队列时格式为 "后续任务:\\n· 每条一行";
+ *     每条按**字符数**截到 INBOX_TIP_MAXCH, 超出补 "..." (正好等于上限则不补);
+ *     多行插话只取首行, 后面还有内容也要补 "..."
+ *   ② 真控件渲染: 建一个与产品同款的多行 EDIT + 挂真实 InputProc, 数像素证明
+ *     空时画了灰字、**聚焦时照样画** (原生 cue 是聚焦即隐, 我们刻意不那样)、
+ *     有内容时不再画 (否则会和正文重叠)
+ * 顺带出 preview_input.bmp 给人眼看: 一行一条折没折行、省略号位置好不好看。 */
+static void input_tip_selftest(void) {
+    WCHAR tip[INBOX_TIP_LEN];
+    int ok = 1, ph_empty = 0, ph_fmt = 0, ph_multiline = 0, ph_bound = 0;
+
+    /* ---- ① 文本契约 ---- */
+    g_inbox_n = 0;
+    ph_empty = (ui_inbox_tip(tip, INBOX_TIP_LEN) == 0);
+
+    char long_ascii[64];
+    memset(long_ascii, 'a', 40);                 /* 40 字符: 必然被截断 */
+    long_ascii[40] = '\0';
+
+    g_inbox_n = 0;
+    ok &= inbox_push("看下 Makefile");
+    ok &= inbox_push(long_ascii);
+    ok &= inbox_push("第一行\r\n第二行不该出现在占位里");
+    int got = ui_inbox_tip(tip, INBOX_TIP_LEN);
+
+    /* 期望串: 标题 + 每条一行 "· " + 内容; 40 字符那条按上限截 28 再补 "..." */
+    char expect[512];
+    snprintf(expect, sizeof(expect), "后续任务：\n· 看下 Makefile\n· %.28s...\n· 第一行...", long_ascii);
+    WCHAR want[INBOX_TIP_LEN];
+    utf8_to_wide(expect, want, INBOX_TIP_LEN);
+    ph_fmt = (got == 1) && pv_weq(tip, want);
+    if (!ph_fmt) {
+        printf("  got : ");
+        for (int i = 0; tip[i] && i < 120; i++) printf("%04X ", (unsigned)tip[i]);
+        printf("\n  want: ");
+        for (int i = 0; want[i] && i < 120; i++) printf("%04X ", (unsigned)want[i]);
+        printf("\n");
+    }
+    /* 多行插话只占一行: 第二条正文一个字符都不许出现在占位里 */
+    ph_multiline = (pv_wstrstr(tip, L"第二行") == NULL);
+
+    /* 长度边界: 正好 MAXCH 不补 "..."; MAXCH+1 补 */
+    {
+        char exact[INBOX_TIP_MAXCH + 1], over[INBOX_TIP_MAXCH + 2];
+        memset(exact, 'b', INBOX_TIP_MAXCH);     exact[INBOX_TIP_MAXCH] = '\0';
+        memset(over,  'b', INBOX_TIP_MAXCH + 1); over[INBOX_TIP_MAXCH + 1] = '\0';
+        WCHAR line[INBOX_TIP_MAXCH + 8];
+        int n_exact = inbox_tip_line(exact, line, INBOX_TIP_MAXCH + 8);
+        int n_over  = inbox_tip_line(over,  line, INBOX_TIP_MAXCH + 8);
+        ph_bound = (n_exact == INBOX_TIP_MAXCH) && (n_over == INBOX_TIP_MAXCH + 3);
+    }
+    ok &= ph_empty && ph_fmt && ph_multiline && ph_bound;
+
+    /* ---- ② 真控件渲染 (g_hInput 由 main 建好并挂了真实 InputProc) ---- */
+    int line_h = dp(16);
+    {
+        HDC dc = GetDC(g_hInput);
+        if (dc) {
+            HFONT of = (HFONT)SelectObject(dc, g_hFont);
+            TEXTMETRICW tm;
+            if (GetTextMetricsW(dc, &tm)) line_h = tm.tmHeight + tm.tmExternalLeading;
+            SelectObject(dc, of);
+            ReleaseDC(g_hInput, dc);
+        }
+    }
+    int px_plain = pv_dark_band(g_hInput, 0, -1, "preview_input.bmp");
+    /* 聚焦: 原生 cue 会消失, 我们必须照旧显示 (用户正一边打字一边看排队条目) */
+    SetFocus(g_hInput);
+    int px_focus = pv_dark_band(g_hInput, 0, -1, NULL);
+    /* 有内容: 占位必须让位 —— 第二行往下一个深色像素都不该有 (单字符文本只占第一行)。
+     * 分界线用控件自己报的第二行行首位置 (EM_POSFROMCHAR 取文本末位), 不靠字号估算。
+     * 容忍 ≤4 像素: 字号换算下字形下沿会越过行线 1 像素 (实测 y_line2 处那一行), 而占位
+     * 真没让位时这里是几千像素 —— 两种情况的量级差三个数量级, 不靠这个阈值区分不出来。 */
+    SetWindowTextW(g_hInput, L"x");
+    int y_line2 = line_h;
+    {
+        POINTL p;
+        memset(&p, 0, sizeof(p));
+        if (SendMessageW(g_hInput, EM_POSFROMCHAR, (WPARAM)&p, 1) != -1 && p.y > 0)
+            y_line2 = (int)p.y;
+    }
+    int px_text_top = pv_dark_band(g_hInput, 0, y_line2, NULL);
+    int px_text_low = pv_dark_band(g_hInput, y_line2, -1, NULL);
+    SetWindowTextW(g_hInput, L"");       /* 还原成空, 不给后面的自检留状态 */
+
+    ok &= (px_plain > 0) && (px_focus > 0) && (px_text_top > 0) && (px_text_low <= 4);
+
+    /* 善后: 队列清空、假投递队列清空 (后面还有自检要用) */
+    g_inbox_n = 0;
+    for (int i = 0; i < g_pq_n; i++) if (g_pq[i].txt) free(g_pq[i].txt);
+    g_pq_n = 0;
+
+    if (!ok) g_pv_fails++;
+    printf("input tip selftest: 空态=%d 格式=%d 多行只取首行=%d 截断边界=%d"
+           " | 像素 空=%d 聚焦=%d 有正文首行=%d 次行=%d [%s]\n",
+           ph_empty, ph_fmt, ph_multiline, ph_bound,
+           px_plain, px_focus, px_text_top, px_text_low, ok ? "OK" : "FAIL");
 }
 
 int main(void) {
@@ -883,12 +1041,23 @@ int main(void) {
                (long)p1.dxStartIndent, (long)p2.dxStartIndent);
     }
 
+    /* 输入框 (产品里由 WM_CREATE 建, 这里补上 —— 占位提示的自检要一个真控件, 且
+     * drain 的投递契约也要有目标窗口)。建在所有出图之后, 免得挡住 preview_out.bmp。 */
+    g_hInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+        0, 0, 0, 0, hwnd, (HMENU)(LONG_PTR)ID_INPUT, NULL, NULL);
+    if (!g_hInput) { printf("CreateWindow input EDIT failed\n"); return 1; }
+    SendMessageW(g_hInput, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    g_oldInputProc = (WNDPROC)SetWindowLongPtrW(g_hInput, GWLP_WNDPROC, (LONG_PTR)InputProc);
+    SetWindowPos(g_hInput, HWND_TOP, dp(8), dp(8), dp(420), dp(96), SWP_SHOWWINDOW);
+
     /* 回放自检放最后 —— 它会清空历史框并重置块表, 前面那些检查都还要用当前内容。
      * inbox/drain 是纯逻辑与投递契约, 不碰文档内容, 排在它前面。 */
     note_split_selftest();
     empty_delta_selftest();
     inbox_selftest();
     drain_order_selftest();
+    input_tip_selftest();      /* 占位提示: 文本契约 + 真控件渲染 (顺带出 preview_input.bmp) */
     replay_selftest();
     fold_cap_selftest();
 

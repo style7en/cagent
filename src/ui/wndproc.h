@@ -249,7 +249,56 @@ static int ui_zoom_wheel(WPARAM wp) {
     return 1;   /* 攒不满一格也算消费: 否则缩放途中会同时触发控件自己的滚动 */
 }
 
+/* 输入框的占位提示: 把排队中的插话列出来 (文本由 hooks.h 的 ui_inbox_tip 拼好)。
+ *
+ * 为什么不用 EM_SETCUEBANNER: 那个接口**只认单行 EDIT** —— 实测多行控件上
+ * EM_SETCUEBANNER 直接返回 FALSE 且什么都不画 (test/ui_cue_probe.c 就是为查这个写的),
+ * 而我们的输入框是多行可换行的 (Shift+Enter)。自己画还顺带得到原生接口给不了的行为:
+ * **聚焦时也显示**。这里显示的是"还有几条排队没发", 用户正一边打字一边看它 —— 原生 cue
+ * 恰恰是聚焦即隐 (实测 focused 灰字像素 679 -> 0), 那等于常态下什么都看不到。
+ *
+ * 只在输入框为空时画: 有内容时画上去会和正文重叠 (文本一非空, 下面那次空转绘制就不再
+ * 发生, 原先的灰字被控件自己的重绘覆盖掉 —— EN_CHANGE 分支已经把整块客户区标脏)。
+ * 颜色取 COLOR_GRAYTEXT, 与配置区接口地址框的 cue 同色, 跟着系统主题走。 */
+static void ui_input_draw_tip(HWND h) {
+    if (GetWindowTextLengthW(h) > 0) return;
+    WCHAR tip[INBOX_TIP_LEN];
+    if (!ui_inbox_tip(tip, INBOX_TIP_LEN)) return;
+
+    HDC dc = GetDC(h);
+    if (!dc) return;
+    HFONT old_font = (HFONT)SelectObject(dc, g_hFont);
+    int      old_bk = SetBkMode(dc, TRANSPARENT);
+    COLORREF old_fg = SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+
+    RECT rc;
+    GetClientRect(h, &rc);
+    rc.left  += dp(5);      /* 起点让开控件自身的左边距: 插入符就画在那一列, 不会压字 */
+    rc.top   += dp(3);
+    rc.right -= dp(3);
+    /* DT_NOPREFIX: 用户消息里可能有 '&' (会当助记符吃掉); 不设 DT_SINGLELINE, 文本里的
+     * '\n' 就是换行 —— 每条插话一行正是靠它。 */
+    DrawTextW(dc, tip, -1, &rc, DT_LEFT | DT_TOP | DT_NOPREFIX);
+
+    SetTextColor(dc, old_fg);
+    SetBkMode(dc, old_bk);
+    SelectObject(dc, old_font);
+    ReleaseDC(h, dc);
+}
+
 static LRESULT CALLBACK InputProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    /* 队列变了 (工作线程 drain 之后投来的) -> 重画占位清单 */
+    if (msg == WM_APP_INBOX) {
+        InvalidateRect(h, NULL, TRUE);
+        return 0;
+    }
+    /* 画完控件自己的内容再补占位 —— 必须排在 CallWindowProc 之后: 默认过程在 WM_PAINT
+     * 里已经做完 BeginPaint/EndPaint, 此刻的 GetDC 画上去才不会被它覆盖。 */
+    if (msg == WM_PAINT) {
+        LRESULT r = CallWindowProcW(g_oldInputProc, h, msg, wp, lp);
+        ui_input_draw_tip(h);
+        return r;
+    }
     /* Ctrl+滚轮: 缩放输出区字号(见 ui_zoom_wheel 的注释: 焦点在这里时消息只到这儿) */
     if (msg == WM_MOUSEWHEEL && ui_zoom_wheel(wp)) return 0;
     if (msg == WM_KEYDOWN && wp == VK_RETURN) {
@@ -439,6 +488,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_COMMAND:
+        /* 输入框文本变了 (打字 / 粘贴 / 撤销 / SetWindowText 清空) -> 重画占位提示:
+         * 空则画上, 非空则让控件自己的重绘把灰字盖掉。不逐个拦键盘消息, 是因为
+         * EN_CHANGE 覆盖了所有改文本的路径; 重复标脏也会和控件自身的重绘合并成一次
+         * WM_PAINT, 不会多画一遍。 */
+        if (LOWORD(wp) == ID_INPUT && HIWORD(wp) == EN_CHANGE) {
+            InvalidateRect(g_hInput, NULL, FALSE);
+            return 0;
+        }
         /* 「发送」永远可点: 空闲 -> 发新轮; 运行中 -> 有文字就**排队** (插话),
          * 空则无事可做。**不再有"运行中把发送按钮临时改成停止"那套** ——
          * 停止是「停止」按钮与 Esc 的独立职责 (见下面的 ID_STOP)。 */
@@ -454,9 +511,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (u8) {
                             WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, u8, need, NULL, NULL);
                             if (inbox_push(u8)) {
-                                /* 入队即清空输入框: 用户看到"话已递出去", 按钮带上队计数 */
+                                /* 入队即清空输入框: 用户看到"话已递出去", 按钮带上队计数;
+                                 * 清空后占位提示立刻列出全部排队条目 (见 ui_inbox_tip)。 */
                                 SetWindowTextW(g_hInput, L"");
                                 ui_buttons_running();
+                                ui_inbox_tip_refresh();
                             } else {
                                 /* 队满 (INBOX_MAX) 或超长 (INBOX_SLOT): 拒绝并说明,
                                  * 文字留在输入框 —— 不静默截断用户的指令 */

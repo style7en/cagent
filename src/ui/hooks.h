@@ -70,6 +70,85 @@ static int inbox_take(char *out, size_t cap) {
     return ok;
 }
 
+/* ===== 输入框占位提示: "后续任务" 清单 =====
+ * 排队中的插话在输入框空着时以灰字列出来, 用户一眼看到"还有几条没发出去":
+ *     后续任务：
+ *     · 第一条
+ *     · 第二条
+ * 画在哪里见 wndproc.h 的 ui_input_draw_tip —— 多行 EDIT 上 EM_SETCUEBANNER 无效
+ * (实测直接返回 FALSE), 只能自己画。 */
+
+/* 一条插话 -> 占位里的一行。取**首行** (插话可以多行: Shift+Enter, 但占位里一条只占
+ * 一行), 超过 INBOX_TIP_MAXCH 个字符就截断、补 "..." 表示还有内容。返回写入的宽字符数
+ * (不含结尾 NUL)。
+ *
+ * 按 UTF-16 码元截断 (不会切半个汉字); 先按字节限长再转宽字符 —— 一条插话最长 64KB,
+ * 全量转换既费时又要给 64K 宽字符开缓冲, 而我们最多只看前 INBOX_TIP_MAXCH 个字符
+ * (UTF-8 下每字符最多 4 字节, 所以截 4*MAXCH 字节足够)。 */
+static int inbox_tip_line(const char *utf8, WCHAR *out, int cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = L'\0';
+    if (!utf8 || !utf8[0]) return 0;
+
+    size_t n = 0;                                        /* 首行的字节数 (不含换行) */
+    while (utf8[n] && utf8[n] != '\r' && utf8[n] != '\n') n++;
+
+    size_t take = (size_t)INBOX_TIP_MAXCH * 4;
+    int more = (utf8[n] != '\0');                        /* 首行之后还有内容 */
+    if (take > n) take = n;
+    else          more = 1;                              /* 首行本身就超长 */
+    take = utf8_trim_len(utf8, take);                    /* 不切半个多字节字符 */
+
+    WCHAR tmp[INBOX_TIP_MAXCH * 4 + 4];
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, (int)take, tmp,
+                                   INBOX_TIP_MAXCH * 4 + 4);
+    if (wlen < 0) wlen = 0;
+    int keep = wlen > INBOX_TIP_MAXCH ? INBOX_TIP_MAXCH : wlen;
+    if (wlen > keep) more = 1;
+    if (keep > cap - 2) keep = cap - 2;                  /* 给 "..." 与 NUL 留位 */
+    if (keep < 0) keep = 0;
+    memcpy(out, tmp, (size_t)keep * sizeof(WCHAR));
+    int o = keep;
+    if (more && o <= cap - 4) {
+        out[o++] = L'.'; out[o++] = L'.'; out[o++] = L'.';
+    }
+    out[o] = L'\0';
+    return o;
+}
+
+/* 把排队中的插话拼成占位文本 ("后续任务:" + 每条一行)。队列空返回 0 = 没有占位要画。
+ *
+ * **只能在 UI 线程调用** (由 WM_PAINT 触发): 它读 g_inbox 并一直持共享锁 —— push
+ * (UI 线程) / take (工作线程) 走排他锁, 读到的永远是完整的一条; 拼字符串只有几微秒,
+ * 占着共享锁不会拖慢排队。 */
+static int ui_inbox_tip(WCHAR *out, int cap) {
+    if (!out || cap < 8) return 0;
+    int n = 0, got = 0;
+    AcquireSRWLockShared(&g_inbox_lock);
+    if (g_inbox_n > 0) {
+        got = 1;
+        const WCHAR *title = L"后续任务：";
+        for (int k = 0; title[k] && n < cap - 1; k++) out[n++] = title[k];
+        for (int i = 0; i < g_inbox_n; i++) {
+            WCHAR line[INBOX_TIP_MAXCH + 4];
+            if (!inbox_tip_line(g_inbox[i], line, INBOX_TIP_MAXCH + 4)) continue;
+            static const WCHAR bullet[] = { L'\n', L'·', L' ', L'\0' };
+            for (int k = 0; bullet[k] && n < cap - 1; k++) out[n++] = bullet[k];
+            for (int k = 0; line[k] && n < cap - 1; k++) out[n++] = line[k];
+            if (n >= cap - 1) break;                     /* 装不下了: 剩下的条目不画 */
+        }
+        out[n] = L'\0';
+    }
+    ReleaseSRWLockShared(&g_inbox_lock);
+    return got;
+}
+
+/* 入队/出队之后让输入框重画占位提示。push 在 UI 线程、drain 在工作线程, 一律投递 ——
+ * 跨线程直接碰控件是不允许的 (与 gui_status 同理)。 */
+static void ui_inbox_tip_refresh(void) {
+    if (g_hInput) PostMessageW(g_hInput, WM_APP_INBOX, 0, 0);
+}
+
 /* 用户消息回显 (USER 角色: 蓝底加粗, 见 ui/state.h 的样式表)。
  * 两处共用: task.h 的首发、gui_on_done 的插话消费。不加"你："前缀 (样式已说明是谁),
  * 不带前导换行 (上一块若没收尾, do_append 的 g_last_no_lf 会补; 带了每条用户消息前
@@ -120,6 +199,7 @@ static int ui_drain_inbox(char *out, size_t cap) {
     if (!inbox_take(out, cap)) return 0;
     gui_turn_end();
     ui_echo_user(out);
+    ui_inbox_tip_refresh();      /* 队里少了一条 -> 输入框的占位清单跟着更新 */
     return 1;
 }
 

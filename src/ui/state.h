@@ -53,6 +53,9 @@
 #define WM_APP_STATUS  (WM_APP + 4)   /* 更新状态栏。lParam = UTF-8 char* (须 free),
                                        * 传 0 表示回到空闲。**必须走消息队列**: core 在工作
                                        * 线程里报告状态, 直接碰控件是不允许的。 */
+#define WM_APP_INBOX   (WM_APP + 5)   /* 插话队列变了 -> 重绘输入框的占位提示 ("后续任务"
+                                       * 清单, 见 hooks.h 的 ui_inbox_tip)。drain 发生在
+                                       * 工作线程, 同样只能投递, 不能直接碰控件。 */
 
 #define CFG_URL 0
 #define CFG_KEY 1
@@ -220,6 +223,12 @@ static int  md_pending(void);
 static char g_inbox[INBOX_MAX][INBOX_SLOT];
 static int  g_inbox_n;
 static SRWLOCK g_inbox_lock = SRWLOCK_INIT;
+
+/* 占位提示的排版常量 (输入框为空时显示的"后续任务"清单, 见 hooks.h 的 ui_inbox_tip):
+ *   INBOX_TIP_MAXCH 单条最多保留的字符数, 超出补 "..."  —— 每条只占一行, 长度固定
+ *   INBOX_TIP_LEN   占位文本的总容量 (宽字符): 标题 + INBOX_MAX 行 + 余量 */
+#define INBOX_TIP_MAXCH 28
+#define INBOX_TIP_LEN   512
 
 /* ===== GUI 状态 ===== */
 static HWND g_hHistory, g_hInput, g_hSend, g_hStop, g_hNew, g_hSess;
