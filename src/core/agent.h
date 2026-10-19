@@ -56,6 +56,9 @@ static const char *g_system_prompt = g_prompt_default;
 #define BYTES_PER_TOKEN_EST        3
 /* 摘要硬上限 (字节); 提示词要求模型控制在 2000 字以内, 此处兜底截断。 */
 #define COMPACT_SUMMARY_MAX        8192
+/* 摘要请求自己的输出预算 (token)。不要沿用主请求的 max_tokens: 摘要只需要一小段,
+ * 而且输出预算也占模型窗口, 用 64K 会把本来放得下的旧历史顶成 400。 */
+#define COMPACT_SUMMARY_MAX_TOKENS 4096
 /* 压缩时尾部原样保留的预算 (字节): 摘要 + 最近原文, 避免刚读过的内容全部丢失。 */
 #define COMPACT_TAIL_KEEP_BYTES    (32 * 1024)
 /* 400 上下文超限后"压缩并重试"的最大次数, 防止压缩不奏效时无限打转。 */
@@ -194,6 +197,29 @@ static void system_prompt_apply_default(void) {
         system_prompt_set_raw(SYSTEM_PROMPT_CONTENT_DEFAULT);
 }
 
+/* 外置提示词的字节归一化 (仅用于缓存友好, 不改变语义):
+ * 去 UTF-8 BOM, CRLF/CR -> LF。编辑器保存一次通常就会改变这些字节;
+ * 而 system prompt 是每个请求的第 0 个 token, 变一个字节就让整段前缀缓存失效。 */
+static void normalize_prompt_text(char *s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    if (n >= 3 && (unsigned char)s[0] == 0xEF &&
+                 (unsigned char)s[1] == 0xBB &&
+                 (unsigned char)s[2] == 0xBF) {
+        memmove(s, s + 3, n - 2);   /* 剩余内容 + NUL */
+    }
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (*r == '\r') {
+            if (r[1] == '\n') r++;   /* CRLF 只输出一个 LF */
+            *w++ = '\n';
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
+}
+
 /* 启动时读取 exe 同目录的 SYSTEM_PROMPT 外置提示词。
  * 文件不存在 / 空 / 超限 / 转码后为空 -> 静默保持内置默认。 */
 static void system_prompt_init(void) CAGENT_MAYBE_UNUSED;   /* 测试二进制不调用 (保持默认指针) */
@@ -223,6 +249,8 @@ static void system_prompt_init(void) {
         oem_to_utf8(buf, (size_t)fsz * 2 + 1);
         n = strlen(buf);
     }
+    normalize_prompt_text(buf);   /* BOM / CRLF 归一化: 避免编辑器差异破坏前缀缓存 */
+    n = strlen(buf);
     if (n == 0 || !is_valid_utf8((const unsigned char*)buf, n)) {
         free(buf);
         log_line("[prompt] 外置提示词转码后为空/仍非法 UTF-8, 回退默认: %s", path);
@@ -263,7 +291,7 @@ static void chat_completions_url(char *out, size_t cap) {
              (nurl > 0 && g_api_url[nurl - 1] == '/') ? "" : "/");
 }
 
-/* 请求体的 max_tokens 片段 (agent_turn 与上下文压缩共用)。
+/* 主请求体的 max_tokens 片段 (摘要请求在 compact_via_summary 里单独限制)。
  * 必须显式下发: 缺省时服务端/中转自用保守默认 (常见 1024-4096), 而本模型是
  * 推理模型, 思考 token 又先消耗输出预算 —— 模型刚开始内联大文件就被
  * finish=length 掐断, 这是截断问题的根源。g_max_tokens<=0 时输出空串,
@@ -411,18 +439,33 @@ static long estimate_prompt_tokens(void) {
     return (long)now / BYTES_PER_TOKEN_EST;
 }
 
-/* 是否应当压缩: 配置了模型窗口 (ini 的 context_tokens) 则按 token 估算到 80% 触发;
- * 未配置或服务端不发 usage 时退回字节水位 (75% BUFSZ)。 */
+/* 可用于输入的 token 预算。context_tokens 是模型的**总窗口** (输入 + 输出),
+ * max_tokens 也占同一窗口; 只按总窗口的 80% 判断会在输出预算较大时先撞 400,
+ * 然后被动压缩 —— 既慢又会把好好的前缀缓存打掉。这里显式扣掉输出预算。
+ * max_tokens 未配置或配置得比窗口还大时退回总窗口, 避免出现 0/负预算。 */
+static long context_input_budget(void) {
+    if (g_context_tokens <= 0) return 0;
+    if (g_max_tokens > 0 && g_max_tokens < g_context_tokens)
+        return g_context_tokens - g_max_tokens;
+    return g_context_tokens;
+}
+
+/* 是否应当压缩: 配置了模型窗口 (ini 的 context_tokens) 则按输入预算的 90% 触发;
+ * 未配置或服务端不发 usage 时退回字节水位 (75% BUFSZ)。
+ * 90% 而不是 80%: 前缀缓存下, 压缩会改写前缀、丢掉整个缓存; 能晚一点压就晚一点。 */
 static int context_pressure(void) {
-    if (g_context_tokens > 0 &&
-        estimate_prompt_tokens() > g_context_tokens * 4 / 5) return 1;
+    long budget = context_input_budget();
+    if (budget > 0 &&
+        estimate_prompt_tokens() > budget * 9 / 10) return 1;
     return strlen(messages) > MESSAGES_WATERMARK;
 }
 
-/* 压缩目标: 压完至少降到该字节数以下 (配置了窗口按窗口折算, 否则水位的一半) */
+/* 压缩目标: 压完至少降到该字节数以下 (配置了窗口按输入预算折算, 否则水位的一半)。
+ * 目标取输入预算的 50%: 压缩本身会丢掉旧前缀的缓存, 压完留足空间, 尽量少压下一次。 */
 static size_t compact_target_bytes(void) {
-    if (g_context_tokens > 0) {
-        size_t t = (size_t)g_context_tokens * BYTES_PER_TOKEN_EST / 2;
+    long budget = context_input_budget();
+    if (budget > 0) {
+        size_t t = (size_t)budget * BYTES_PER_TOKEN_EST / 2;
         if (t > MESSAGES_WATERMARK) t = MESSAGES_WATERMARK;
         if (t == 0) t = 1;
         return t;
@@ -487,7 +530,10 @@ static int compact_via_summary(int halve) {
         ks = s;
     }
 
-    /* 4. 摘要请求: system + [0,ks) + ask (不带 tools, 避免模型改为调用工具) */
+    /* 4. 摘要请求: system + [0,ks) + ask。
+     * **带 tools + tool_choice:none**: 服务端通常把 tools 也算进缓存前缀; 摘要请求
+     * 和正常请求保持相同前缀形状, 才能命中旧对话的 prefix cache。tool_choice:none
+     * 则保证模型不会真的去调工具 (它只需要输出摘要)。 */
     static const char *ask =
         "上下文即将超出长度上限。请把以上对话压缩成一份交接摘要, 供后续继续工作。"
         "必须保留: 1) 用户的目标与约束; 2) 已完成的关键步骤与结论; 3) 创建或改动过的文件路径; "
@@ -503,13 +549,18 @@ static int compact_via_summary(int halve) {
     free(esc_ask);
     if (rn <= 0 || (size_t)rn >= rcap) { free(req_msgs); return 0; }
 
-    size_t bcap = (size_t)rn + strlen(g_model) + 192;   /* 192 含 ,"max_tokens":N 余量 */
+    size_t bcap = (size_t)rn + strlen(g_model) + strlen(TOOLS_JSON) + 256;
     char *bodybuf = (char*)malloc(bcap);
     if (!bodybuf) { free(req_msgs); return 0; }
+    /* 摘要只输出一小段: 单独限制输出预算, 不沿用主请求的 max_tokens。 */
+    int smt = (g_max_tokens > 0 && g_max_tokens < COMPACT_SUMMARY_MAX_TOKENS)
+                  ? g_max_tokens : COMPACT_SUMMARY_MAX_TOKENS;
     char mt_frag[48];
-    max_tokens_frag(mt_frag, sizeof(mt_frag));
-    snprintf(bodybuf, bcap, "{\"model\":\"%s\",\"messages\":[%s],\"stream\":true%s}",
-             g_model, req_msgs, mt_frag);
+    snprintf(mt_frag, sizeof(mt_frag), ",\"max_tokens\":%d", smt);
+    snprintf(bodybuf, bcap,
+             "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"tool_choice\":\"none\","
+             "\"stream\":true%s,\"stream_options\":{\"include_usage\":true}}",
+             g_model, req_msgs, TOOLS_JSON, mt_frag);
     free(req_msgs);
 
     char url[1280];
@@ -520,6 +571,12 @@ static int compact_via_summary(int halve) {
     if (cagent_stream_begin) cagent_stream_begin();
     int status = http_post_stream(url, g_api_key, bodybuf, strlen(bodybuf), err, sizeof(err), sctx);
     free(bodybuf);
+
+    if (status == 200 && sctx->prompt_tokens > 0) {
+        log_line("[compact] prompt=%ld cached=%ld hit=%.1f%%",
+                 sctx->prompt_tokens, sctx->cached_tokens,
+                 100.0 * (double)sctx->cached_tokens / (double)sctx->prompt_tokens);
+    }
 
     char *summary = NULL;
     if (status == 200 && sctx->content_len > 0) {
@@ -708,7 +765,8 @@ static void agent_turn(const char *user_msg) {
         char mt_frag[48];
         max_tokens_frag(mt_frag, sizeof(mt_frag));
         int blen = snprintf(body, sizeof(body),
-            "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true%s}",
+            "{\"model\":\"%s\",\"messages\":[%s],\"tools\":%s,\"stream\":true%s,"
+            "\"stream_options\":{\"include_usage\":true}}",
             g_model, messages, TOOLS_JSON, mt_frag);
         if (blen < 0 || (size_t)blen >= sizeof(body)) {
             /* BODY_SZ 的余量让这在数学上不可能发生; 真发生了也绝不能把半截 JSON
@@ -830,14 +888,22 @@ static void agent_turn(const char *user_msg) {
             goto done;
         }
 
-        log_line("[http] 成功 iter=%d finish=%s prompt_tokens=%ld data_lines=%d bad_json=%d msgs_len=%zu",
+        log_line("[http] 成功 iter=%d finish=%s prompt_tokens=%ld cached_tokens=%ld "
+                 "data_lines=%d bad_json=%d msgs_len=%zu",
              iter, ctx->finish[0] ? ctx->finish : "-", ctx->prompt_tokens,
-             ctx->n_data_lines, ctx->n_bad_json, strlen(messages));
+             ctx->cached_tokens, ctx->n_data_lines, ctx->n_bad_json, strlen(messages));
 
-        /* 服务端报告的 prompt_tokens (与请求时的 messages 长度配对, 供水位估算) */
+        /* 服务端报告的 prompt_tokens (与请求时的 messages 长度配对, 供水位估算)。
+         * cached_tokens 只用于成本/命中率观察: 命中的 token 仍然占模型窗口,
+         * 不能从上下文水位里扣掉。 */
         if (ctx->prompt_tokens > 0) {
             g_last_prompt_tokens = ctx->prompt_tokens;
             g_last_prompt_bytes = strlen(messages);
+            log_line("[usage] prompt=%ld cached=%ld hit=%.1f%%",
+                     ctx->prompt_tokens, ctx->cached_tokens,
+                     ctx->prompt_tokens > 0
+                         ? 100.0 * (double)ctx->cached_tokens / (double)ctx->prompt_tokens
+                         : 0.0);
         }
 
         if (strcmp(ctx->finish, "length") == 0)

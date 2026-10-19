@@ -180,6 +180,10 @@ typedef struct {
     int n_calls;
     char finish[24];           /* stop / length / tool_calls / content_filter 等 */
     long prompt_tokens;        /* 服务端报告的 prompt_tokens (SSE usage; 不发则 0) */
+    /* 命中前缀缓存的输入 token 数 (OpenAI: usage.prompt_tokens_details.cached_tokens;
+     * DeepSeek 等兼容实现: usage.prompt_cache_hit_tokens)。只用于成本/命中率统计,
+     * 不从上下文水位里扣除 —— 缓存命中仍然占用模型窗口。 */
+    long cached_tokens;
     /* 诊断留痕: 服务端返回 200 却解析不出 content/tool_calls 时, 日志里必须能看出它到底
      * 发了什么 —— 否则那条回滚完全无从下手 (err_out 在成功路径上是空的, 一点线索都没有)。 */
     char sse_head[512];        /* 第一条 data: 行的原文 (截断到 511 字节) */
@@ -415,6 +419,26 @@ static void stream_apply_delta(StreamCtx *ctx, const JValue *delta) {
     stream_apply_tool_calls(ctx, tcs);
 }
 
+/* 应用一片 usage。prompt_tokens 供水位估算; cached_tokens 只做成本统计。
+ * OpenAI 把命中数放在 usage.prompt_tokens_details.cached_tokens, 部分兼容实现
+ * (DeepSeek 等) 放在 usage.prompt_cache_hit_tokens, 两个都认。 */
+static void stream_apply_usage(StreamCtx *ctx, const JValue *usage) {
+    if (!ctx || !usage || usage->type != J_OBJ) return;
+    const JValue *pt = json_obj_get(usage, "prompt_tokens");
+    if (pt && pt->type == J_NUM && pt->num > 0)
+        ctx->prompt_tokens = (long)pt->num;
+
+    const JValue *details = json_obj_get(usage, "prompt_tokens_details");
+    const JValue *ct = details ? json_obj_get(details, "cached_tokens") : NULL;
+    const JValue *hit = json_obj_get(usage, "prompt_cache_hit_tokens");
+    if (ct && ct->type == J_NUM && ct->num > 0)
+        ctx->cached_tokens = (long)ct->num;
+    else if (hit && hit->type == J_NUM && hit->num > 0)
+        ctx->cached_tokens = (long)hit->num;
+    else if ((ct && ct->type == J_NUM) || (hit && hit->type == J_NUM))
+        ctx->cached_tokens = 0;    /* 明确报了 0: 覆盖同一 ctx 里上一次尝试的旧值 */
+}
+
 /* 单次请求尝试 (无重试): 建立连接、发送、流式读取 SSE、解析 tool_calls。
  * completed 输出参数: 是否完整收到 [DONE] (用于区分"200 但流被截断")。
  * retry_after_sec 输出参数: 服务端 Retry-After 头 (秒; 无或非数字为 0)。
@@ -565,11 +589,8 @@ static int http_post_stream_once(const char *url, const char *api_key,
                         /* 思考/正文/工具调用的应用规则见 stream_apply_delta —— 空串当"没有"
                          * 那层判断必须留在那边, 这里不要自己再展开一遍。 */
                         stream_apply_delta(ctx, delta);
-                        /* usage (常在末片): 记下 prompt_tokens 供水位估算, 没有则保持 0 */
-                        const JValue *usage = json_obj_get(root, "usage");
-                        const JValue *pt = usage ? json_obj_get(usage, "prompt_tokens") : NULL;
-                        if (pt && pt->type == J_NUM && pt->num > 0)
-                            ctx->prompt_tokens = (long)pt->num;
+                        /* usage 常在末片; 解析细节见 stream_apply_usage。 */
+                        stream_apply_usage(ctx, json_obj_get(root, "usage"));
                         json_free(root);
                     } else {
                         ctx->n_bad_json++;      /* 诊断计数: 200 但全是解析不了的 data 行 */

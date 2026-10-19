@@ -420,6 +420,44 @@ static int run_all_tests(void) {
         }
     }
 
+    /* ---- SSE: usage 的 prompt_tokens / cached_tokens 两种兼容形状 ---- */
+    {
+        StreamCtx c;
+        memset(&c, 0, sizeof(c));
+        JValue *u = json_parse(
+            "{\"prompt_tokens\":1234,\"prompt_tokens_details\":{\"cached_tokens\":1000}}");
+        CHK(u != NULL);
+        stream_apply_usage(&c, u);
+        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 1000);
+        json_free(u);
+
+        memset(&c, 0, sizeof(c));
+        u = json_parse("{\"prompt_tokens\":1234,\"prompt_cache_hit_tokens\":800}");
+        CHK(u != NULL);
+        stream_apply_usage(&c, u);
+        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 800);
+        json_free(u);
+
+        memset(&c, 0, sizeof(c));
+        u = json_parse("{\"prompt_tokens\":1234}");
+        CHK(u != NULL);
+        stream_apply_usage(&c, u);
+        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 0);
+        json_free(u);
+
+        /* 明确报 0 时覆盖旧值 (同一 ctx 可能经历过一次失败的尝试) */
+        c.cached_tokens = 999;
+        u = json_parse("{\"prompt_tokens\":1234,\"prompt_tokens_details\":"
+                       "{\"cached_tokens\":0}}");
+        CHK(u != NULL);
+        stream_apply_usage(&c, u);
+        CHK(c.cached_tokens == 0);
+        json_free(u);
+
+        stream_apply_usage(&c, NULL);                 /* 防御: 无 usage 不崩 */
+        CHK(c.prompt_tokens == 1234);
+    }
+
     /* ---- SSE: 无 index 的 tool_call 分片必须各自成条 (Gemini 3 兼容层的形状) ----
      * Gemini 的 OpenAI 兼容层不发 tool_calls[].index: 每个分片带一条完整的 function,
      * 只有 id/name/arguments。旧写法"缺 index 一律当 0 号"会把并发调用的第二条并进第一条
@@ -1034,14 +1072,26 @@ static int run_all_tests(void) {
         g_context_tokens = 100;                           /* 窗口极小: est=strlen/3 必然超 */
         CHK(context_pressure() == 1);
 
-        /* 有服务端读数: 上次 1000 token + 新增 900 字节 (~300 token) = 1300 */
+        /* 有服务端读数: 上次 1000 token + 新增 900 字节 (~300 token) = 1300。
+         * 90% 水位: 1400*9/10=1260 < 1300 -> 压; 2000*9/10=1800 >= 1300 -> 不压 */
         g_last_prompt_tokens = 1000;
         g_last_prompt_bytes = strlen(messages) - 900;
-        g_context_tokens = 1500;                          /* 1500*4/5=1200 < 1300 -> 压 */
+        g_context_tokens = 1400;
         CHK(context_pressure() == 1);
-        g_context_tokens = 2000;                          /* 1600 >= 1300 -> 不压 */
+        g_context_tokens = 2000;
         CHK(context_pressure() == 0);
 
+        /* 输入预算要扣掉输出预算: 1500 - 500 = 1000, 90%=900 < 1300 -> 压。
+         * max_tokens >= 窗口时配置无效, 退回总窗口, 不产生 0/负预算。 */
+        g_max_tokens = 500;
+        g_context_tokens = 1500;
+        CHK(context_input_budget() == 1000);
+        CHK(context_pressure() == 1);
+        g_max_tokens = 2000;
+        CHK(context_input_budget() == 1500);
+        CHK(context_pressure() == 0);
+
+        g_max_tokens = 65536;
         g_context_tokens = 0;
         g_last_prompt_tokens = 0;
         g_last_prompt_bytes = 0;
@@ -1207,6 +1257,13 @@ static int run_all_tests(void) {
         CHK(c != NULL && c->type == J_STR && strcmp(c->str, "say \"hi\"\nnext") == 0);
         if (r) json_free(r);
 
+        /* 外置提示词归一化: 去 BOM, CRLF/CR 统一成 LF (前缀缓存稳定性) */
+        {
+            char norm[] = "\xEF\xBB\xBF" "a\r\nb\rc\n";
+            normalize_prompt_text(norm);
+            CHK(strcmp(norm, "a\nb\nc\n") == 0);
+        }
+
         /* 空原文 / 超 32KB: 拒绝提交, 指针不动 */
         cur = g_system_prompt;
         CHK(system_prompt_set_raw("") == 0 && g_system_prompt == cur);
@@ -1326,9 +1383,17 @@ static int run_all_tests(void) {
         snprintf(g_skills_dir, sizeof(g_skills_dir), "cagent_test_ws\\skills");
         skills_init();
         CHK(g_skill_count == 2);                                  /* demo + bom */
-        {   /* 枚举按字母序, 不硬编码下标 */
+        /* 技能索引按名称排序: system prompt 的字节顺序必须稳定, 否则前缀缓存失效 */
+        CHK(strcmp(g_skills[0].name, "bomskill") == 0);
+        CHK(strcmp(g_skills[1].name, "demo") == 0);
+        {
+            const char *pb = strstr(g_skills_suffix, "bomskill");
+            const char *pd = strstr(g_skills_suffix, "demo");
+            CHK(pb != NULL && pd != NULL && pb < pd);
+        }
+        {   /* frontmatter 生效 */
             Skill *b = (strcmp(g_skills[0].name, "bomskill") == 0) ? &g_skills[0] : &g_skills[1];
-            CHK(strcmp(b->name, "bomskill") == 0);                /* frontmatter 生效 */
+            CHK(strcmp(b->name, "bomskill") == 0);
             CHK(strstr(b->desc, "BOM") != NULL);
         }
         dispatch_tool("load_skill", "{\"name\":\"bomskill\"}", "");
@@ -1472,7 +1537,10 @@ static int run_all_tests(void) {
                  "cagent_test_ws\\skills;cagent_test_ws\\skills2");
         skills_init();
         CHK(g_skill_count == 3);
-        CHK(strcmp(g_skills[2].name, "deep") == 0);
+        /* 排序后: deep < demo < other */
+        CHK(strcmp(g_skills[0].name, "deep") == 0);
+        CHK(strcmp(g_skills[1].name, "demo") == 0);
+        CHK(strcmp(g_skills[2].name, "other") == 0);
         dispatch_tool("load_skill", "{\"name\":\"demo\"}", "");
         CHK(strstr(tool_out, "DEMO-SKILL-BODY") != NULL);
         CHK(strstr(tool_out, "THIRD-SKILL-BODY") == NULL);

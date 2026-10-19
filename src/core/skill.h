@@ -216,6 +216,14 @@ static void skills_scan_dir(const char *root, int depth) {
     FindClose(h);
 }
 
+/* 技能索引按名称排序后再拼进 system prompt。
+ * FindFirstFile 的枚举顺序依赖文件系统/目录历史, 不保证跨进程一致; 而 system prompt
+ * 是前缀缓存的第 0 个 token, 顺序一变整个缓存就失效。重名去重已在加载时完成,
+ * 排序不会改变"先到先得"的语义。 */
+static int skill_name_cmp(const void *a, const void *b) {
+    return strcmp(((const Skill*)a)->name, ((const Skill*)b)->name);
+}
+
 /* 把技能索引拼进 g_skills_suffix (追加到系统提示词的文本, 会被整体转义) */
 static void skills_build_suffix(void) {
     g_skills_suffix[0] = '\0';
@@ -307,6 +315,9 @@ static void skills_init(void) {
         skills_scan_dir(root, 0);
         log_line("[skill] 技能根目录: %s", root);
     }
+    /* 稳定索引顺序: 前缀缓存要求 system prompt 字节完全一致。 */
+    if (g_skill_count > 1)
+        qsort(g_skills, (size_t)g_skill_count, sizeof(Skill), skill_name_cmp);
     skills_build_suffix();
     log_line("[skill] 共 %d 个技能", g_skill_count);
 }
