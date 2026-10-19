@@ -484,6 +484,10 @@ A: 启动不自动加载历史(全新对话)。需要继续之前的会话时,�
   - `app.rc` 里的 `#include "core/version.h"` 与 `ICON "app.ico"` 都相对自身目录解析，故 Makefile 给 windres 传了 `-I src -I res`。
   - Makefile 还给 windres 传了 `-c 65001`：`app.rc` 是 UTF-8(无 BOM)，而 windres 默认按**系统 ANSI 码页**解释源码（中文 Windows 上是 936/GBK）。漏了这个选项，非 ASCII 字符串会被按 GBK 拆成乱码写进资源 —— 表现为文件属性里出现 `C 璇█鏋佺畝缂栫▼ Agent` 这类乱码。**新增非 ASCII 文本前请确认该选项仍在。**
 
+---
+
+## 界面实现细节与踩坑
+
 ### 控件外观与 `res/app.manifest`
 
 `res/app.rc` 里有一行 `1 24 "app.manifest"`，把清单作为 **RT_MANIFEST**（类型必须写数字 `24`，ID 必须是 `1`）嵌进 exe。
