@@ -251,6 +251,27 @@ static long find_messages_inner(const char *t, long *out_start, long *out_end) {
 /* 把文件文本重建进 messages: 始终以最新系统提示词开场, 再追加对话。
  * 支持两种格式: 自描述 {"workspace":...,"messages":[...]} 与旧版纯对话。
  * 返回 1 成功; 若含 workspace 则同步写回 g_workspace / g_active_ws。 */
+/* 旧版本曾把 read_file 续读块折叠成占位文本: 内容读进内存即被覆盖, 从未进过
+ * 上下文, 占位声称"内容在前文"是误导。该机制已废除, 任何载入路径都把残留占位
+ * 替换为"已失效、需重新读取" (替换文本比占位短, 只缩不涨, 原地左移安全)。 */
+static void fix_legacy_read_placeholders(void) {
+    const char *legacy_ph =
+        "<已缓存: 该段 read_file 内容在本会话前文 (文件未变, 如需可重新按 offset 读取)>";
+    const char *rep = "(该段 read_file 内容曾缓存到本会话, 载入后已失效; 如需请重新按 offset 读取)";
+    size_t ph_len = strlen(legacy_ph);
+    char *php = messages;
+    int n_fix = 0;
+    while ((php = strstr(php, legacy_ph)) != NULL) {
+        size_t rl = strlen(rep);
+        memmove(php + rl, php + ph_len, strlen(php + ph_len) + 1);
+        memcpy(php, rep, rl);
+        n_fix++;
+        php += rl;
+    }
+    if (n_fix > 0)
+        log_line("[session] 载入的会话含 %d 处旧版 read_file 折叠占位, 已标记为失效", n_fix);
+}
+
 static int load_messages_from_text(const char *text) {
     /* 解析调用方读入堆缓冲的完整文本, 不截断; messages 仍受 BUFSZ 容量上限约束。 */
     JValue *root = json_parse(text);
@@ -273,6 +294,7 @@ static int load_messages_from_text(const char *text) {
                 json_free(root);
                 return 0;
             }
+            fix_legacy_read_placeholders();
             session_load_reasonings(root);   /* 思考旁路存档: 载入即对齐 (见函数说明) */
             json_free(root);
             return 1;
@@ -292,6 +314,7 @@ static int load_messages_from_text(const char *text) {
     if (strncmp(conv, "{\"role\":", 8) == 0 &&
         strlen(messages) + strlen(conv) < BUFSZ - 1) {
         strcat(messages, conv);
+        fix_legacy_read_placeholders();
         /* 旧格式文件没有思考存档字段, 也必须把数组补到 assistant 条数 (全 NULL 占位)
          * —— 不然后续新对话第一条 assistant 的归档会挤进旧消息的槽位, 从此错位 */
         reasonings_align_to(count_assistant_msgs(messages + strlen(g_system_prompt)));
@@ -478,29 +501,6 @@ static CAGENT_MAYBE_UNUSED int history_load_from_file(const char *path) {
         if (fixed_args)
             log_line("[session] 载入的会话含 %zu 处非法 tool_call arguments, 已净化 (%s)",
                      fixed_args, path);
-        /* read_file 旁路缓存是进程内存: 换会话/换工作目录后旧缓存不应残留,
-         * 载入即清 (续读命中判定有 path 三重匹配, 这里兜底) */
-        read_cache_clear();
-        /* read_file 旁路缓存的折叠块: 占位标记只在"本会话前文仍有完整内容"
-         * 时才有意义; 载入历史后缓存必然失效 (缓存是进程内存), 把占位替换为
-         * "已失效、需重新读取", 否则模型会误以为内容还在前文而拿不到。 */
-        {
-            size_t ph_len = strlen(READ_CACHED_PLACEHOLDER);
-            char *php = messages;
-            int n_ph = 0;
-            while ((php = strstr(php, READ_CACHED_PLACEHOLDER)) != NULL) {
-                const char *rep = "(该段 read_file 内容曾缓存到本会话, 载入后已失效; 如需请重新按 offset 读取)";
-                size_t rl = strlen(rep);
-                /* 原地替换: 占位文本比提示短, 把尾部整体左移 */
-                memmove(php + rl, php + ph_len, strlen(php + ph_len) + 1);
-                memcpy(php, rep, rl);
-                n_ph++;
-                php += rl;
-            }
-            if (n_ph > 0)
-                log_line("[session] 载入的会话含 %d 处已缓存折叠的 read_file 块, 已标记为失效 (%s)",
-                         n_ph, path);
-        }
 
         snprintf(g_history_file, sizeof(g_history_file), "%s", path); /* 绑定本对话到该文件 */
         snprintf(g_last_session, sizeof(g_last_session), "%s", path);

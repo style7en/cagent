@@ -20,10 +20,6 @@
  * 4KB 够覆盖数倍; 超限就整条丢弃 (半截签名发回去同样 400, 不如不发并在日志留痕)。 */
 #define TOOL_SIG_MAX    4096
 #define TOOL_OUTPUT_CAP (16 * 1024)  /* 单个工具结果进入上下文的上限, 超出即截断 */
-/* 被旁路缓存折叠的 read_file 续读块, 在会话文件里的占位文本 (不再膨胀磁盘)。
- * 载入会话后缓存失效, 模型读到它知道"该段内容曾在本会话前文出现 (文件未变),
- * 如需可重新按 offset 读取"。仅用于落盘, 不参与请求体。 */
-#define READ_CACHED_PLACEHOLDER "<已缓存: 该段 read_file 内容在本会话前文 (文件未变, 如需可重新按 offset 读取)>"
 #define EDIT_MAX_BYTES  (2 * 1024 * 1024) /* edit_file 可处理的最大文件体积 */
 /* 请求体缓冲: 内容是 messages(<= BUFSZ) 再套一层 JSON 框架并拼上 model 与 TOOLS_JSON,
  * 所以必须**大于** BUFSZ —— 用 BUFSZ 装会触发 -Wformat-truncation, 而且真截断时

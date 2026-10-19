@@ -630,9 +630,6 @@ static int compact_conversation(void) {
         /* 压缩丢掉最早的若干 assistant 消息, 思考存档跟着丢同样多条 —— 尾部对应关系
          * 不动 (保留段的 assistant 仍配原来的思考)。选数组的头部压缩条数就完成对齐。 */
         reasonings_align_to(count_assistant_msgs(messages + strlen(g_system_prompt)));
-        /* read_file 续读缓存指向"真实文件内容": 压缩后对话里已看不到被摘要掉的块,
-         * 缓存继续指向它们只会让模型误以为还在前文, 压缩成功即清。 */
-        read_cache_clear();
     }
     return ok;
 }
@@ -1092,13 +1089,7 @@ static void agent_turn(const char *user_msg) {
 
         for (int i = 0; i < n_calls && ok; i++) {
             char *ei = json_escape_alloc(calls[i].id);
-            /* 折叠的 read_file 续读块: 完整内容在会话本地缓存 (tool_out_cache),
-             * 不进历史 —— 历史里只留占位标记, 避免 150KB 大文件反复读把上下文
-             * 撑爆 (曾出现 body 160KB 后每轮必 400 invalid arguments)。
-             * 只对"命中缓存折叠"的输出裁; 其余输出原样回传 (Gemini 行为不变)。 */
-            const char *out = calls[i].output ? calls[i].output : "";
-            const char *fold = strstr(out, READ_CACHED_PLACEHOLDER);
-            char *eo = json_escape_alloc(fold ? READ_CACHED_PLACEHOLDER : out);
+            char *eo = json_escape_alloc(calls[i].output ? calls[i].output : "");
             ok = ei && eo && msg_append(
                 ",{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"%s\"}", ei, eo);
             free(ei); free(eo);
