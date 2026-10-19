@@ -101,6 +101,8 @@ static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
 static long g_context_tokens = 0;      /* 模型上下文窗口 (token), 来自 ini 的 context_tokens; 0=未知 */
 static long g_last_prompt_tokens = 0;  /* 上次请求服务端报告的 prompt_tokens (SSE usage; 无则 0) */
 static size_t g_last_prompt_bytes = 0; /* 上次请求发出时 messages 的字节数 (与上者配对做增量估算) */
+static long g_last_cached_tokens = 0;  /* 上次请求命中前缀缓存的 token 数 (SSE usage; 无则 0) */
+static int  g_last_cache_reported = 0; /* 服务端是否报告过缓存字段 (0 = 不支持/未发, 状态栏不显示) */
 
 static const char *TOOLS_JSON =
     "[{\"type\":\"function\",\"function\":{"

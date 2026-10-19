@@ -428,30 +428,31 @@ static int run_all_tests(void) {
             "{\"prompt_tokens\":1234,\"prompt_tokens_details\":{\"cached_tokens\":1000}}");
         CHK(u != NULL);
         stream_apply_usage(&c, u);
-        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 1000);
+        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 1000 && c.cache_reported == 1);
         json_free(u);
 
         memset(&c, 0, sizeof(c));
         u = json_parse("{\"prompt_tokens\":1234,\"prompt_cache_hit_tokens\":800}");
         CHK(u != NULL);
         stream_apply_usage(&c, u);
-        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 800);
+        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 800 && c.cache_reported == 1);
         json_free(u);
 
         memset(&c, 0, sizeof(c));
         u = json_parse("{\"prompt_tokens\":1234}");
         CHK(u != NULL);
         stream_apply_usage(&c, u);
-        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 0);
+        CHK(c.prompt_tokens == 1234 && c.cached_tokens == 0 && c.cache_reported == 0);
         json_free(u);
 
-        /* 明确报 0 时覆盖旧值 (同一 ctx 可能经历过一次失败的尝试) */
+        /* 明确报 0 时覆盖旧值 (同一 ctx 可能经历过一次失败的尝试), 且视为"报过" */
         c.cached_tokens = 999;
+        c.cache_reported = 0;
         u = json_parse("{\"prompt_tokens\":1234,\"prompt_tokens_details\":"
                        "{\"cached_tokens\":0}}");
         CHK(u != NULL);
         stream_apply_usage(&c, u);
-        CHK(c.cached_tokens == 0);
+        CHK(c.cached_tokens == 0 && c.cache_reported == 1);
         json_free(u);
 
         stream_apply_usage(&c, NULL);                 /* 防御: 无 usage 不崩 */

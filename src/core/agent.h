@@ -676,9 +676,11 @@ static int compact_conversation(void) {
           || compact_via_summary(1)      /* ② 只摘要更早一半, 请求更小 */
           || compact_drop_oldest();      /* ③ 保底: 不经模型直接丢最旧 */
     if (ok) {
-        /* 压缩改写了历史, 上次请求的 token 读数已失效 */
+        /* 压缩改写了历史, 上次请求的 token / 缓存读数已失效 */
         g_last_prompt_tokens = 0;
         g_last_prompt_bytes = 0;
+        g_last_cached_tokens = 0;
+        g_last_cache_reported = 0;
         /* 压缩丢掉最早的若干 assistant 消息, 思考存档跟着丢同样多条 —— 尾部对应关系
          * 不动 (保留段的 assistant 仍配原来的思考)。选数组的头部压缩条数就完成对齐。 */
         reasonings_align_to(count_assistant_msgs(messages + strlen(g_system_prompt)));
@@ -899,6 +901,8 @@ static void agent_turn(const char *user_msg) {
         if (ctx->prompt_tokens > 0) {
             g_last_prompt_tokens = ctx->prompt_tokens;
             g_last_prompt_bytes = strlen(messages);
+            g_last_cached_tokens = ctx->cached_tokens;
+            g_last_cache_reported = ctx->cache_reported;
             log_line("[usage] prompt=%ld cached=%ld hit=%.1f%%",
                      ctx->prompt_tokens, ctx->cached_tokens,
                      ctx->prompt_tokens > 0

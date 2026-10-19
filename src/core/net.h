@@ -184,6 +184,7 @@ typedef struct {
      * DeepSeek 等兼容实现: usage.prompt_cache_hit_tokens)。只用于成本/命中率统计,
      * 不从上下文水位里扣除 —— 缓存命中仍然占用模型窗口。 */
     long cached_tokens;
+    int  cache_reported;       /* 本次响应是否真的带了缓存字段 (区分"命中 0" 与"不支持缓存") */
     /* 诊断留痕: 服务端返回 200 却解析不出 content/tool_calls 时, 日志里必须能看出它到底
      * 发了什么 —— 否则那条回滚完全无从下手 (err_out 在成功路径上是空的, 一点线索都没有)。 */
     char sse_head[512];        /* 第一条 data: 行的原文 (截断到 511 字节) */
@@ -431,6 +432,8 @@ static void stream_apply_usage(StreamCtx *ctx, const JValue *usage) {
     const JValue *details = json_obj_get(usage, "prompt_tokens_details");
     const JValue *ct = details ? json_obj_get(details, "cached_tokens") : NULL;
     const JValue *hit = json_obj_get(usage, "prompt_cache_hit_tokens");
+    if ((ct && ct->type == J_NUM) || (hit && hit->type == J_NUM))
+        ctx->cache_reported = 1;   /* 报了 0 也算报过: 状态栏应显示 0.0%, 而不是"不支持" */
     if (ct && ct->type == J_NUM && ct->num > 0)
         ctx->cached_tokens = (long)ct->num;
     else if (hit && hit->type == J_NUM && hit->num > 0)
