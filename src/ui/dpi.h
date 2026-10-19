@@ -42,6 +42,12 @@
  * 这些块里主要是路径、命令、代码, 中文占比很低。 */
 #define CAGENT_MONO_FACE L"Consolas"
 
+/* ASCII 表格专用字体。表格由模型用空格数按"中文占 2 列、ASCII 占 1 列"排好,
+ * 所以字体必须让中文宽度严格等于 2 个 ASCII 宽度。实测 RichEdit 里 Consolas
+ * 没有中文字形, 回退后的中文约 1.8 个 ASCII 格宽, 表格会逐列向左漂移; NSimSun
+ * 的中文恰好是 2 格, 且中文 Windows 自带。 */
+#define CAGENT_TABLE_FACE L"NSimSun"
+
 /* 界面字体渲染质量。**别再改回 ANTIALIASED_QUALITY** —— 那是"灰度抗锯齿", 在 100%
  * (96 DPI) 下笔画边缘只有灰阶过渡, 观感发虚发糊, 正是 issue #1 的成因。
  *

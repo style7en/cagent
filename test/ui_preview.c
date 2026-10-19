@@ -111,6 +111,14 @@ static const struct { const char *text; int role; } kSample[] = {
     { "---\r\n",                                                   CAGENT_ROLE_AI },
     { "```make\r\nall: cagent.exe\r\n\t$(MAKE) -C src test\r\n```\r\n", CAGENT_ROLE_AI },
     { "\r\n**粗体套 `代码`** 与 ***粗斜*** 也要分清。\r\n",           CAGENT_ROLE_AI },
+    /* ASCII 表格: 中文按 2 个显示列宽排版, 整行等宽后 + / | 应当对齐 */
+    { "\r\n+----------+------------+------------------+\r\n"
+      "| 姓名     | 部门       | 角色             |\r\n"
+      "+----------+------------+------------------+\r\n"
+      "| 张三     | 研发部     | 后端工程师       |\r\n"
+      "| 李四     | 产品部     | 产品经理         |\r\n"
+      "| 王五     | 设计部     | UI 设计师        |\r\n"
+      "+----------+------------+------------------+\r\n",              CAGENT_ROLE_AI },
 };
 
 /* 32 位 DIB -> BMP 文件。DIB section 用**正高度**(自下而上), 与 BMP 文件的内存布局

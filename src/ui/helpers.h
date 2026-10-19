@@ -91,6 +91,7 @@ typedef struct {
     int has_cf;
     COLORREF fg;
     int bold, italic, mono, underline;
+    const WCHAR *face;   /* 非 NULL 时覆盖字体族 (ASCII 表格用 NSimSun); NULL 按 mono 选 */
     int has_para;
     int sp_before, sp_after, indent;
 } UiStyleOv;
@@ -171,7 +172,8 @@ static long ui_insert_ex(HWND h, const WCHAR *w, int role, long pos, const UiSty
         if (ov->bold)      role_cf.dwEffects |= CFE_BOLD;
         if (ov->italic)    role_cf.dwEffects |= CFE_ITALIC;
         if (ov->underline) role_cf.dwEffects |= CFE_UNDERLINE;
-        wcscpy(role_cf.szFaceName, ov->mono ? CAGENT_MONO_FACE : CAGENT_UI_FACE);
+        wcscpy(role_cf.szFaceName,
+               ov->face ? ov->face : (ov->mono ? CAGENT_MONO_FACE : CAGENT_UI_FACE));
     } else {
         role_cf.crTextColor = st->fg;
         if (st->bold)      role_cf.dwEffects |= CFE_BOLD;

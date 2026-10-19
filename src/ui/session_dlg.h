@@ -11,6 +11,7 @@ static HWND g_sess_owner = NULL;
 static char g_sess_paths[64][PATHSZ];   /* 会话目录 + 文件名, 见 state.h 的 PATHSZ 说明 */
 static char g_sess_ws[64][200];      /* 第一行: 工作目录 */
 static char g_sess_sub[64][300];     /* 第二行: N 条消息 · 时间 · 预览 */
+static unsigned long long g_sess_time[64];  /* 文件修改时间 (FILETIME 64 位值), 用于倒序排序 */
 static int  g_sess_n = 0;
 
 /* 对话框自己的 DPI 与字体 —— 同 about.h: 它可能被拖到与主窗口不同缩放比例的显示器上,
@@ -19,6 +20,32 @@ static UINT  g_sess_dpi = 96;
 static UINT  g_sess_font_dpi = 0;
 static HFONT g_sessFont     = NULL;
 static HFONT g_sessFontBold = NULL;
+
+/* 按文件修改时间倒序排列 (最新在最上面)。用插入排序而不是 qsort:
+ * 三个平行数组要一起移动, 插入排序的移位写起来最直接; 且它是稳定排序,
+ * 同一时间戳的会话保持 FindFirstFile 的原始顺序, 不会来回跳。 */
+static void sess_sort_by_time_desc(void) {
+    for (int i = 1; i < g_sess_n; i++) {
+        unsigned long long key = g_sess_time[i];
+        if (key <= g_sess_time[i - 1]) continue;
+        char path[PATHSZ], ws[200], sub[300];
+        memcpy(path, g_sess_paths[i], sizeof(path));
+        memcpy(ws,   g_sess_ws[i],   sizeof(ws));
+        memcpy(sub,  g_sess_sub[i],  sizeof(sub));
+        int j = i;
+        while (j > 0 && g_sess_time[j - 1] < key) {
+            g_sess_time[j] = g_sess_time[j - 1];
+            memcpy(g_sess_paths[j], g_sess_paths[j - 1], sizeof(g_sess_paths[j]));
+            memcpy(g_sess_ws[j],    g_sess_ws[j - 1],    sizeof(g_sess_ws[j]));
+            memcpy(g_sess_sub[j],   g_sess_sub[j - 1],   sizeof(g_sess_sub[j]));
+            j--;
+        }
+        g_sess_time[j] = key;
+        memcpy(g_sess_paths[j], path, sizeof(path));
+        memcpy(g_sess_ws[j],    ws,   sizeof(ws));
+        memcpy(g_sess_sub[j],   sub,  sizeof(sub));
+    }
+}
 
 /* 旧格式文件从文件名反推工作目录显示 (sanitized: '_' 大多为分隔符)。 */
 static void ws_from_filename(const char *path, char *out, size_t cap) {
@@ -44,8 +71,8 @@ static void ws_from_filename(const char *path, char *out, size_t cap) {
     out[o] = '\0';
 }
 
-/* 枚举会话目录 (sessions\) 下所有 history_*.json, 记录路径与元信息 (目录/条数/时间/预览)。
- * dir 需以 \ 结尾。 */
+/* 枚举会话目录 (sessions\) 下所有 history_*.json, 记录路径与元信息 (目录/条数/时间/预览),
+ * 最后按修改时间倒序排列, 最新的会话排在最上面。dir 需以 \ 结尾。 */
 static int sess_enumerate(const char *dir) {
     g_sess_n = 0;
     char pat[PATHSZ];
@@ -75,6 +102,11 @@ static int sess_enumerate(const char *dir) {
         char tbuf[32];
         snprintf(tbuf, sizeof(tbuf), "%04d-%02d-%02d %02d:%02d",
                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+        /* 排序键与显示时间同源 (文件修改时间); 用 64 位 FILETIME 比较,
+         * 避免只精确到分钟的 tbuf 在同分钟内无法稳定排序。 */
+        g_sess_time[g_sess_n] =
+            ((unsigned long long)fd.ftLastWriteTime.dwHighDateTime << 32) |
+             (unsigned long long)fd.ftLastWriteTime.dwLowDateTime;
 
         /* 旧格式: 从文件名反推目录显示 */
         char wsdisp[180];
@@ -93,6 +125,7 @@ static int sess_enumerate(const char *dir) {
         g_sess_n++;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
+    sess_sort_by_time_desc();   /* 枚举顺序是文件系统给的, 不保证时间序 */
     return g_sess_n;
 }
 
@@ -173,6 +206,13 @@ static void sess_create_list(HWND hwnd) {
  * 而且用户没有任何理由去缩放一个列表选择框。 */
 #define SESS_DLG_STYLE (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX)
 
+/* 列表行: 两行信息, 压缩后的行高与两条文字顶边 (逻辑像素)。
+ * 16dp 字体两行约 32dp, 46 留出 3dp 上边距与少量行间/底部空间;
+ * WM_MEASUREITEM 与 WM_DRAWITEM 共用这组值, 改一处不会漏另一处。 */
+#define SESS_ROW_H   46
+#define SESS_ROW_L1  3
+#define SESS_ROW_L2  24
+
 /* 排布控件并下发字体。尺寸全部按当前 g_sess_dpi 现算, 所以重跑一次就适配新 DPI。
  * 客户区按 540x400 逻辑像素设计 —— 与 show_session_dialog 里的外框计算是一套。
  * **四周留白都是 12**: 列表宽度 = 540 - 12*2, 列表底 + 12 = 按钮顶, 按钮底 + 12 = 客户区底 ——
@@ -227,7 +267,7 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MEASUREITEM:
-        ((MEASUREITEMSTRUCT*)lp)->itemHeight = dp_at(g_sess_dpi, 56);
+        ((MEASUREITEMSTRUCT*)lp)->itemHeight = dp_at(g_sess_dpi, SESS_ROW_H);
         return TRUE;
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT*)lp;
@@ -245,7 +285,7 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         utf8_to_wide(g_sess_ws[idx], w1, 200);
         RECT r1 = d->rcItem;
         r1.left  += dp_at(g_sess_dpi, 10);
-        r1.top   += dp_at(g_sess_dpi, 6);
+        r1.top   += dp_at(g_sess_dpi, SESS_ROW_L1);
         r1.bottom = r1.top + dp_at(g_sess_dpi, 20);
         DrawTextW(d->hDC, w1, -1, &r1, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         /* 第二行: 条数 · 时间 · 预览 (灰) */
@@ -256,7 +296,7 @@ static LRESULT CALLBACK SessDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         utf8_to_wide(g_sess_sub[idx], w2, 300);
         RECT r2 = d->rcItem;
         r2.left += dp_at(g_sess_dpi, 10);
-        r2.top  += dp_at(g_sess_dpi, 28);
+        r2.top  += dp_at(g_sess_dpi, SESS_ROW_L2);
         DrawTextW(d->hDC, w2, -1, &r2, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         if (d->itemState & ODS_FOCUS) DrawFocusRect(d->hDC, &d->rcItem);
         return TRUE;

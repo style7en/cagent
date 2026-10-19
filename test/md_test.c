@@ -9,6 +9,7 @@
  *   ③ 流式: 标记被 delta 劈开时, 行缓冲凑齐整行再解析, 结果与整段喂入一致
  *   ④ CommonMark 边界: 反斜杠转义 / 等长反引号代码 span / *** 粗斜
  *   ⑤ 接线: do_append 里"切角色先落地半行、围栏跨过 NOTE、TOOL 复位"
+ *   ⑥ ASCII 表格行整行等宽, 表格内段距 0, 表格后恢复块前距
  *
  * 编译/运行: make mdtest   (退出码 = 失败用例数)
  */
@@ -35,6 +36,7 @@ typedef struct {
     long s;                            /* 插入起点 */
     int  n;                            /* 码元数 */
     int  bold, italic, underline, mono;
+    WCHAR face[LF_FACESIZE];
     COLORREF fg;
     int  sp_before, sp_after, indent;  /* 逻辑像素 (twips / 15) */
 } Run;
@@ -56,7 +58,10 @@ static void record_run(const WCHAR *t, int n) {
         r->bold      = (g_cf.dwEffects & CFE_BOLD) ? 1 : 0;
         r->italic    = (g_cf.dwEffects & CFE_ITALIC) ? 1 : 0;
         r->underline = (g_cf.dwEffects & CFE_UNDERLINE) ? 1 : 0;
-        r->mono      = (wcsncmp(g_cf.szFaceName, L"Consolas", 8) == 0) ? 1 : 0;
+        /* 表格专用 NSimSun 也是等宽字体; 具体字体族由 run_face_is 另外断言 */
+        r->mono      = (wcsncmp(g_cf.szFaceName, L"Consolas", 8) == 0 ||
+                        wcsncmp(g_cf.szFaceName, L"NSimSun", 7) == 0) ? 1 : 0;
+        wcscpy(r->face, g_cf.szFaceName);
         r->fg        = g_cf.crTextColor;
         r->sp_before = g_sp_before;   /* 先记旧值, EM_SETPARAFORMAT 回来后再补 */
         r->sp_after  = g_sp_after;
@@ -168,6 +173,21 @@ static void run_is(int idx, long s, int n, int bold, int italic, int und,
                name, idx, r->s, r->n, r->bold, r->italic, r->underline, r->mono,
                (unsigned)r->fg, r->indent, s, n, bold, italic, und, mono,
                (unsigned)fg, ind);
+        g_fail++;
+    }
+}
+
+/* 断言字体族。表格必须用 NSimSun (中文严格 2 个 ASCII 格宽), 普通代码仍用 Consolas。 */
+static void run_face_is(int idx, const WCHAR *face, const char *name) {
+    if (idx >= g_runc) {
+        printf("  FAIL [%s] run %d 缺失 (共 %d 个)\n", name, idx, g_runc);
+        g_fail++;
+        return;
+    }
+    Run *r = &g_runs[idx];
+    if (wcscmp(r->face, face) != 0) {
+        printf("  FAIL [%s] run %d 字体: got <%ls>; want <%ls>\n",
+               name, idx, r->face, face);
         g_fail++;
     }
 }
@@ -419,6 +439,37 @@ int main(void) {
     para_is(1, 16 + 4, 0, 0, "head-break");
     reset_test(); feed(W("text\r\n---\r\n"));
     para_is(1, 16, 0, 0, "rule-break");
+
+    /* ASCII 表格: 整行等宽, 表格内段距 0, 表格之后恢复块首段前距 */
+    reset_test(); feed(W("+----+----+\r\n| a  | b  |\r\n+----+----+\r\n"));
+    doc_is(W("+----+----+\r\n| a  | b  |\r\n+----+----+\r\n"), "table");
+    run_is(0, 0,  13, 0, 0, 0, 1, AI_FG, 0, "table");
+    run_is(1, 13, 13, 0, 0, 0, 1, AI_FG, 0, "table");
+    run_is(2, 26, 13, 0, 0, 0, 1, AI_FG, 0, "table");
+    run_face_is(0, L"NSimSun", "table");
+    run_face_is(1, L"NSimSun", "table");
+    run_face_is(2, L"NSimSun", "table");
+    para_is(0, 16, 0, 0, "table");
+    para_is(1, 0,  0, 0, "table");
+    para_is(2, 0,  0, 0, "table");
+    reset_test(); feed(W("+---+\r\n| x |\r\n+---+\r\nafter\r\n"));
+    para_is(3, 16, 0, 0, "table-after");
+
+    /* Markdown 管道表格也按原样等宽显示 (不实现列宽语义) */
+    reset_test(); feed(W("| a | b |\r\n|---|---|\r\n| c | d |\r\n"));
+    run_is(0, 0,  11, 0, 0, 0, 1, AI_FG, 0, "table-pipe");
+    run_is(1, 11, 11, 0, 0, 0, 1, AI_FG, 0, "table-pipe");
+    run_is(2, 22, 11, 0, 0, 0, 1, AI_FG, 0, "table-pipe");
+    run_face_is(0, L"NSimSun", "table-pipe");
+    run_face_is(1, L"NSimSun", "table-pipe");
+    run_face_is(2, L"NSimSun", "table-pipe");
+
+    /* 正文里的单竖线不是表格; 围栏内的表格字符仍按代码样式 */
+    reset_test(); feed(W("a | b\r\n"));
+    run_is(0, 0, 7, 0, 0, 0, 0, AI_FG, 0, "table-prose");
+    reset_test(); feed(W("```\r\n| a | b |\r\n```\r\n"));
+    run_is(1, 5, 11, 0, 0, 0, 1, MD_CODE_FG, 0, "table-fence");
+    run_face_is(1, L"Consolas", "table-fence");
 
     /* 围栏内的空行是**代码内容**, 照常按字面上屏 (不能被当块分隔符吞掉) */
     reset_test(); feed(W("```\r\nx\r\n\r\ny\r\n```\r\n"));

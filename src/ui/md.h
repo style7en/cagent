@@ -38,8 +38,10 @@
  *
  * 支持范围 ("简单"的边界):
  *   行级  ``` 围栏代码块 / # 标题 / > 引用 / - * + 与 N. 列表 / --- 分割线
+ *         ASCII 表格行 (+---+ / |...|) 原样等宽显示
  *   行内  **粗体** *斜体* ***粗斜*** `行内码` [文字](链接) \ 反斜杠转义
- * 不做的: 表格 / 任务列表 / 嵌套强调的完整 CommonMark 定界符规则 / HTML 标签。
+ * 不做的: Markdown 表格的列宽/对齐语义 (ASCII/管道表格行只按等宽原样显示) /
+ *         任务列表 / 嵌套强调的完整 CommonMark 定界符规则 / HTML 标签。
  */
 
 /* ===== 颜色 =====
@@ -71,11 +73,13 @@ static int    md_fence_len;  /* 开围栏那行的反引号个数 —— 关围�
 
 /* 上一个落地的行是什么 (原则 ⑥: 段前距只给块首行)。
  * NONE = 块边界 (空行/标题/分割线/围栏/文档开头/复位之后);
- * PARA/LIST/QUOTE = 行内内容行, 且**同类**的下一行是它的续行 (段前距 0)。 */
+ * PARA/LIST/QUOTE = 行内内容行, 且**同类**的下一行是它的续行 (段前距 0);
+ * TABLE = ASCII 表格行, 同类续行段前距 0, 表格之后是新的块边界。 */
 #define MD_PREV_NONE  0
 #define MD_PREV_PARA  1
 #define MD_PREV_LIST  2
 #define MD_PREV_QUOTE 3
+#define MD_PREV_TABLE 4
 static int    md_prev_kind;
 
 /* ===== 行内/行级样式 =====
@@ -86,6 +90,7 @@ enum { MD_F_BOLD = 1, MD_F_ITALIC = 2, MD_F_CODE = 4, MD_F_LINK = 8 };
 typedef struct {
     COLORREF fg;
     int bold, italic, mono, underline;
+    const WCHAR *face;   /* NULL = 按 mono 选默认等宽/正文字体 */
 } MdStyle;
 
 /* 标记字符的样式: 淡化灰, 且**一律清零**粗斜等下划线 —— 否则标题里的 ** 会跟着
@@ -93,7 +98,7 @@ typedef struct {
 static MdStyle md_dim_style(void) {
     MdStyle s;
     s.fg = MD_DIM_FG;
-    s.bold = 0; s.italic = 0; s.mono = 0; s.underline = 0;
+    s.bold = 0; s.italic = 0; s.mono = 0; s.underline = 0; s.face = NULL;
     return s;
 }
 
@@ -119,7 +124,7 @@ static void md_put(WCHAR *line, int s, int n, const MdStyle *st,
     ov.has_cf = 1;
     ov.fg = st->fg;
     ov.bold = st->bold; ov.italic = st->italic;
-    ov.mono = st->mono; ov.underline = st->underline;
+    ov.mono = st->mono; ov.underline = st->underline; ov.face = st->face;
     ov.has_para = 1;
     ov.sp_before = sp_before; ov.sp_after = sp_after; ov.indent = indent;
     WCHAR save = line[s + n];
@@ -137,7 +142,7 @@ static void md_emit_raw(const WCHAR *w, int n) {
     const UiRoleStyle *rs = ui_role_style(CAGENT_ROLE_AI);
     MdStyle st;
     st.fg = rs->fg; st.bold = rs->bold; st.italic = rs->italic;
-    st.mono = rs->mono; st.underline = 0;
+    st.mono = rs->mono; st.underline = 0; st.face = NULL;
     int sp_first = 0;
     if (md_in_fence) { st.mono = 1; st.fg = MD_CODE_FG; }
     else             { sp_first = rs->sp_before; }
@@ -146,7 +151,7 @@ static void md_emit_raw(const WCHAR *w, int n) {
     ov.has_cf = 1;
     ov.fg = st.fg;
     ov.bold = st.bold; ov.italic = st.italic;
-    ov.mono = st.mono; ov.underline = st.underline;
+    ov.mono = st.mono; ov.underline = st.underline; ov.face = st.face;
     ov.has_para = 1;
     ov.sp_before = sp_first; ov.sp_after = rs->sp_after; ov.indent = rs->indent;
     WCHAR tmp[512];
@@ -260,6 +265,33 @@ static int md_rest_blank(const WCHAR *line, int from, int len) {
         if (c != L' ' && c != L'\t' && c != L'\r' && c != L'\n') return 0;
     }
     return 1;
+}
+
+/* ASCII 表格行: 行首 (忽略空白) 为 | 且至少两个 |, 或为 +---+ / +===+ 这类边框。
+ * 只认行首形态, 避免把正文里的 "a | b" 误判成表格; 表格行整行等宽、不做行内解析,
+ * 否则单元格里的 ** 会改变字体, 列对齐就断了。Markdown 管道表格也落在 | 分支里,
+ * 但这里不实现列宽/对齐语义, 只保证原样等宽显示。 */
+static int md_is_table_line(const WCHAR *line, int len) {
+    int p = md_skip_ws(line, 0, len);
+    int e = len;
+    while (e > p && (line[e-1] == L' ' || line[e-1] == L'\t' ||
+                     line[e-1] == L'\r' || line[e-1] == L'\n')) e--;
+    if (p >= e) return 0;
+    if (line[p] == L'|') {
+        int pipes = 0;
+        for (int i = p; i < e; i++) if (line[i] == L'|') pipes++;
+        return pipes >= 2;
+    }
+    if (line[p] == L'+') {
+        int has_rule = 0;
+        for (int i = p; i < e; i++) {
+            WCHAR c = line[i];
+            if (c == L'-' || c == L'=') has_rule = 1;
+            else if (c != L'+' && c != L':' && c != L' ' && c != L'\t') return 0;
+        }
+        return has_rule;
+    }
+    return 0;
 }
 
 /* 反斜杠后可转义的字符: ASCII 标点 (CommonMark)。两字符都当普通文本,
@@ -429,6 +461,7 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
     base.italic = st->italic;
     base.mono = st->mono;
     base.underline = 0;
+    base.face = NULL;
     MdStyle dim = md_dim_style();
     int sp_before = st->sp_before, sp_after = st->sp_after, indent = st->indent;
 
@@ -484,6 +517,19 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
     if (md_is_rule(line, len)) {
         md_put(line, 0, len, &dim, sp_before, sp_after, indent);
         md_prev_kind = MD_PREV_NONE;   /* 分割线永远是新块 */
+        return;
+    }
+
+    /* ---- ASCII 表格 ----
+     * 表格行整行等宽、不做行内解析, 列对齐才不会被 ** / ` 等标记打断。
+     * 表格内部段距全 0; 表格之后由 md_prev_kind=TABLE 让下一块重新拿到段前距。 */
+    if (md_is_table_line(line, len)) {
+        int sp_in = (md_prev_kind == MD_PREV_TABLE) ? 0 : sp_before;
+        MdStyle s = base;
+        s.mono = 1;
+        s.face = CAGENT_TABLE_FACE;   /* 中文必须严格占 2 个 ASCII 格宽 */
+        md_put(line, 0, len, &s, sp_in, 0, indent);
+        md_prev_kind = MD_PREV_TABLE;
         return;
     }
 
@@ -557,11 +603,12 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
     }
 
     /* ---- 普通段落行 ---- */
-    /* 软换行续行 (上一个落地的行是任何行内内容) 段前距 0; 空行/标题/分割线/
-     * 围栏之后才是新段。CommonMark 语义: 段落续段落 = 软换行, 段落续列表项 =
+    /* 软换行续行 (上一个落地的行是段落/列表/引用) 段前距 0; 空行/标题/分割线/
+     * 围栏/表格之后才是新段。CommonMark 语义: 段落续段落 = 软换行, 段落续列表项 =
      * 延迟延续, 都算同一块; 列表/引用打断段落才是块边界 (见上面各分支)。 */
     {
-        int sp_in = (md_prev_kind != MD_PREV_NONE) ? 0 : sp_before;
+        int sp_in = (md_prev_kind == MD_PREV_NONE || md_prev_kind == MD_PREV_TABLE)
+                    ? sp_before : 0;
         md_scan_inline(line, 0, len, &base, 0, sp_in, sp_after, indent);
         md_prev_kind = MD_PREV_PARA;
     }
