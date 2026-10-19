@@ -258,11 +258,14 @@ static void fix_legacy_read_placeholders(void) {
     const char *legacy_ph =
         "<已缓存: 该段 read_file 内容在本会话前文 (文件未变, 如需可重新按 offset 读取)>";
     const char *rep = "(该段 read_file 内容曾缓存到本会话, 载入后已失效; 如需请重新按 offset 读取)";
-    size_t ph_len = strlen(legacy_ph);
+    size_t ph_len = strlen(legacy_ph), rl = strlen(rep);
+    /* 防护: 本迁移只允许缩短 —— rep 若在日后改文案时变长, 载入就会净增字节,
+     * 绕过 load 路径的 messages[BUFSZ] 容量校验 (memmove 本身对重叠两向安全,
+     * 这里防的是缓冲不变量, 不是移动方向)。 */
+    if (rl > ph_len) return;
     char *php = messages;
     int n_fix = 0;
     while ((php = strstr(php, legacy_ph)) != NULL) {
-        size_t rl = strlen(rep);
         memmove(php + rl, php + ph_len, strlen(php + ph_len) + 1);
         memcpy(php, rep, rl);
         n_fix++;

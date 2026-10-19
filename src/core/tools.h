@@ -64,8 +64,10 @@ static void tool_read_file(const char *path, long long offset) {
 
     size_t cap = tool_output_cap();
     /* 首次读 (offset=0) 且文件大于首块预算: 只回传头部预览, 不进全文。
+     * 仅当当前上限**大于**预览值时下调 —— 用户用 CAGENT_TOOL_OUTPUT_MAX
+     * 显式调小上限时不得被抬到预览值之上 (上限只能缩, 不能放)。
      * 续读 (offset>0) 不受此限, 仍按工具输出上限逐块读。 */
-    if (offset == 0 && total > (long long)FILE_HEAD_PREVIEW)
+    if (offset == 0 && total > (long long)FILE_HEAD_PREVIEW && cap > (size_t)FILE_HEAD_PREVIEW)
         cap = (size_t)FILE_HEAD_PREVIEW;
 
     size_t raw = fread(tool_out, 1, cap, f);

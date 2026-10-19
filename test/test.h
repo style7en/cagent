@@ -960,6 +960,29 @@ static int run_all_tests(void) {
         CHK(g_reasoning_n == 1);
         CHK(g_reasonings[0] == NULL);
 
+        /* 旧版 read_file 折叠占位 (内容从未进过上下文却声称"在前文"):
+         * 载入即替换为失效提示, 且无残留 —— 旧占位含已废除机制的字面量,
+         * 留着会误导新版本模型 */
+        {
+            const char *legacy_ph =
+                "<已缓存: 该段 read_file 内容在本会话前文 (文件未变, 如需可重新按 offset 读取)>";
+            char big[1024];
+            snprintf(big, sizeof(big),
+                     "{\"workspace\":\"W\",\"messages\":["
+                     "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":"
+                     "\"前文%s后文\"},"
+                     "{\"role\":\"tool\",\"tool_call_id\":\"c2\",\"content\":\"无占位\"}],"
+                     "\"reasonings\":[]}", legacy_ph);
+            reset_conversation();
+            reasonings_reset();
+            CHK(load_messages_from_text(big) == 1);
+            const char *rep = "(该段 read_file 内容曾缓存到本会话, 载入后已失效; 如需请重新按 offset 读取)";
+            CHK(strstr(messages, rep) != NULL);           /* 已替换为失效提示 */
+            CHK(strstr(messages, legacy_ph) == NULL);     /* 无占位残留 */
+            CHK(strstr(messages, "前文") != NULL && strstr(messages, "后文") != NULL);   /* 前后文完整 */
+            CHK(strstr(messages, "无占位") != NULL);      /* 其余消息不受影响 */
+        }
+
         reasonings_reset();
         reset_conversation();
         test_ws_rm("reasoning_session.json");
@@ -1102,6 +1125,15 @@ static int run_all_tests(void) {
             /* 中段跳读 (非首读 offset): 同样完整回传该段, 含 END */
             tool_read_file("big.txt", 16000);
             CHK(strstr(tool_out, "END") != NULL);
+
+            /* 用户上限小于预览值: 首读预览被压到用户上限 (只缩不放, 不得放到 6144) */
+            _putenv("CAGENT_TOOL_OUTPUT_MAX=4096");
+            tool_read_file("big.txt", 0);
+            CHK(strstr(tool_out, "offset=4096") != NULL);
+            CHK(strstr(tool_out, "offset=6144") == NULL);
+            tool_read_file("big.txt", 16000);         /* 尾块 < 上限, 完整含 END */
+            CHK(strstr(tool_out, "END") != NULL);
+            _putenv("CAGENT_TOOL_OUTPUT_MAX=");       /* 清掉, 不泄漏给后续用例 */
 
             /* 超出文件末尾: 明确说明, 不报错 */
             tool_read_file("big.txt", 999999);
