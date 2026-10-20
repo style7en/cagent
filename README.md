@@ -479,14 +479,14 @@ A: 启动不自动加载历史（全新对话）。需要继续之前的会话�
 
 需要改版本号时只改这一处，其他位置通过宏引用，不重复硬编码。
 
-**Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.2.7.0` + 字符串 `1.2.7`）。
+**Windows 文件属性**：`res/app.rc` 的 `VERSIONINFO` 资源，右键 `cagent.exe` → 属性 → 详细信息可见（当前数值 `1.2.8.0` + 字符串 `1.2.8`）。
 
 - 资源名必须用整数 `1`；写 `VS_VERSION_INFO` 会被 windres 当成字符串名，导致读取失败（错误 1813）。
 - `app.rc` 里的 `#include "core/version.h"` 与 `ICON "app.ico"` 都相对自身目录解析，因此 Makefile 给 windres 传了 `-I src -I res`。
 - Makefile 还给 windres 传了 `-c 65001`：`app.rc` 是 UTF-8（无 BOM），而 windres 默认按系统 ANSI 码页解释源码（中文 Windows 上是 936/GBK）。漏掉这个选项，非 ASCII 字符串会被按 GBK 拆成乱码写进资源，表现为文件属性里出现 `C 璇█鏋佺畝缂栫▼ Agent` 这类乱码。**新增非 ASCII 文本前请确认该选项仍在。**
 - `FileDescription` 当前是纯英文（`cagent - a minimal AI coding agent in C`），作为额外的编码保险。
 
-**命令行**：`cagent.exe --version` 打印 `cagent 1.2.7`（有父控制台则打印到终端，否则弹对话框）。
+**命令行**：`cagent.exe --version` 打印 `cagent 1.2.8`（有父控制台则打印到终端，否则弹对话框）。
 
 **「关于」**：主窗口系统菜单里的「关于(A)...」（点标题栏图标 / `Alt+Space` / 右键标题栏都能打开），显示一句话功能、版本号和两个项目地址（GitHub 与 Gitee 镜像，国内访问 gitee 更稳）。两个地址都可点击打开默认浏览器，正文也可用 `Ctrl+C` 整段复制。
 
