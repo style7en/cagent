@@ -184,7 +184,7 @@ log=1
 
 几个注意点：
 
-- **修改 ini 前先退出 cagent**，否则程序退出时会用内存中的配置覆盖文件。
+- **运行期间可以修改 ini**：退出保存时会保留 `context_tokens`、`max_tokens`、`skills_dir`、`skip_cert_verify`、`log` 的外部修改（下次启动生效）；`url_base`、`api_key`、`model`、`workspace` 以窗口里的值为准。
 - `api_key` 绑定当前 Windows 用户。换机或换用户后 DPAPI 无法解密，程序会提示并清空 Key，重新填写即可。
 - `workspace`、`skills_dir` 的相对值都按 **exe 目录**解析，不按当前命令行目录。
 - `log=1` 时日志按天写入 `log\`；HTTP 失败时完整请求体另存为 `log\request_fail_N.json`，可直接对服务端重放复现。

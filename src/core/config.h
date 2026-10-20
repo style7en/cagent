@@ -4,14 +4,11 @@
  * cagent 核心的一部分, 由 cagent_core.h 按依赖顺序聚合 (单 TU, 全 static)。
  */
 
-/* 简单 key=value 解析器 */
-static CAGENT_MAYBE_UNUSED void config_load(void) {
-    g_log_enabled = 1;   /* 运行日志默认开 (ini 里 log=0 可关); 测试不进本函数故不落盘 */
-    char path[MAX_PATH];
-    get_ini_path(path, sizeof(path));
-    FILE *f = fopen_utf8(path, "rb");
-    if (!f) return;
-
+/* 解析已打开的 ini 文件。
+ * only_ini=1: 只处理"没有界面的项" (context_tokens / max_tokens / skills_dir /
+ * skip_cert_verify / log) —— 退出保存前用它把运行期间用户的外部修改合并回来;
+ * 界面拥有的 url/key/model/workspace 与程序维护的 last_session 不碰。 */
+static void config_parse(FILE *f, int only_ini) {
     char line[2048];
     int first_line = 1;
     while (fgets(line, sizeof(line), f)) {
@@ -32,6 +29,20 @@ static CAGENT_MAYBE_UNUSED void config_load(void) {
         size_t vlen = strlen(val);
         while (vlen > 0 && (val[vlen-1] == '\n' || val[vlen-1] == '\r')) {
             val[--vlen] = '\0';
+        }
+
+        if (only_ini) {
+            if (strcmp(key, "max_tokens") == 0)
+                g_max_tokens = atoi(val);
+            else if (strcmp(key, "skip_cert_verify") == 0)
+                g_skip_cert_verify = (atoi(val) != 0);
+            else if (strcmp(key, "context_tokens") == 0)
+                g_context_tokens = atol(val);
+            else if (strcmp(key, "skills_dir") == 0)
+                snprintf(g_skills_dir, sizeof(g_skills_dir), "%s", val);
+            else if (strcmp(key, "log") == 0)
+                g_log_enabled = (atoi(val) != 0);
+            continue;
         }
 
         if (strcmp(key, "url_base") == 0)
@@ -63,6 +74,28 @@ static CAGENT_MAYBE_UNUSED void config_load(void) {
         else if (strcmp(key, "log") == 0)
             g_log_enabled = (atoi(val) != 0);   /* 0 = 关闭运行日志 */
     }
+}
+
+/* 简单 key=value 解析器 */
+static CAGENT_MAYBE_UNUSED void config_load(void) {
+    g_log_enabled = 1;   /* 运行日志默认开 (ini 里 log=0 可关); 测试不进本函数故不落盘 */
+    char path[MAX_PATH];
+    get_ini_path(path, sizeof(path));
+    FILE *f = fopen_utf8(path, "rb");
+    if (!f) return;
+    config_parse(f, 0);
+    fclose(f);
+}
+
+/* 退出保存前合并外部修改: 运行期间用户手改 ini 里没有界面的项时, 内存里还是
+ * 启动时的旧值 —— 直接重写会把修改抹掉。这里只重读那几项; 文件不存在/读不到
+ * 则保持内存值 (等价于原来的行为)。 */
+static CAGENT_MAYBE_UNUSED void config_reload_ini_only(void) {
+    char path[MAX_PATH];
+    get_ini_path(path, sizeof(path));
+    FILE *f = fopen_utf8(path, "rb");
+    if (!f) return;
+    config_parse(f, 1);
     fclose(f);
 }
 
@@ -72,6 +105,10 @@ static CAGENT_MAYBE_UNUSED void config_save(void) {
 
     /* 三个全空就不写,避免覆盖出"空文件" */
     if (!g_api_url[0] && !g_api_key[0] && !g_model[0]) return;
+
+    /* 运行期间用户可能手改了 ini 里没有界面的项 (context_tokens 等): 先合并
+     * 磁盘上的新值, 否则这次重写会把它覆盖回启动时的旧值。 */
+    config_reload_ini_only();
 
     char path[MAX_PATH];
     get_ini_path(path, sizeof(path));
@@ -101,7 +138,9 @@ static CAGENT_MAYBE_UNUSED void config_save(void) {
     fprintf(f, "#\r\n");
     fprintf(f, "# ============================================================\r\n");
     fprintf(f, "# 提示:\r\n");
-    fprintf(f, "#   - 修改本文件前请先退出 cagent，否则程序退出时会用内存中的配置覆盖本文件。\r\n");
+    fprintf(f, "#   - 运行期间可以修改本文件：退出时会保留 context_tokens / max_tokens /\r\n");
+    fprintf(f, "#     skills_dir / skip_cert_verify / log 的外部修改（下次启动生效）；\r\n");
+    fprintf(f, "#     url_base / api_key / model / workspace 以窗口里的值为准。\r\n");
     fprintf(f, "#   - 如遇问题，可删除本文件后重新启动，程序将自动生成默认配置。\r\n");
     fprintf(f, "# ============================================================\r\n");
     fprintf(f, "\r\n");

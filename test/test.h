@@ -269,6 +269,63 @@ static int run_all_tests(void) {
     CHK(http_should_retry(500) == 1);    /* 服务端错误 */
     CHK(http_should_retry(503) == 1);
 
+    /* ---- ini 合并: 运行期间手改的"无界面项"不能被退出保存覆盖 ---- */
+    {
+        test_ws_begin();
+        char ini[MAX_PATH];
+        snprintf(ini, sizeof(ini), "%s\\merge.ini", g_test_ws);
+        FILE *wf = fopen_utf8(ini, "wb");
+        CHK(wf != NULL);
+        if (wf) {
+            fputs("# 模拟用户在 cagent 运行期间手改的 ini\r\n"
+                  "url_base=https://disk.example/v1\r\n"
+                  "model=disk-model\r\n"
+                  "workspace=D:\\disk-ws\r\n"
+                  "context_tokens=333333\r\n"
+                  "max_tokens=7777\r\n"
+                  "skills_dir=disk-skills\r\n"
+                  "skip_cert_verify=1\r\n"
+                  "log=0\r\n"
+                  "last_session=disk-session.json\r\n", wf);
+            fclose(wf);
+
+            /* 内存里模拟启动时的旧值, 以及界面当前持有的值 */
+            snprintf(g_api_url, sizeof(g_api_url), "%s", "https://ui.example/v1");
+            snprintf(g_model, sizeof(g_model), "%s", "ui-model");
+            snprintf(g_workspace, sizeof(g_workspace), "%s", "C:\\ui-ws");
+            snprintf(g_last_session, sizeof(g_last_session), "%s", "ui-session.json");
+            g_context_tokens = 111111;
+            g_max_tokens = 65536;
+            g_skills_dir[0] = '\0';
+            g_skip_cert_verify = 0;
+            g_log_enabled = 1;
+
+            FILE *rf = fopen_utf8(ini, "rb");
+            CHK(rf != NULL);
+            if (rf) { config_parse(rf, 1); fclose(rf); }
+
+            /* 无界面项: 采纳磁盘上的新值 (否则退出保存会把用户修改抹掉) */
+            CHK(g_context_tokens == 333333);
+            CHK(g_max_tokens == 7777);
+            CHK(strcmp(g_skills_dir, "disk-skills") == 0);
+            CHK(g_skip_cert_verify == 1);
+            CHK(g_log_enabled == 0);
+            /* 界面拥有 / 程序维护的项: 不被磁盘值覆盖 */
+            CHK(strcmp(g_api_url, "https://ui.example/v1") == 0);
+            CHK(strcmp(g_model, "ui-model") == 0);
+            CHK(strcmp(g_workspace, "C:\\ui-ws") == 0);
+            CHK(strcmp(g_last_session, "ui-session.json") == 0);
+        }
+        /* 复原, 避免影响后续用例 */
+        g_context_tokens = 0;
+        g_max_tokens = 65536;
+        g_skills_dir[0] = '\0';
+        g_skip_cert_verify = 0;
+        g_log_enabled = 1;
+        test_ws_rm("merge.ini");
+        test_ws_end();
+    }
+
     /* ---- 工具: 分发与参数校验 ---- */
     {
         dispatch_tool("read_file", "{}", "");
