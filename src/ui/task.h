@@ -59,6 +59,20 @@ static void start_task(HWND hwnd) {
         return;
     }
 
+    /* 接入点/模型变了 = 半路换了后端: 分词器、缓存实现、上下文窗口都可能换了一套,
+     * 上一模型返回的 prompt/cached 读数与累计命中率不再可比。**历史保留** (允许换模型
+     * 接着聊), 只把用量统计清零, 状态栏立即刷新 —— 否则"累计命中率"会把两家服务端、
+     * 两个 tokenizer 的数字混在一起。上下文分母仍按 ini 的 context_tokens:
+     * 换到窗口不同的模型时请同步修改配置 (程序无法从模型名推断窗口)。 */
+    if ((g_stat_url[0] && strcmp(g_api_url, g_stat_url) != 0) ||
+        (g_stat_model[0] && strcmp(g_model, g_stat_model) != 0)) {
+        usage_stats_reset();
+        gui_status(NULL);
+        log_line("[stats] 接入点/模型已变更, 用量统计清零 (对话历史保留)");
+    }
+    snprintf(g_stat_url, sizeof(g_stat_url), "%s", g_api_url);
+    snprintf(g_stat_model, sizeof(g_stat_model), "%s", g_model);
+
     wchar_t wws[MAX_PATH];
     if (utf8_to_wide(g_workspace, wws, MAX_PATH) && !SetCurrentDirectoryW(wws)) {
         MessageBoxW(hwnd, L"无法切换到该工作目录, 请检查权限。", L"工作目录无效",

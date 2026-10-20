@@ -529,6 +529,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* 启动不自动加载历史: 全新对话, 旧会话通过"加载会话"按钮按需载入 */
             reset_conversation();
             snprintf(g_active_ws, sizeof(g_active_ws), "%s", g_workspace);
+            /* 初始状态也带统计段: 启动即可看到上下文占用, 不必等第一轮结束 */
+            gui_status(NULL);
         }
 
         if (g_key_decrypt_failed) {
@@ -651,6 +653,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 md_reset();              /* Markdown 行缓冲/围栏状态跟着作废 */
                 ui_fold_reset();         /* 折叠块的位置索引也跟着作废 */
                 emit_note("(新会话已创建。旧会话文件保留, 可通过 [加载会话] 恢复)\r\n");
+                gui_status(NULL);        /* 用量统计已随新会话清零, 状态栏同步刷新 */
                 SetFocus(g_hInput);
             }
             return 0;

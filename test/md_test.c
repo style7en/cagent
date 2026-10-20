@@ -464,12 +464,21 @@ int main(void) {
     run_face_is(1, L"NSimSun", "table-pipe");
     run_face_is(2, L"NSimSun", "table-pipe");
 
-    /* 正文里的单竖线不是表格; 围栏内的表格字符仍按代码样式 */
+    /* 正文里的单竖线不是表格; 围栏内的表格行仍是代码配色, 但字体必须切 NSimSun ——
+     * 模型常把整张表包进 ```, 沿用 Consolas 时中文走字体回退 (~1.8 格宽),
+     * 含中文的行比 +---+ 边框短, 右边框逐列左漂。 */
     reset_test(); feed(W("a | b\r\n"));
     run_is(0, 0, 7, 0, 0, 0, 0, AI_FG, 0, "table-prose");
     reset_test(); feed(W("```\r\n| a | b |\r\n```\r\n"));
     run_is(1, 5, 11, 0, 0, 0, 1, MD_CODE_FG, 0, "table-fence");
-    run_face_is(1, L"Consolas", "table-fence");
+    run_face_is(1, L"NSimSun", "table-fence");
+
+    /* 边框行 (纯 ASCII) 也必须同字体: 若边框留在 Consolas、内容行用 NSimSun,
+     * 两者格宽不同, 整张表照样对不齐。 */
+    reset_test(); feed(W("```\r\n+---+\r\n| a |\r\n+---+\r\n```\r\n"));
+    run_face_is(1, L"NSimSun", "table-fence-border");
+    run_face_is(2, L"NSimSun", "table-fence-border");
+    run_face_is(3, L"NSimSun", "table-fence-border");
 
     /* 围栏内的空行是**代码内容**, 照常按字面上屏 (不能被当块分隔符吞掉) */
     reset_test(); feed(W("```\r\nx\r\n\r\ny\r\n```\r\n"));

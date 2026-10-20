@@ -1022,6 +1022,16 @@ static int run_all_tests(void) {
             CHK(strstr(messages, "无占位") != NULL);      /* 其余消息不受影响 */
         }
 
+        /* 载入失败 (内容无法识别) 不能清空当前对话: messages 必须原样保留 */
+        reset_conversation();
+        strcat(messages, ",{\"role\":\"user\",\"content\":\"keep-me\"}");
+        {
+            size_t keep_len = strlen(messages);
+            CHK(load_messages_from_text("not a session file") == 0);
+            CHK(strlen(messages) == keep_len);
+            CHK(strstr(messages, "keep-me") != NULL);
+        }
+
         reasonings_reset();
         reset_conversation();
         test_ws_rm("reasoning_session.json");
@@ -1093,6 +1103,104 @@ static int run_all_tests(void) {
         CHK(context_pressure() == 0);
 
         g_max_tokens = 65536;
+        g_context_tokens = 0;
+        g_last_prompt_tokens = 0;
+        g_last_prompt_bytes = 0;
+    }
+
+    /* ---- 状态栏统计: token 显示 / 命中率 / 累计口径 / 整行文案 ---- */
+    {
+        char s[32];
+
+        /* token 数: 千位保留一位, 十万以上取整 (59.3K / 256K) */
+        token_count_str(512, s, sizeof(s));
+        CHK(strcmp(s, "512") == 0);
+        token_count_str(59300, s, sizeof(s));
+        CHK(strcmp(s, "59.3K") == 0);
+        token_count_str(256000, s, sizeof(s));
+        CHK(strcmp(s, "256K") == 0);
+        token_count_str(-5, s, sizeof(s));
+        CHK(strcmp(s, "0") == 0);
+
+        /* 命中率: 正常值 / 越界夹回 / 分母无效 */
+        CHK(cache_hit_percent(832, 1000) > 83.19 && cache_hit_percent(832, 1000) < 83.21);
+        CHK(cache_hit_percent(1200, 1000) == 100.0);   /* 个别服务端会多报 */
+        CHK(cache_hit_percent(-1, 1000) == 0.0);
+        CHK(cache_hit_percent(10, 0) == 0.0);
+
+        /* 累计口径: 不报告缓存字段的请求不进样本, 也不计次数 (否则拉低命中率) */
+        g_cache_req_count = 0; g_cache_prompt_sum = 0; g_cache_hit_sum = 0;
+        cache_stat_record(1000, 800, 0);
+        CHK(g_cache_req_count == 0 && g_cache_prompt_sum == 0 && g_cache_hit_sum == 0);
+        cache_stat_record(0, 0, 1);                    /* 无 prompt 读数 -> 跳过 */
+        CHK(g_cache_req_count == 0);
+        cache_stat_record(1000, 900, 1);
+        cache_stat_record(1000, 1200, 1);              /* 越界夹到 prompt */
+        CHK(g_cache_req_count == 2 && g_cache_prompt_sum == 2000 && g_cache_hit_sum == 1900);
+
+        /* 整行: 本次 = 最近一次; 累计 = 会话内所有报告过缓存的请求;
+         * 上下文 = 估算的下一次 prompt / 总窗口 (59300/256000 = 23.2%) */
+        reset_conversation();
+        g_context_tokens = 256000;
+        g_last_prompt_tokens = 59300;
+        g_last_prompt_bytes = strlen(messages);        /* 无新增字节 -> 估算就是 59300 */
+        g_last_cached_tokens = 49338;                  /* 49338/59300 = 83.2% */
+        g_last_cache_reported = 1;
+        g_cache_req_count = 12;
+        g_cache_prompt_sum = 100000;
+        g_cache_hit_sum = 91000;                       /* 91.0% */
+
+        char line[320];
+        agent_status_text(NULL, line, sizeof(line));
+        CHK(strcmp(line, "就绪 | 缓存命中 本次83.2% 累计 91.0% 12次 | 上下文 23.2% 59.3K/256K") == 0);
+
+        /* 最近一次没报缓存 (如刚压缩过): 只保留累计段 */
+        g_last_cache_reported = 0;
+        agent_status_text("正在生成…", line, sizeof(line));
+        CHK(strcmp(line, "正在生成… | 缓存命中 累计 91.0% 12次 | 上下文 23.2% 59.3K/256K") == 0);
+
+        /* 未配置窗口: 分母用默认 256K (与配置 256000 时同一条文案) */
+        g_context_tokens = 0;
+        g_last_cache_reported = 1;
+        agent_status_text("就绪", line, sizeof(line));
+        CHK(strcmp(line, "就绪 | 缓存命中 本次83.2% 累计 91.0% 12次 | 上下文 23.2% 59.3K/256K") == 0);
+
+        /* 完全没收到过缓存字段: 整段省略, 不伪造 0% */
+        g_last_cache_reported = 0;
+        g_cache_req_count = 0;
+        g_cache_prompt_sum = 0;
+        g_cache_hit_sum = 0;
+        agent_status_text("就绪", line, sizeof(line));
+        CHK(strcmp(line, "就绪 | 上下文 23.2% 59.3K/256K") == 0);
+
+        /* 缓冲不够时只截断, 不越界 */
+        char tiny[8];
+        memset(tiny, 'x', sizeof(tiny));
+        agent_status_text("就绪", tiny, sizeof(tiny));
+        CHK(tiny[sizeof(tiny) - 1] == '\0' && strlen(tiny) < sizeof(tiny));
+
+        /* 新建/载入会话: 累计与上次读数一起清零 */
+        g_context_tokens = 256000;
+        reset_conversation();
+        CHK(g_cache_req_count == 0 && g_cache_prompt_sum == 0 && g_cache_hit_sum == 0);
+        CHK(g_last_prompt_tokens == 0 && g_last_cached_tokens == 0 && g_last_cache_reported == 0);
+
+        /* 切换接入点/模型: 只清用量统计, 不动对话历史 (允许换模型接着聊) */
+        strcat(messages, ",{\"role\":\"user\",\"content\":\"history-kept\"}");
+        g_last_prompt_tokens = 500;
+        g_last_cached_tokens = 400;
+        g_last_cache_reported = 1;
+        g_cache_req_count = 3;
+        g_cache_prompt_sum = 3000;
+        g_cache_hit_sum = 2000;
+        {
+            size_t keep_msgs = strlen(messages);
+            usage_stats_reset();
+            CHK(strlen(messages) == keep_msgs && strstr(messages, "history-kept") != NULL);
+        }
+        CHK(g_last_prompt_tokens == 0 && g_last_cached_tokens == 0 && g_last_cache_reported == 0);
+        CHK(g_cache_req_count == 0 && g_cache_prompt_sum == 0 && g_cache_hit_sum == 0);
+
         g_context_tokens = 0;
         g_last_prompt_tokens = 0;
         g_last_prompt_bytes = 0;

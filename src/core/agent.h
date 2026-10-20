@@ -150,10 +150,26 @@ static void reasonings_align_to(int assistant_n) {
  * 之后 (见 msg_role 下方的实现; 这里只有前向声明, 供 reasonings 模块与本文件早前使用)。 */
 static int count_assistant_msgs(const char *conv);
 
+/* 清空用量读数 (上次 prompt/缓存读数 + 累计缓存统计)。两个场景调用:
+ *   ① 会话重置 (新建/载入) —— 旧会话的读数对新对话的上下文水位毫无意义;
+ *   ② 切换接入点/模型 —— 分词器与缓存实现都换了, 命中率不可比 (历史保留)。
+ * 压缩改写历史时**不**调它: 那里只清"上次读数", 会话累计命中率要保留 (见
+ * compact_conversation)。只碰统计, 不动 messages/上下文窗口配置。 */
+static void usage_stats_reset(void) {
+    g_last_prompt_tokens = 0;
+    g_last_prompt_bytes = 0;
+    g_last_cached_tokens = 0;
+    g_last_cache_reported = 0;
+    g_cache_req_count = 0;
+    g_cache_prompt_sum = 0;
+    g_cache_hit_sum = 0;
+}
+
 /* 初始化 messages 为只含 system prompt 的状态。 */
 static void reset_conversation(void) {
     snprintf(messages, BUFSZ, "%s", g_system_prompt);
     reasonings_reset();      /* 会话重置 = 思考存档同步清空 (两者必须同生命周期) */
+    usage_stats_reset();     /* 新会话 = 用量统计归零, "累计"从零开始重新计 */
 }
 
 /* ===== 外置系统提示词 (exe 同目录的 SYSTEM_PROMPT 文件) ===== */
@@ -450,6 +466,86 @@ static long context_input_budget(void) {
     return g_context_tokens;
 }
 
+/* ===== 状态栏统计 (缓存命中率 / 上下文占用) ===== */
+
+/* token 数折成紧凑显示: 59300 -> "59.3K", 256000 -> "256K", 512 -> "512"。
+ * 十万以上不留小数 (256.0K 太啰嗦), 千位保留一位 —— 与上下文窗口的量级相称。 */
+static void token_count_str(long tokens, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (tokens < 0) tokens = 0;
+    if (tokens >= 100000)    snprintf(out, cap, "%.0fK", (double)tokens / 1000.0);
+    else if (tokens >= 1000) snprintf(out, cap, "%.1fK", (double)tokens / 1000.0);
+    else                     snprintf(out, cap, "%ld", tokens);
+}
+
+/* 命中率 (百分比)。prompt<=0 无意义返回 0; hit 越界一律夹回 [0, prompt] ——
+ * 个别服务端的 cached 计数会大于 prompt (含重试的累计), 直接相除会出现 107%。 */
+static double cache_hit_percent(long hit, long prompt) {
+    if (prompt <= 0) return 0.0;
+    if (hit < 0) hit = 0;
+    if (hit > prompt) hit = prompt;
+    return 100.0 * (double)hit / (double)prompt;
+}
+
+/* 记一笔累计缓存统计。reported=0 (服务端不带缓存字段) 或 prompt<=0 的请求**直接跳过**,
+ * 不进分母也不计次数 —— 否则"不支持缓存"的模型会把累计命中率压成难看的数字。 */
+static void cache_stat_record(long prompt_tokens, long cached_tokens, int reported) {
+    if (!reported || prompt_tokens <= 0) return;
+    if (cached_tokens < 0) cached_tokens = 0;
+    if (cached_tokens > prompt_tokens) cached_tokens = prompt_tokens;
+    g_cache_req_count++;
+    g_cache_prompt_sum += prompt_tokens;
+    g_cache_hit_sum += cached_tokens;
+}
+
+/* 拼状态栏整行文案: "此刻在做什么" + 统计段。
+ *   就绪 | 缓存命中 本次83.2% 累计 91.0% 12次 | 上下文 45.2% 59.3K/256K
+ * 数据不足的段整段省略, 绝不伪造数字:
+ *   - 从未收到过缓存字段 -> 没有"缓存命中"段 (不把"不支持"显示成 0%);
+ *   - 未配置模型窗口 (context_tokens=0) -> 分母用默认值 CONTEXT_TOKENS_DEFAULT (256K)。
+ * 只读全局状态、无副作用, 供 UI (hooks.h 的 gui_status) 与回归测试直接调用。 */
+static void agent_status_text(const char *state, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    const char *st = (state && state[0]) ? state : "就绪";
+
+    /* 缓存命中: 本次 = 最近一次请求; 累计 = 会话内所有报告过缓存字段的请求。
+     * 本次的读数被压缩清掉 (compact_conversation) 时只剩累计 —— 段仍成立。 */
+    char cache[160] = "";
+    int has_last = (g_last_cache_reported && g_last_prompt_tokens > 0);
+    if (has_last || (g_cache_req_count > 0 && g_cache_prompt_sum > 0)) {
+        char cur[48] = "", cum[64] = "";
+        if (has_last)
+            snprintf(cur, sizeof(cur), " 本次%.1f%%",
+                     cache_hit_percent(g_last_cached_tokens, g_last_prompt_tokens));
+        if (g_cache_req_count > 0 && g_cache_prompt_sum > 0)
+            snprintf(cum, sizeof(cum), " 累计 %.1f%% %ld次",
+                     cache_hit_percent(g_cache_hit_sum, g_cache_prompt_sum), g_cache_req_count);
+        snprintf(cache, sizeof(cache), " | 缓存命中%s%s", cur, cum);
+    }
+
+    /* 上下文: 已用 = 按服务端读数估算的**下一次请求** prompt (含本轮新增的字节增长)。
+     * 分母优先用模型总窗口 (ini 的 context_tokens), 不是扣掉输出的输入预算 ——
+     * 用户看的是"离满还有多远", 输出预算的余量由压缩水位去管。
+     *
+     * context_tokens=0 (未知窗口) 时按 CONTEXT_TOKENS_DEFAULT (256K) 当分母, 让百分比
+     * 始终可见。它只是**显示的默认值**, 不改变压缩行为 (压缩仍按字节水位兜底);
+     * 实际窗口不同的模型请在 ini 里配置 context_tokens。 */
+    char ctx[96] = "";
+    {
+        long used = estimate_prompt_tokens();
+        if (used < 0) used = 0;
+        long window = (g_context_tokens > 0) ? g_context_tokens : CONTEXT_TOKENS_DEFAULT;
+        char u[24], w[24];
+        token_count_str(used, u, sizeof(u));
+        token_count_str(window, w, sizeof(w));
+        double pct = 100.0 * (double)used / (double)window;
+        if (pct > 100.0) pct = 100.0;
+        snprintf(ctx, sizeof(ctx), " | 上下文 %.1f%% %s/%s", pct, u, w);
+    }
+
+    snprintf(out, cap, "%s%s%s", st, cache, ctx);
+}
+
 /* 是否应当压缩: 配置了模型窗口 (ini 的 context_tokens) 则按输入预算的 90% 触发;
  * 未配置或服务端不发 usage 时退回字节水位 (75% BUFSZ)。
  * 90% 而不是 80%: 前缀缓存下, 压缩会改写前缀、丢掉整个缓存; 能晚一点压就晚一点。 */
@@ -676,7 +772,8 @@ static int compact_conversation(void) {
           || compact_via_summary(1)      /* ② 只摘要更早一半, 请求更小 */
           || compact_drop_oldest();      /* ③ 保底: 不经模型直接丢最旧 */
     if (ok) {
-        /* 压缩改写了历史, 上次请求的 token / 缓存读数已失效 */
+        /* 压缩改写了历史, 上次请求的 token / 缓存读数已失效。这里只清"本次"读数,
+         * **不动** g_cache_* —— 累计命中率是会话级统计, 压缩不该把它抹掉。 */
         g_last_prompt_tokens = 0;
         g_last_prompt_bytes = 0;
         g_last_cached_tokens = 0;
@@ -899,15 +996,19 @@ static void agent_turn(const char *user_msg) {
          * cached_tokens 只用于成本/命中率观察: 命中的 token 仍然占模型窗口,
          * 不能从上下文水位里扣掉。 */
         if (ctx->prompt_tokens > 0) {
+            if (ctx->cached_tokens < 0) ctx->cached_tokens = 0;
+            if (ctx->cached_tokens > ctx->prompt_tokens)
+                ctx->cached_tokens = ctx->prompt_tokens;
             g_last_prompt_tokens = ctx->prompt_tokens;
             g_last_prompt_bytes = strlen(messages);
             g_last_cached_tokens = ctx->cached_tokens;
             g_last_cache_reported = ctx->cache_reported;
-            log_line("[usage] prompt=%ld cached=%ld hit=%.1f%%",
+            cache_stat_record(ctx->prompt_tokens, ctx->cached_tokens, ctx->cache_reported);
+            log_line("[usage] prompt=%ld cached=%ld hit=%.1f%% cum=%.1f%%/%ld次",
                      ctx->prompt_tokens, ctx->cached_tokens,
-                     ctx->prompt_tokens > 0
-                         ? 100.0 * (double)ctx->cached_tokens / (double)ctx->prompt_tokens
-                         : 0.0);
+                     cache_hit_percent(ctx->cached_tokens, ctx->prompt_tokens),
+                     cache_hit_percent(g_cache_hit_sum, g_cache_prompt_sum),
+                     g_cache_req_count);
         }
 
         if (strcmp(ctx->finish, "length") == 0)

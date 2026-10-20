@@ -119,6 +119,16 @@ static const struct { const char *text; int role; } kSample[] = {
       "| 李四     | 产品部     | 产品经理         |\r\n"
       "| 王五     | 设计部     | UI 设计师        |\r\n"
       "+----------+------------+------------------+\r\n",              CAGENT_ROLE_AI },
+    /* 模型几乎总把 ASCII 表格包进 ``` 围栏: 围栏内也必须切 NSimSun, 否则 Consolas
+     * 的中文回退字体不到 2 格宽, 含中文的行比 +---+ 边框短, 右边框逐列左漂
+     * (用户截图实录)。"围栏表格"四个字供下面的字体自检定位。 */
+    { "\r\n```\r\n"
+      "+----------+------------+\r\n"
+      "| 围栏表格 | 对齐检查   |\r\n"
+      "+----------+------------+\r\n"
+      "| 中文     | 应当对齐   |\r\n"
+      "+----------+------------+\r\n"
+      "```\r\n",                                                     CAGENT_ROLE_AI },
 };
 
 /* 32 位 DIB -> BMP 文件。DIB section 用**正高度**(自下而上), 与 BMP 文件的内存布局
@@ -302,6 +312,24 @@ static void read_fmt(long cp, CHARFORMAT2W *cf) {
     cf->cbSize = sizeof(*cf);
     SendMessageW(g_hHistory, EM_SETSEL, cp, cp + 1);
     SendMessageW(g_hHistory, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)cf);
+}
+
+/* 围栏内表格的字体: 模型习惯把 ASCII 表格包在 ``` 里, 这条路径曾经漏掉 NSimSun,
+ * 中文回退到系统字体后不是严格 2 格宽, 右边框逐列左漂 (用户截图实录)。 */
+static void fenced_table_font_selftest(void) {
+    FINDTEXTEXW ft;
+    memset(&ft, 0, sizeof(ft));
+    ft.chrg.cpMin = 0;
+    ft.chrg.cpMax = -1;         /* 全文档 */
+    ft.lpstrText = L"围栏表格";
+    long cp = (long)SendMessageW(g_hHistory, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&ft);
+    if (cp < 0) { printf("fenced table font selftest: 跳过 (样本缺失)\n"); return; }
+    CHARFORMAT2W cf;
+    read_fmt(cp, &cf);
+    int ok = wcscmp(cf.szFaceName, CAGENT_TABLE_FACE) == 0;
+    if (!ok) g_pv_fails++;
+    printf("fenced table font selftest: 围栏内表格字体 %ls (期望 %ls) [%s]\n",
+           cf.szFaceName, CAGENT_TABLE_FACE, ok ? "OK" : "FAIL");
 }
 
 /* 折叠再展开后, **输出段的字符格式必须原样恢复**。
@@ -1123,6 +1151,7 @@ int main(void) {
     fold_selftest();
     head_indent_selftest();
     style_selftest();
+    fenced_table_font_selftest();
     reasoning_flow_selftest();
 
     /* 收起**工具块**, 再出一张图 —— 这是用户实际会点的那个: 工具输出经常几十上百行,

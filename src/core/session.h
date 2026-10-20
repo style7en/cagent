@@ -287,15 +287,18 @@ static int load_messages_from_text(const char *text) {
         long s, e;
         if (find_messages_inner(text, &s, &e) >= 0) {
             long ilen = e - s;
-            reset_conversation();
-            if (ilen > 0 && strlen(messages) + (size_t)ilen + 1 < BUFSZ) {
-                strcat(messages, ",");
-                strncat(messages, text + s, (size_t)ilen);
-            } else if (ilen > 0) {
-                /* 装不下就明确失败并说明原因, 不再静默丢弃整段历史 */
+            /* **先验证容量再 reset**: 装不下就整份拒绝, 当前对话保持原样。
+             * reset 之后再失败会把 messages 清成只剩 system prompt, 而调用方
+             * (sess_apply_selected) 只是 return, 界面还显示着原对话 —— 两边永久不一致。 */
+            if (ilen > 0 && strlen(g_system_prompt) + (size_t)ilen + 1 >= BUFSZ) {
                 emit_err("(加载失败: 会话历史超出上下文缓冲容量 (1MB))\r\n");
                 json_free(root);
-                return 0;
+                return 0;                       /* messages 未动 */
+            }
+            reset_conversation();
+            if (ilen > 0) {
+                strcat(messages, ",");
+                strncat(messages, text + s, (size_t)ilen);
             }
             fix_legacy_read_placeholders();
             session_load_reasonings(root);   /* 思考旁路存档: 载入即对齐 (见函数说明) */
@@ -306,24 +309,24 @@ static int load_messages_from_text(const char *text) {
     }
 
     /* 旧版: 纯对话文本 (messages 以系统提示词开头)。
-     * 只接受形如对话的内容, 防止损坏文件把垃圾文本混进请求体。 */
-    reset_conversation();
+     * 只接受形如对话的内容, 防止损坏文件把垃圾文本混进请求体。
+     * 同样**先校验再 reset**: 无法识别就返回 0 并保留当前对话, 不能清空。 */
     const char *conv = text;
     if (strncmp(text, "{\"role\":\"system\"", 16) == 0) {
         size_t end = first_object_end(text);
         if (end) conv = text + end;
     }
     if (*conv == ',') conv++;
-    if (strncmp(conv, "{\"role\":", 8) == 0 &&
-        strlen(messages) + strlen(conv) < BUFSZ - 1) {
-        strcat(messages, conv);
-        fix_legacy_read_placeholders();
-        /* 旧格式文件没有思考存档字段, 也必须把数组补到 assistant 条数 (全 NULL 占位)
-         * —— 不然后续新对话第一条 assistant 的归档会挤进旧消息的槽位, 从此错位 */
-        reasonings_align_to(count_assistant_msgs(messages + strlen(g_system_prompt)));
-        return 1;
-    }
-    return 0;   /* 无法识别: 视为无有效历史, 从新对话开始 */
+    if (strncmp(conv, "{\"role\":", 8) != 0 ||
+        strlen(g_system_prompt) + strlen(conv) + 1 >= BUFSZ)
+        return 0;                               /* messages 未动 */
+    reset_conversation();
+    strcat(messages, conv);
+    fix_legacy_read_placeholders();
+    /* 旧格式文件没有思考存档字段, 也必须把数组补到 assistant 条数 (全 NULL 占位)
+     * —— 不然后续新对话第一条 assistant 的归档会挤进旧消息的槽位, 从此错位 */
+    reasonings_align_to(count_assistant_msgs(messages + strlen(g_system_prompt)));
+    return 1;
 }
 
 /* ===== 思考旁路存档的落盘 / 载入 =====

@@ -91,7 +91,8 @@ static CAGENT_MAYBE_UNUSED void config_save(void) {
     fprintf(f, "#   model             模型名称，需与 API 支持的模型一致\r\n");
     fprintf(f, "#   workspace         工作目录，文件工具（读/写/编辑）限制在此目录内；留空默认 exe 目录\r\n");
     fprintf(f, "#   context_tokens    模型上下文窗口大小（token），用于裁剪超长历史；\r\n");
-    fprintf(f, "#                     0 = 未知，退化为按字节水位估算，并非不限制\r\n");
+    fprintf(f, "#                     配置后状态栏显示 “上下文 百分比 已用/窗口”；\r\n");
+    fprintf(f, "#                     0 = 未知，状态栏按默认 256K 估算，压缩退化为按字节水位，并非不限制\r\n");
     fprintf(f, "#   max_tokens        单次回复输出预算（token），0 = 不下发该字段，由服务端决定\r\n");
     fprintf(f, "#   skills_dir        技能根目录，可用 ; 分隔多个；留空默认 <exe>\\skills\r\n");
     fprintf(f, "#   skip_cert_verify  1 = 跳过 SSL 证书校验（仅自签/调试用），0 = 正常校验\r\n");

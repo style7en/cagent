@@ -479,10 +479,18 @@ static void md_emit_line(WCHAR *line, int len, int tail_len) {
             md_put(line, 0, len, &s, 0, 0, indent);
         } else {
             /* 代码行: 等宽深灰, **段距全 0** —— 多行块每行都带段前距会被拉散
-             * (同 OUTPUT 角色, 见 ui/state.h 的段距说明); 不行内解析。 */
+             * (同 OUTPUT 角色, 见 ui/state.h 的段距说明); 不行内解析。
+             *
+             * 但模型习惯把 ASCII 表格整块包进 ``` 围栏, 这种行必须和围栏外一样
+             * 换成 NSimSun: 默认等宽字体 (Consolas) **没有中文字形**, RichEdit
+             * 会把中文回退到系统字体, 而回退字体的中文宽度并不是恰好 2 个 Consolas
+             * 格宽 —— 含中文的行会缩短, 和纯 ASCII 的 +---+ 边框行对不齐, 越往右
+             * 漂得越多。边框行也命中 md_is_table_line, 所以整张表都落在 NSimSun
+             * 下 (半角/全角严格 1:2); 围栏里其它代码行不受影响。 */
             MdStyle s = base;
             s.mono = 1;
             s.fg = MD_CODE_FG;
+            if (md_is_table_line(line, len)) s.face = CAGENT_TABLE_FACE;
             md_put(line, 0, len, &s, 0, 0, indent);
         }
         return;

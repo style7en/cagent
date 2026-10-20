@@ -16,21 +16,13 @@ static void gui_emit(const char *utf8, int role) {
 /* 状态栏: 报告"模型此刻在做什么"。core 在**工作线程**里调它, 所以只能投递到 UI 线程
  * (直接碰控件是不允许的); text 为 NULL 表示回到空闲。
  * 这些信息以前是往输出区打旁白的, 但它们属于状态而不是对话内容 —— 见 core/base.h 的说明。
- * 最近一次请求的缓存命中率追加在状态文案后面: 它不属于"此刻在做什么", 但用户需要
- * 一眼看到前缀缓存有没有生效。服务端不返回缓存字段时保持原文案, 不伪造 0%。 */
+ * 统计段 (缓存命中率 本次/累计 + 上下文占用) 由 core 的 agent_status_text 统一拼好:
+ * 数据口径属于 core (它才知道 usage 与上下文窗口), UI 只负责把整行投递上屏。 */
 static void gui_status(const char *text) {
     if (!g_hStatus) return;                        /* 控件还没建好 (理论上不会走到) */
-    char buf[256];
-    const char *out = text ? text : "就绪";
-    if (g_last_cache_reported && g_last_prompt_tokens > 0) {
-        long cached = g_last_cached_tokens;
-        if (cached < 0) cached = 0;
-        if (cached > g_last_prompt_tokens) cached = g_last_prompt_tokens;
-        snprintf(buf, sizeof(buf), "%s | 缓存命中率 %.1f%%", out,
-                 100.0 * (double)cached / (double)g_last_prompt_tokens);
-        out = buf;
-    }
-    char *copy = strdup(out);
+    char buf[320];
+    agent_status_text(text, buf, sizeof(buf));
+    char *copy = strdup(buf);
     if (copy) PostMessageW(GetParent(g_hStatus), WM_APP_STATUS, 0, (LPARAM)copy);
 }
 
@@ -249,7 +241,7 @@ static void gui_on_done(void) {
     SetFocus(g_hInput);
     /* 本轮结束 = 最后一个折叠块也结束了, 按默认收起它 (见 gui_turn_end)。 */
     gui_turn_end();
-    /* 状态栏回到"就绪"(仍由 gui_status 追加最近一次缓存命中率) —— 同样只能投递 */
+    /* 状态栏回到"就绪"(统计段由 gui_status 重新拼) —— 同样只能投递 */
     gui_status(NULL);
 }
 

@@ -82,6 +82,10 @@ static int g_skip_cert_verify = 0;     /* 1=跳过 SSL 证书校验 (自签端�
 static char g_workspace[MAX_PATH] = "";/* 工作目录 (文件工具限制在此目录内, 默认 exe 目录) */
 static char g_skills_dir[MAX_PATH] = ""; /* 技能根目录 (ini 的 skills_dir; 空 = 默认 <exe>\skills) */
 static char g_active_ws[MAX_PATH] = "";/* 当前已加载历史所对应的工作目录 */
+/* 当前用量统计对应的接入点/模型 (只用于检测"半路换了后端")。换接入点或模型意味着
+ * 分词器、缓存实现、窗口都可能换了一套, 旧读数不可比 —— 见 usage_stats_reset。 */
+static CAGENT_MAYBE_UNUSED char g_stat_url[1024] = "";
+static CAGENT_MAYBE_UNUSED char g_stat_model[128] = "";
 static char g_last_session[MAX_PATH] = ""; /* 最近使用的会话文件 (持久化到 ini) */
 static char g_history_file[MAX_PATH] = ""; /* 当前对话绑定的会话文件 (懒生成) */
 
@@ -99,10 +103,25 @@ static volatile LONG g_cancel  = 0;   /* 1 = 请求取消 */
 
 /* ===== 上下文水位 (token 优先, 字节兜底, 见 agent.h 的 context_pressure) ===== */
 static long g_context_tokens = 0;      /* 模型上下文窗口 (token), 来自 ini 的 context_tokens; 0=未知 */
+
+/* context_tokens=0 (ini 没配) 时, 状态栏上下文百分比用的**默认窗口分母**。
+ * 只影响显示, 不写回 ini, 也不参与压缩判定 —— 压缩仍按字节水位兜底 (见 context_pressure)。
+ * 取 256K: 当前主流模型窗口的常见档位, 让没配 ini 的用户也能看到有意义的比例;
+ * 若实际窗口不同, 在 ini 里配置 context_tokens 即可换成真实值。 */
+#define CONTEXT_TOKENS_DEFAULT 256000L
+
 static long g_last_prompt_tokens = 0;  /* 上次请求服务端报告的 prompt_tokens (SSE usage; 无则 0) */
 static size_t g_last_prompt_bytes = 0; /* 上次请求发出时 messages 的字节数 (与上者配对做增量估算) */
 static long g_last_cached_tokens = 0;  /* 上次请求命中前缀缓存的 token 数 (SSE usage; 无则 0) */
 static int  g_last_cache_reported = 0; /* 服务端是否报告过缓存字段 (0 = 不支持/未发, 状态栏不显示) */
+
+/* ===== 累计缓存统计 (会话内跨请求, 状态栏的"累计 N次") =====
+ * 只累计**服务端确实报告过缓存字段**的请求: 不支持的请求既不进分母也不计次数,
+ * 否则会把"不支持"混进命中率里 (把 91% 拉成 60%)。口径与"本次"一致, 见
+ * agent.h 的 cache_stat_record / agent_status_text。新建或载入会话时清零。 */
+static long g_cache_req_count = 0;     /* 样本数 (= 状态栏里的 "N次") */
+static long g_cache_prompt_sum = 0;    /* 样本的 prompt token 之和 (命中率分母) */
+static long g_cache_hit_sum = 0;       /* 样本的命中 token 之和 (命中率分子) */
 
 static const char *TOOLS_JSON =
     "[{\"type\":\"function\",\"function\":{"

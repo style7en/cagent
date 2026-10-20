@@ -133,7 +133,12 @@ static int sess_enumerate(const char *dir) {
 static void sess_apply_selected(const char *path) {
     if (g_active_ws[0] && strlen(messages) > strlen(g_system_prompt))
         history_save();          /* 空对话不落盘, 避免覆盖旧会话文件 */
-    if (!history_load_from_file(path)) return;
+    if (!history_load_from_file(path)) {
+        /* 载入失败时 messages 保持原样 (见 load_messages_from_text 的"先校验再 reset"),
+         * 界面上的旧对话也保持; 但必须告诉用户, 否则按了"载入"像是没反应。 */
+        emit_err("(会话加载失败: 文件无法读取或内容无法识别, 当前对话保持不变)\r\n");
+        return;
+    }
     set_edit_utf8(g_hWorkspace, g_workspace);
     wchar_t wws[MAX_PATH];
     if (utf8_to_wide(g_workspace, wws, MAX_PATH))
@@ -159,6 +164,9 @@ static void sess_apply_selected(const char *path) {
      * 直接调就是对着空气栈收尾 (d46e7f3 踩过: 同步直调的测试桩测不出来)。
      * 同一条窗口队列 FIFO, 信号天然排在本回放最后一条追加之后。 */
     gui_turn_end();
+    /* 载入会话时 reset_conversation 已把用量读数清零 (累计/本次/上下文), 状态栏必须
+     * 跟着刷新 —— 否则底部还挂着上一个会话的"累计 N次"和上下文占用。 */
+    gui_status(NULL);
 }
 
 /* ===== 布局与字体 (首次创建与 WM_DPICHANGED 共用) ===== */
